@@ -14,9 +14,10 @@ use windows::{
         Graphics::Gdi::{
             self, BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW,
             EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo,
-            MonitorFromWindow, MoveToEx, RoundRect, SelectObject, SetBkMode, SetTextColor,
+            MonitorFromWindow, MoveToEx, RedrawWindow, RoundRect, SelectObject, SetBkMode, SetTextColor,
             DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT,
             HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, TRANSPARENT,
+            RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
         },
         System::{Com::*, LibraryLoader},
         UI::{
@@ -211,6 +212,7 @@ struct App {
     sidebar_width: f32,
     sidebar_target: f32,
     sidebar_collapsed: bool,
+    animating_sidebar: bool,
     site_mode: SiteMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -257,6 +259,7 @@ impl App {
             sidebar_width: SIDEBAR_EXPANDED,
             sidebar_target: SIDEBAR_EXPANDED,
             sidebar_collapsed: false,
+            animating_sidebar: false,
             site_mode: SiteMode::Auto,
             settings_open: false,
             mode_menu_open: false,
@@ -1085,6 +1088,7 @@ impl App {
         } else {
             SIDEBAR_EXPANDED
         };
+        self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
         }
@@ -1094,6 +1098,7 @@ impl App {
         let distance = self.sidebar_target - self.sidebar_width;
         if distance.abs() < 0.75 {
             self.sidebar_width = self.sidebar_target;
+            self.animating_sidebar = false;
             unsafe {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), SIDEBAR_TIMER_ID);
             }
@@ -1101,7 +1106,14 @@ impl App {
             self.sidebar_width += distance * 0.22;
         }
         self.layout();
-        self.refresh();
+        unsafe {
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_ERASE,
+            );
+        }
     }
 
     fn set_site_mode(&mut self, mode: SiteMode) {
