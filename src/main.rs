@@ -6,18 +6,18 @@ use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
     core::*,
     Win32::{
-        Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Dwm::{
             DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
         },
         Graphics::Gdi::{
             self, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-            CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
-            GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, RoundRect,
-            SelectObject, SetBkMode, SetTextColor, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-            DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH,
-            NULL_PEN, TRANSPARENT,
+            CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
+            GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo, MapWindowPoints, MonitorFromWindow,
+            MoveToEx, RoundRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, SRCCOPY,
+            DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT,
+            HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, TRANSPARENT,
         },
         System::{Com::*, LibraryLoader},
         UI::{
@@ -27,9 +27,9 @@ use windows::{
                 GetKeyState, SetFocus, VK_CONTROL, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA,
-                GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
-                WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
+                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetTopWindow, GetWindow,
+                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GW_HWNDNEXT, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL,
+                IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
                 WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
                 WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
                 WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
@@ -114,6 +114,7 @@ struct Tab {
     url: String,
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
+    child_hwnd: HWND,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -286,12 +287,16 @@ impl App {
         unsafe {
             controller.SetIsVisible(false)?;
         }
+
+        let child_hwnd = find_webview_child(self.hwnd, self.address_hwnd);
+
         self.tabs.push(Tab {
             id,
             title: "New Tab".to_string(),
             url: url.to_string(),
             controller,
             webview,
+            child_hwnd,
         });
         self.switch_to(index);
         self.navigate_active(url);
@@ -653,7 +658,28 @@ impl App {
         };
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
-                let _ = tab.controller.SetBounds(bounds);
+                if self.animating_sidebar {
+                    let sidebar_right = self.sidebar_width() as i32;
+                    let mut clip_pts = [
+                        POINT { x: sidebar_right, y: TOPBAR_HEIGHT },
+                        POINT { x: rect.right, y: rect.bottom },
+                    ];
+                    MapWindowPoints(
+                        Some(self.hwnd),
+                        Some(tab.child_hwnd),
+                        &mut clip_pts,
+                    );
+                    let region = CreateRectRgn(
+                        clip_pts[0].x,
+                        clip_pts[0].y,
+                        clip_pts[1].x,
+                        clip_pts[1].y,
+                    );
+                    let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
+                } else {
+                    let _ = tab.controller.SetBounds(bounds);
+                    let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                }
                 let _ = tab.controller.SetIsVisible(i == self.active);
             }
         }
@@ -1838,6 +1864,19 @@ fn solid_brush(color: u32) -> HBRUSH {
 
 fn to_wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn find_webview_child(parent: HWND, exclude: HWND) -> HWND {
+    unsafe {
+        let mut child = GetTopWindow(Some(parent)).unwrap_or_default();
+        while !child.is_invalid() {
+            if child != exclude {
+                return child;
+            }
+            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
+        }
+        HWND::default()
+    }
 }
 
 fn loword(value: u32) -> u16 {
