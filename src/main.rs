@@ -285,6 +285,14 @@ impl App {
             saved_rect: RECT::default(),
         };
         app.create_tab(DEFAULT_URL)?;
+        unsafe {
+            let _ = WindowsAndMessaging::SetTimer(
+                Some(app.hwnd),
+                HOVER_DETECT_TIMER_ID,
+                100,
+                None,
+            );
+        }
         Ok(app)
     }
 
@@ -663,11 +671,7 @@ impl App {
         let rect = client_rect(self.hwnd);
         let address = self.address_rect();
         unsafe {
-            let flags = if self.animating_sidebar {
-                WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW
-            } else {
-                WindowsAndMessaging::SWP_NOZORDER
-            };
+            let flags = WindowsAndMessaging::SWP_NOZORDER;
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.address_hwnd,
                 None,
@@ -691,7 +695,7 @@ impl App {
                             bottom: rect.bottom,
                         },
                         SidebarMode::Pushed => RECT {
-                            left: 0,
+                            left: sidebar_width,
                             top: TOPBAR_HEIGHT,
                             right: rect.right,
                             bottom: rect.bottom,
@@ -731,6 +735,9 @@ impl App {
                 let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
                     || (self.sidebar_mode == SidebarMode::Hidden
                         && self.sidebar_expand_mode == SidebarMode::Overlay
+                        && self.sidebar_target >= SIDEBAR_EXPANDED)
+                    || (self.sidebar_mode == SidebarMode::Hidden
+                        && self.sidebar_expand_mode == SidebarMode::Pushed
                         && self.sidebar_target >= SIDEBAR_EXPANDED);
                 if needs_clipping && sidebar_width > 0 {
                     if (sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 {
@@ -1230,7 +1237,9 @@ impl App {
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
-            let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
+            if mode != SidebarMode::Hidden {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
+            }
             if mode == SidebarMode::Hidden {
                 self.clear_webview_clipping();
             }
@@ -1250,30 +1259,12 @@ impl App {
                 self.sidebar_mode = SidebarMode::Hidden;
                 self.clear_webview_clipping();
                 unsafe {
-                    let mut pt = POINT::default();
-                    if GetCursorPos(&mut pt).is_ok()
-                        && ScreenToClient(self.hwnd, &mut pt).as_bool()
-                        && pt.x < HOVER_ZONE
-                        && pt.x >= 0
-                        && pt.y >= 0
-                    {
-                        self.sidebar_expand_mode = SidebarMode::Overlay;
-                        self.sidebar_target = SIDEBAR_EXPANDED;
-                        self.animating_sidebar = true;
-                        let _ = WindowsAndMessaging::SetTimer(
-                            Some(self.hwnd),
-                            SIDEBAR_TIMER_ID,
-                            15,
-                            None,
-                        );
-                    } else {
-                        let _ = WindowsAndMessaging::SetTimer(
-                            Some(self.hwnd),
-                            HOVER_DETECT_TIMER_ID,
-                            100,
-                            None,
-                        );
-                    }
+                    let _ = WindowsAndMessaging::SetTimer(
+                        Some(self.hwnd),
+                        HOVER_DETECT_TIMER_ID,
+                        100,
+                        None,
+                    );
                 }
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
                 self.sidebar_mode = self.sidebar_expand_mode;
