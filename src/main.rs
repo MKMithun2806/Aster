@@ -15,9 +15,9 @@ use windows::{
             self, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
             CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
             GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, RoundRect,
-            ScreenToClient, SelectObject, SetBkMode, SetTextColor, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS,
-            DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
-            MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, TRANSPARENT,
+            SelectObject, SetBkMode, SetTextColor, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
+            DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH,
+            NULL_PEN, TRANSPARENT,
         },
         System::{Com::*, LibraryLoader},
         UI::{
@@ -27,14 +27,14 @@ use windows::{
                 GetKeyState, SetFocus, VK_CONTROL, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetCursorPos,
-                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL,
-                IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE,
-                WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
-                WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-                WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT,
-                WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPSIBLINGS,
-                WS_EX_DLGMODALFRAME, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA,
+                GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
+                WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
+                WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
+                WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
+                WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
+                WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
+                WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
     },
@@ -45,13 +45,12 @@ const CLASS_NAME: PCWSTR = w!("AsterWindow");
 const ADDRESS_ID: i32 = 1001;
 const DEFAULT_URL: &str = "https://www.google.com";
 const SIDEBAR_EXPANDED: f32 = 248.0;
-const SIDEBAR_COLLAPSED: f32 = 0.0;
-const HOVER_TRIGGER_ZONE: i32 = 16;
+const SIDEBAR_HIDDEN: f32 = 0.0;
+const HOVER_ZONE: i32 = 8;
 const TOPBAR_HEIGHT: i32 = 58;
 const TAB_HEIGHT: i32 = 48;
 const TAB_TOP: i32 = 76;
 const SIDEBAR_TIMER_ID: usize = 42;
-const HOVER_TIMER_ID: usize = 43;
 
 const COLOR_BLACK: u32 = 0x000000;
 const COLOR_PANEL: u32 = 0x090909;
@@ -130,6 +129,13 @@ enum HoverTarget {
     ModeAuto,
     ModeDark,
     ModeLight,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarMode {
+    Hidden,
+    Overlay,
+    Pushed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,9 +219,9 @@ struct App {
     hover_target: Option<HoverTarget>,
     sidebar_width: f32,
     sidebar_target: f32,
-    sidebar_visible: bool,
-    hover_overlay_active: bool,
+    sidebar_mode: SidebarMode,
     animating_sidebar: bool,
+    hovering_sidebar: bool,
     site_mode: SiteMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -259,11 +265,11 @@ impl App {
             hover_close: None,
             hover_tab: None,
             hover_target: None,
-            sidebar_width: SIDEBAR_EXPANDED,
-            sidebar_target: SIDEBAR_EXPANDED,
-            sidebar_visible: true,
-            hover_overlay_active: false,
+            sidebar_width: SIDEBAR_HIDDEN,
+            sidebar_target: SIDEBAR_HIDDEN,
+            sidebar_mode: SidebarMode::Hidden,
             animating_sidebar: false,
+            hovering_sidebar: false,
             site_mode: SiteMode::Auto,
             settings_open: false,
             mode_menu_open: false,
@@ -272,9 +278,6 @@ impl App {
             saved_rect: RECT::default(),
         };
         app.create_tab(DEFAULT_URL)?;
-        unsafe {
-            let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_TIMER_ID, 100, None);
-        }
         Ok(app)
     }
 
@@ -529,10 +532,9 @@ impl App {
     }
 
     fn content_left(&self) -> i32 {
-        if self.sidebar_visible {
-            self.sidebar_width()
-        } else {
-            0
+        match self.sidebar_mode {
+            SidebarMode::Hidden | SidebarMode::Overlay => 0,
+            SidebarMode::Pushed => self.sidebar_width(),
         }
     }
 
@@ -570,7 +572,7 @@ impl App {
     }
 
     fn new_tab_rect(&self) -> RECT {
-        let right = self.sidebar_width() - 16;
+        let right = self.sidebar_width().max(SIDEBAR_EXPANDED as i32) - 16;
         RECT {
             left: right - 36,
             top: 13,
@@ -635,13 +637,17 @@ impl App {
         ((self.sidebar_width - 118.0) / (SIDEBAR_EXPANDED - 118.0)).clamp(0.0, 1.0)
     }
 
-    fn is_overlay(&self) -> bool {
-        !self.sidebar_visible && self.hover_overlay_active
-    }
-
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
-        let address = self.address_rect();
+        let sidebar_width = self.sidebar_width();
+        let left = match self.sidebar_mode {
+            SidebarMode::Hidden | SidebarMode::Overlay => 0,
+            SidebarMode::Pushed => sidebar_width,
+        };
+        let address_left = match self.sidebar_mode {
+            SidebarMode::Hidden | SidebarMode::Overlay => 18,
+            SidebarMode::Pushed => sidebar_width + 18,
+        };
         unsafe {
             let flags = if self.animating_sidebar {
                 WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW
@@ -651,15 +657,14 @@ impl App {
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.address_hwnd,
                 None,
-                address.left + 36,
-                address.top + 7,
-                (address.right - address.left - 52).max(120),
+                address_left + 36,
+                13 + 7,
+                (rect.right - address_left - 18 - 52).max(120),
                 22,
                 flags,
             );
         }
 
-        let left = self.content_left();
         let bounds = RECT {
             left,
             top: TOPBAR_HEIGHT,
@@ -676,10 +681,29 @@ impl App {
 
     fn paint(&self, hdc: HDC) {
         let rect = client_rect(self.hwnd);
+        let sidebar_width = self.sidebar_width();
+        let is_overlay = self.sidebar_mode == SidebarMode::Overlay;
         unsafe {
             let _ = FillRect(hdc, &rect, self.brushes.black);
 
-            let sidebar_width = self.sidebar_width();
+            let topbar = RECT {
+                left: 0,
+                top: 0,
+                right: rect.right,
+                bottom: TOPBAR_HEIGHT,
+            };
+            let _ = FillRect(hdc, &topbar, self.brushes.panel);
+            fill_rect(
+                hdc,
+                RECT {
+                    left: 0,
+                    top: TOPBAR_HEIGHT - 1,
+                    right: rect.right,
+                    bottom: TOPBAR_HEIGHT,
+                },
+                0x202020,
+            );
+
             if sidebar_width > 0 {
                 let sidebar = RECT {
                     left: 0,
@@ -688,7 +712,7 @@ impl App {
                     bottom: rect.bottom,
                 };
                 let _ = FillRect(hdc, &sidebar, self.brushes.panel);
-                if self.sidebar_visible {
+                if !is_overlay {
                     fill_rect(
                         hdc,
                         RECT {
@@ -701,24 +725,6 @@ impl App {
                     );
                 }
             }
-
-            let topbar = RECT {
-                left: sidebar_width,
-                top: 0,
-                right: rect.right,
-                bottom: TOPBAR_HEIGHT,
-            };
-            let _ = FillRect(hdc, &topbar, self.brushes.panel);
-            fill_rect(
-                hdc,
-                RECT {
-                    left: topbar.left,
-                    top: TOPBAR_HEIGHT - 1,
-                    right: rect.right,
-                    bottom: TOPBAR_HEIGHT,
-                },
-                0x202020,
-            );
 
             draw_logo(
                 hdc,
@@ -968,8 +974,11 @@ impl App {
     }
 
     fn handle_click(&mut self, x: i32, y: i32) {
-        if self.hover_overlay_active && x >= self.sidebar_width() {
-            self.end_hover_overlay();
+        if self.sidebar_mode == SidebarMode::Overlay
+            && self.sidebar_width > SIDEBAR_EXPANDED * 0.5
+            && (x as f32) >= self.sidebar_width
+        {
+            self.set_sidebar_mode(SidebarMode::Hidden);
             return;
         }
 
@@ -1036,7 +1045,7 @@ impl App {
             return;
         }
 
-        if self.sidebar_width() > 92 && x < self.sidebar_width() && y >= TAB_TOP {
+        if self.sidebar_width() > 92 && (x as f32) < self.sidebar_width && y >= TAB_TOP {
             let index = ((y - TAB_TOP) / TAB_HEIGHT) as usize;
             if index < self.tabs.len() {
                 let close_left = self.sidebar_width() - 42;
@@ -1054,9 +1063,29 @@ impl App {
         let old_tab = self.hover_tab;
         let old_target = self.hover_target;
         let old_mode_menu = self.mode_menu_open;
+        let old_hovering = self.hovering_sidebar;
         self.hover_close = None;
         self.hover_tab = None;
         self.hover_target = None;
+
+        if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
+            self.set_sidebar_mode(SidebarMode::Overlay);
+        }
+
+        if self.sidebar_mode == SidebarMode::Overlay
+            && self.sidebar_width > SIDEBAR_EXPANDED * 0.8
+            && (x as f32) > self.sidebar_width + 20.0
+        {
+            self.hovering_sidebar = false;
+            self.set_sidebar_mode(SidebarMode::Hidden);
+            return;
+        }
+
+        if (x as f32) < self.sidebar_width + 4.0 && self.sidebar_width > 0.5 {
+            self.hovering_sidebar = true;
+        } else {
+            self.hovering_sidebar = false;
+        }
 
         if point_in_rect(x, y, self.logo_rect()) {
             self.hover_target = Some(HoverTarget::Logo);
@@ -1092,18 +1121,11 @@ impl App {
             }
         }
 
-        let sidebar_active_width = if self.is_overlay() {
-            self.sidebar_width()
-        } else if self.sidebar_visible {
-            self.sidebar_width()
-        } else {
-            0
-        };
-        if sidebar_active_width > 92 && x < sidebar_active_width && y >= TAB_TOP {
+        if self.sidebar_width() > 92 && (x as f32) < self.sidebar_width && y >= TAB_TOP {
             let index = ((y - TAB_TOP) / TAB_HEIGHT) as usize;
             if index < self.tabs.len() {
                 self.hover_tab = Some(index);
-                if x >= sidebar_active_width - 42 {
+                if x >= self.sidebar_width() - 42 {
                     self.hover_close = Some(index);
                 }
             }
@@ -1112,81 +1134,29 @@ impl App {
             || old_tab != self.hover_tab
             || old_target != self.hover_target
             || old_mode_menu != self.mode_menu_open
+            || old_hovering != self.hovering_sidebar
         {
             self.refresh();
         }
     }
 
     fn toggle_sidebar(&mut self) {
-        if self.hover_overlay_active {
-            self.hover_overlay_active = false;
-            self.sidebar_target = SIDEBAR_COLLAPSED;
-            self.animating_sidebar = true;
-            unsafe {
-                let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
-            }
-            return;
+        match self.sidebar_mode {
+            SidebarMode::Hidden => self.set_sidebar_mode(SidebarMode::Pushed),
+            SidebarMode::Pushed => self.set_sidebar_mode(SidebarMode::Hidden),
+            SidebarMode::Overlay => self.set_sidebar_mode(SidebarMode::Hidden),
         }
-        self.sidebar_visible = !self.sidebar_visible;
-        self.sidebar_target = if self.sidebar_visible {
-            SIDEBAR_EXPANDED
-        } else {
-            SIDEBAR_COLLAPSED
+    }
+
+    fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        self.sidebar_mode = mode;
+        self.sidebar_target = match mode {
+            SidebarMode::Hidden => SIDEBAR_HIDDEN,
+            SidebarMode::Overlay | SidebarMode::Pushed => SIDEBAR_EXPANDED,
         };
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
-        }
-    }
-
-    fn start_hover_overlay(&mut self) {
-        if self.sidebar_visible || self.animating_sidebar {
-            return;
-        }
-        self.hover_overlay_active = true;
-        self.sidebar_target = SIDEBAR_EXPANDED;
-        self.animating_sidebar = true;
-        unsafe {
-            let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
-        }
-    }
-
-    fn end_hover_overlay(&mut self) {
-        if !self.hover_overlay_active || self.animating_sidebar {
-            return;
-        }
-        self.hover_overlay_active = false;
-        self.sidebar_target = SIDEBAR_COLLAPSED;
-        self.animating_sidebar = true;
-        unsafe {
-            let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
-        }
-    }
-
-    fn check_hover(&mut self) {
-        if self.sidebar_visible || self.animating_sidebar {
-            return;
-        }
-        unsafe {
-            let mut pt = windows::Win32::Foundation::POINT::default();
-            if GetCursorPos(&mut pt).is_err() {
-                return;
-            }
-            if !ScreenToClient(self.hwnd, &mut pt).as_bool() {
-                return;
-            }
-            let x = pt.x;
-            let y = pt.y;
-            if x >= 0 && x < HOVER_TRIGGER_ZONE && y >= 0 {
-                if !self.hover_overlay_active {
-                    self.start_hover_overlay();
-                }
-            } else if self.hover_overlay_active && self.sidebar_width > SIDEBAR_EXPANDED - 1.0 {
-                let rect = client_rect(self.hwnd);
-                if x < 0 || x >= self.sidebar_width() || y < 0 || y >= rect.bottom {
-                    self.end_hover_overlay();
-                }
-            }
         }
     }
 
@@ -1197,6 +1167,9 @@ impl App {
             self.animating_sidebar = false;
             unsafe {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), SIDEBAR_TIMER_ID);
+            }
+            if self.sidebar_width < 0.5 {
+                self.sidebar_mode = SidebarMode::Hidden;
             }
         } else {
             self.sidebar_width += distance * 0.22;
@@ -1533,10 +1506,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         WM_TIMER => {
             if w_param.0 == SIDEBAR_TIMER_ID {
                 with_app(hwnd, |app| app.tick_sidebar_animation());
-                return LRESULT(0);
-            }
-            if w_param.0 == HOVER_TIMER_ID {
-                with_app(hwnd, |app| app.check_hover());
                 return LRESULT(0);
             }
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
