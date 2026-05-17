@@ -672,16 +672,18 @@ impl App {
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
         let address = self.address_rect();
-        unsafe {
-            let _ = WindowsAndMessaging::SetWindowPos(
-                self.address_hwnd,
-                None,
-                address.left + 36,
-                address.top + 7,
-                (address.right - address.left - 52).max(120),
-                22,
-                WindowsAndMessaging::SWP_NOZORDER,
-            );
+        if !self.animating_sidebar {
+            unsafe {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.address_hwnd,
+                    None,
+                    address.left + 36,
+                    address.top + 7,
+                    (address.right - address.left - 52).max(120),
+                    22,
+                    WindowsAndMessaging::SWP_NOZORDER,
+                );
+            }
         }
 
         let sidebar_width = self.sidebar_width();
@@ -875,6 +877,22 @@ impl App {
                 },
                 COLOR_MUTED,
             );
+            if self.animating_sidebar {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    draw_text(
+                        hdc,
+                        &self.fonts.body,
+                        &tab.url,
+                        RECT {
+                            left: edit_rect.left + 38,
+                            top: edit_rect.top,
+                            right: edit_rect.right - 14,
+                            bottom: edit_rect.bottom,
+                        },
+                        COLOR_MUTED,
+                    );
+                }
+            }
 
             draw_settings_button(
                 hdc,
@@ -1246,6 +1264,7 @@ impl App {
             if mode != SidebarMode::Hidden {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
             }
+            let _ = WindowsAndMessaging::ShowWindow(self.address_hwnd, WindowsAndMessaging::SW_HIDE);
             if mode == SidebarMode::Hidden {
                 self.clear_webview_clipping();
             }
@@ -1288,6 +1307,7 @@ impl App {
             }
             self.layout();
             unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(self.address_hwnd, WindowsAndMessaging::SW_SHOW);
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
                 let _ = Gdi::UpdateWindow(self.hwnd);
             }
@@ -1653,6 +1673,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 let mem_dc = CreateCompatibleDC(Some(hdc));
                 let bitmap = CreateCompatibleBitmap(hdc, width, height);
                 let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+                let _ = FillRect(mem_dc, &rect, with_app_return(hwnd, |app| app.brushes.black).unwrap_or(solid_brush(0)));
                 with_app(hwnd, |app| app.paint(mem_dc));
                 let _ = BitBlt(hdc, 0, 0, width, height, Some(mem_dc), 0, 0, SRCCOPY);
                 let _ = SelectObject(mem_dc, old_bitmap);
