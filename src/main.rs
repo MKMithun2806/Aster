@@ -17,7 +17,7 @@ use windows::{
             MonitorFromWindow, MoveToEx, RedrawWindow, RoundRect, SelectObject, SetBkMode, SetTextColor,
             DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT,
             HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, TRANSPARENT,
-            RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+            RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
         },
         System::{Com::*, LibraryLoader},
         UI::{
@@ -628,6 +628,11 @@ impl App {
         let rect = client_rect(self.hwnd);
         let address = self.address_rect();
         unsafe {
+            let flags = if self.animating_sidebar {
+                WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW
+            } else {
+                WindowsAndMessaging::SWP_NOZORDER
+            };
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.address_hwnd,
                 None,
@@ -635,7 +640,7 @@ impl App {
                 address.top + 7,
                 (address.right - address.left - 52).max(120),
                 22,
-                WindowsAndMessaging::SWP_NOZORDER,
+                flags,
             );
         }
 
@@ -1111,7 +1116,7 @@ impl App {
                 Some(self.hwnd),
                 None,
                 None,
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_ERASE,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
             );
         }
     }
