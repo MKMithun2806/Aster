@@ -15,9 +15,9 @@ use windows::{
             self, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
             CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
             GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, RoundRect,
-            SelectObject, SetBkMode, SetTextColor, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-            DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH,
-            NULL_PEN, TRANSPARENT,
+            ScreenToClient, SelectObject, SetBkMode, SetTextColor, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS,
+            DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
+            MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, TRANSPARENT,
         },
         System::{Com::*, LibraryLoader},
         UI::{
@@ -27,14 +27,14 @@ use windows::{
                 GetKeyState, SetFocus, VK_CONTROL, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA,
-                GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
-                WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
-                WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
-                WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
-                WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
-                WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
-                WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetCursorPos,
+                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL,
+                IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE,
+                WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
+                WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+                WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT,
+                WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPSIBLINGS,
+                WS_EX_DLGMODALFRAME, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
     },
@@ -51,6 +51,7 @@ const TOPBAR_HEIGHT: i32 = 58;
 const TAB_HEIGHT: i32 = 48;
 const TAB_TOP: i32 = 76;
 const SIDEBAR_TIMER_ID: usize = 42;
+const HOVER_TIMER_ID: usize = 43;
 
 const COLOR_BLACK: u32 = 0x000000;
 const COLOR_PANEL: u32 = 0x090909;
@@ -271,6 +272,9 @@ impl App {
             saved_rect: RECT::default(),
         };
         app.create_tab(DEFAULT_URL)?;
+        unsafe {
+            let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_TIMER_ID, 100, None);
+        }
         Ok(app)
     }
 
@@ -696,120 +700,100 @@ impl App {
                         COLOR_BORDER,
                     );
                 }
+            }
 
-                let topbar = RECT {
-                    left: sidebar_width,
-                    top: 0,
+            let topbar = RECT {
+                left: sidebar_width,
+                top: 0,
+                right: rect.right,
+                bottom: TOPBAR_HEIGHT,
+            };
+            let _ = FillRect(hdc, &topbar, self.brushes.panel);
+            fill_rect(
+                hdc,
+                RECT {
+                    left: topbar.left,
+                    top: TOPBAR_HEIGHT - 1,
                     right: rect.right,
                     bottom: TOPBAR_HEIGHT,
-                };
-                let _ = FillRect(hdc, &topbar, self.brushes.panel);
-                fill_rect(
+                },
+                0x202020,
+            );
+
+            draw_logo(
+                hdc,
+                self.logo_rect(),
+                self.hover_target == Some(HoverTarget::Logo),
+            );
+            let new_tab_opacity = self.new_tab_opacity();
+            if new_tab_opacity > 0.08 {
+                draw_icon_button(
                     hdc,
-                    RECT {
-                        left: topbar.left,
-                        top: TOPBAR_HEIGHT - 1,
-                        right: rect.right,
-                        bottom: TOPBAR_HEIGHT,
-                    },
-                    0x202020,
-                );
-            } else {
-                let topbar = RECT {
-                    left: 0,
-                    top: 0,
-                    right: rect.right,
-                    bottom: TOPBAR_HEIGHT,
-                };
-                let _ = FillRect(hdc, &topbar, self.brushes.panel);
-                fill_rect(
-                    hdc,
-                    RECT {
-                        left: topbar.left,
-                        top: TOPBAR_HEIGHT - 1,
-                        right: rect.right,
-                        bottom: TOPBAR_HEIGHT,
-                    },
-                    0x202020,
+                    self.new_tab_rect(),
+                    IconKind::Plus,
+                    self.hover_target == Some(HoverTarget::NewTab),
+                    new_tab_opacity,
+                    &self.fonts.icon,
                 );
             }
 
-            if sidebar_width > 0 {
-                draw_logo(
-                    hdc,
-                    self.logo_rect(),
-                    self.hover_target == Some(HoverTarget::Logo),
-                );
-                let new_tab_opacity = self.new_tab_opacity();
-                if new_tab_opacity > 0.08 {
-                    draw_icon_button(
-                        hdc,
-                        self.new_tab_rect(),
-                        IconKind::Plus,
-                        self.hover_target == Some(HoverTarget::NewTab),
-                        new_tab_opacity,
-                        &self.fonts.icon,
-                    );
+            let (back, forward, reload) = self.top_button_rects();
+            draw_icon_button(
+                hdc,
+                back,
+                IconKind::Back,
+                self.hover_target == Some(HoverTarget::Back),
+                1.0,
+                &self.fonts.icon,
+            );
+            draw_icon_button(
+                hdc,
+                forward,
+                IconKind::Forward,
+                self.hover_target == Some(HoverTarget::Forward),
+                1.0,
+                &self.fonts.icon,
+            );
+            draw_icon_button(
+                hdc,
+                reload,
+                IconKind::Reload,
+                self.hover_target == Some(HoverTarget::Reload),
+                1.0,
+                &self.fonts.icon,
+            );
+
+            let edit_rect = self.address_rect();
+            fill_round_rect(hdc, edit_rect, 0x151515, 12);
+            draw_outline(hdc, edit_rect, COLOR_BORDER, 12);
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE774).as_str(),
+                RECT {
+                    left: edit_rect.left + 10,
+                    top: edit_rect.top,
+                    right: edit_rect.left + 34,
+                    bottom: edit_rect.bottom,
+                },
+                COLOR_MUTED,
+            );
+
+            draw_settings_button(
+                hdc,
+                self.settings_rect(),
+                self.hover_target == Some(HoverTarget::Settings),
+                &self.fonts.icon,
+            );
+
+            if sidebar_width > 92 {
+                for (index, tab) in self.tabs.iter().enumerate() {
+                    self.paint_tab(hdc, index, tab);
                 }
+            }
 
-                let (back, forward, reload) = self.top_button_rects();
-                draw_icon_button(
-                    hdc,
-                    back,
-                    IconKind::Back,
-                    self.hover_target == Some(HoverTarget::Back),
-                    1.0,
-                    &self.fonts.icon,
-                );
-                draw_icon_button(
-                    hdc,
-                    forward,
-                    IconKind::Forward,
-                    self.hover_target == Some(HoverTarget::Forward),
-                    1.0,
-                    &self.fonts.icon,
-                );
-                draw_icon_button(
-                    hdc,
-                    reload,
-                    IconKind::Reload,
-                    self.hover_target == Some(HoverTarget::Reload),
-                    1.0,
-                    &self.fonts.icon,
-                );
-
-                let edit_rect = self.address_rect();
-                fill_round_rect(hdc, edit_rect, 0x151515, 12);
-                draw_outline(hdc, edit_rect, COLOR_BORDER, 12);
-                draw_icon_glyph(
-                    hdc,
-                    &self.fonts.icon,
-                    glyph(0xE774).as_str(),
-                    RECT {
-                        left: edit_rect.left + 10,
-                        top: edit_rect.top,
-                        right: edit_rect.left + 34,
-                        bottom: edit_rect.bottom,
-                    },
-                    COLOR_MUTED,
-                );
-
-                draw_settings_button(
-                    hdc,
-                    self.settings_rect(),
-                    self.hover_target == Some(HoverTarget::Settings),
-                    &self.fonts.icon,
-                );
-
-                if sidebar_width > 92 {
-                    for (index, tab) in self.tabs.iter().enumerate() {
-                        self.paint_tab(hdc, index, tab);
-                    }
-                }
-
-                if self.settings_open {
-                    self.paint_settings_menu(hdc);
-                }
+            if self.settings_open {
+                self.paint_settings_menu(hdc);
             }
         }
     }
@@ -1074,19 +1058,6 @@ impl App {
         self.hover_tab = None;
         self.hover_target = None;
 
-        if x < HOVER_TRIGGER_ZONE && !self.sidebar_visible && !self.animating_sidebar {
-            if !self.hover_overlay_active {
-                self.start_hover_overlay();
-            }
-        } else if self.hover_overlay_active
-            && !self.animating_sidebar
-            && self.sidebar_width > SIDEBAR_EXPANDED - 1.0
-        {
-            if x < 0 || x >= self.sidebar_width() || y < 0 || y >= client_rect(self.hwnd).bottom {
-                self.end_hover_overlay();
-            }
-        }
-
         if point_in_rect(x, y, self.logo_rect()) {
             self.hover_target = Some(HoverTarget::Logo);
         } else if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
@@ -1189,6 +1160,33 @@ impl App {
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
+        }
+    }
+
+    fn check_hover(&mut self) {
+        if self.sidebar_visible || self.animating_sidebar {
+            return;
+        }
+        unsafe {
+            let mut pt = windows::Win32::Foundation::POINT::default();
+            if GetCursorPos(&mut pt).is_err() {
+                return;
+            }
+            if !ScreenToClient(self.hwnd, &mut pt).as_bool() {
+                return;
+            }
+            let x = pt.x;
+            let y = pt.y;
+            if x >= 0 && x < HOVER_TRIGGER_ZONE && y >= 0 {
+                if !self.hover_overlay_active {
+                    self.start_hover_overlay();
+                }
+            } else if self.hover_overlay_active && self.sidebar_width > SIDEBAR_EXPANDED - 1.0 {
+                let rect = client_rect(self.hwnd);
+                if x < 0 || x >= self.sidebar_width() || y < 0 || y >= rect.bottom {
+                    self.end_hover_overlay();
+                }
+            }
         }
     }
 
@@ -1535,6 +1533,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         WM_TIMER => {
             if w_param.0 == SIDEBAR_TIMER_ID {
                 with_app(hwnd, |app| app.tick_sidebar_animation());
+                return LRESULT(0);
+            }
+            if w_param.0 == HOVER_TIMER_ID {
+                with_app(hwnd, |app| app.check_hover());
                 return LRESULT(0);
             }
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
