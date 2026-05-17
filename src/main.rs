@@ -735,9 +735,6 @@ impl App {
                 let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
                     || (self.sidebar_mode == SidebarMode::Hidden
                         && self.sidebar_expand_mode == SidebarMode::Overlay
-                        && self.sidebar_target >= SIDEBAR_EXPANDED)
-                    || (self.sidebar_mode == SidebarMode::Hidden
-                        && self.sidebar_expand_mode == SidebarMode::Pushed
                         && self.sidebar_target >= SIDEBAR_EXPANDED);
                 if needs_clipping && sidebar_width > 0 {
                     if (sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 {
@@ -1290,14 +1287,21 @@ impl App {
             self.layout();
             let rect = client_rect(self.hwnd);
             let sw = self.sidebar_width.ceil() as i32;
-            let region = RECT {
+            let topbar = RECT {
                 left: 0,
                 top: 0,
-                right: sw.max(124 + 56 + 8),
-                bottom: TOPBAR_HEIGHT.max(rect.bottom),
+                right: rect.right,
+                bottom: TOPBAR_HEIGHT,
+            };
+            let sidebar = RECT {
+                left: 0,
+                top: TOPBAR_HEIGHT,
+                right: sw,
+                bottom: rect.bottom,
             };
             unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), Some(&region), false);
+                let _ = InvalidateRect(Some(self.hwnd), Some(&topbar), false);
+                let _ = InvalidateRect(Some(self.hwnd), Some(&sidebar), false);
             }
         }
     }
