@@ -12,12 +12,12 @@ use windows::{
             DWMWA_USE_IMMERSIVE_DARK_MODE,
         },
         Graphics::Gdi::{
-            self, BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW,
-            EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo,
-            MonitorFromWindow, MoveToEx, RedrawWindow, RoundRect, SelectObject, SetBkMode, SetTextColor,
-            DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT,
-            HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, TRANSPARENT,
-            RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW,
+            self, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
+            CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+            GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, RoundRect,
+            SelectObject, SetBkMode, SetTextColor, SRCCOPY, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
+            DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH,
+            NULL_PEN, TRANSPARENT,
         },
         System::{Com::*, LibraryLoader},
         UI::{
@@ -1112,17 +1112,8 @@ impl App {
         }
         self.layout();
         unsafe {
-            let flags = if self.animating_sidebar {
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN
-            } else {
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN
-            };
-            let _ = RedrawWindow(
-                Some(self.hwnd),
-                None,
-                None,
-                flags,
-            );
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+            let _ = Gdi::UpdateWindow(self.hwnd);
         }
     }
 
@@ -1421,7 +1412,17 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             unsafe {
                 let mut ps = mem::zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                with_app(hwnd, |app| app.paint(hdc));
+                let rect = client_rect(hwnd);
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
+                let mem_dc = CreateCompatibleDC(Some(hdc));
+                let bitmap = CreateCompatibleBitmap(hdc, width, height);
+                let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+                with_app(hwnd, |app| app.paint(mem_dc));
+                let _ = BitBlt(hdc, 0, 0, width, height, Some(mem_dc), 0, 0, SRCCOPY);
+                let _ = SelectObject(mem_dc, old_bitmap);
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                let _ = DeleteDC(mem_dc);
                 let _ = EndPaint(hwnd, &ps);
             }
             LRESULT(0)
