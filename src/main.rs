@@ -1,6 +1,6 @@
 #![windows_subsystem = "windows"]
 
-use std::{mem, sync::mpsc};
+use std::{cell::Cell, mem, sync::mpsc};
 
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
@@ -225,6 +225,7 @@ struct App {
     sidebar_expand_mode: SidebarMode,
     animating_sidebar: bool,
     hovering_sidebar: bool,
+    last_clip_width: Cell<f32>,
     site_mode: SiteMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -274,6 +275,7 @@ impl App {
             sidebar_expand_mode: SidebarMode::Hidden,
             animating_sidebar: false,
             hovering_sidebar: false,
+            last_clip_width: Cell::new(0.0),
             site_mode: SiteMode::Auto,
             settings_open: false,
             mode_menu_open: false,
@@ -725,24 +727,30 @@ impl App {
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
                 let _ = tab.controller.SetBounds(bounds);
-                if self.sidebar_mode == SidebarMode::Overlay
+                let is_overlay_mode = self.sidebar_mode == SidebarMode::Overlay
                     || (self.sidebar_mode == SidebarMode::Hidden
                         && self.sidebar_expand_mode == SidebarMode::Overlay
-                        && self.sidebar_target >= SIDEBAR_EXPANDED)
-                {
-                    if sidebar_width > 0 {
+                        && self.sidebar_target >= SIDEBAR_EXPANDED);
+                if is_overlay_mode && sidebar_width > 0 {
+                    if (sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 {
+                        let clip_left = sidebar_width;
+                        let clip_top = 0;
+                        let clip_right = rect.right;
+                        let clip_bottom = rect.bottom - TOPBAR_HEIGHT;
                         let region = CreateRectRgn(
-                            sidebar_width,
-                            TOPBAR_HEIGHT,
-                            rect.right,
-                            rect.bottom,
+                            clip_left,
+                            clip_top,
+                            clip_right,
+                            clip_bottom,
                         );
                         let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
-                    } else {
-                        let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                        self.last_clip_width.set(sidebar_width as f32);
                     }
                 } else {
-                    let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                    if self.last_clip_width.get() != 0.0 {
+                        let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                        self.last_clip_width.set(0.0);
+                    }
                 }
                 let _ = tab.controller.SetIsVisible(i == self.active);
             }
@@ -1264,6 +1272,7 @@ impl App {
     }
 
     fn clear_webview_clipping(&self) {
+        self.last_clip_width.set(0.0);
         for tab in &self.tabs {
             unsafe {
                 let _ = SetWindowRgn(tab.child_hwnd, None, true);
