@@ -27,8 +27,8 @@ use windows::{
                 GetKeyState, SetFocus, VK_CONTROL, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetCursorPos, GetTopWindow, GetWindow,
-                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GW_HWNDNEXT, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
+                self, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GetCursorPos, GetTopWindow,
+                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
                 WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
                 WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
                 WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
@@ -42,7 +42,7 @@ use windows::{
 
 const APP_NAME: PCWSTR = w!("Aster");
 const CLASS_NAME: PCWSTR = w!("AsterWindow");
-const ADDRESS_ID: i32 = 1001;
+const URL_POPUP_EDIT_ID: i32 = 1001;
 const DEFAULT_URL: &str = "https://www.google.com";
 const SIDEBAR_EXPANDED: f32 = 248.0;
 const SIDEBAR_HIDDEN: f32 = 0.0;
@@ -64,7 +64,7 @@ const COLOR_TEXT: u32 = 0xf5f5f5;
 const COLOR_MUTED: u32 = 0xa1a1a1;
 const COLOR_ACCENT: u32 = 0xf16f63;
 
-static mut OLD_ADDRESS_PROC: WNDPROC = None;
+static mut OLD_URL_POPUP_PROC: WNDPROC = None;
 
 type AppResult<T> = std::result::Result<T, AppError>;
 
@@ -111,6 +111,63 @@ impl From<mpsc::RecvError> for AppError {
     }
 }
 
+fn create_url_popup_edit(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("EDIT"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_TABSTOP.0),
+            0,
+            0,
+            500,
+            36,
+            Some(parent),
+            Some(HMENU(URL_POPUP_EDIT_ID as usize as *mut _)),
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        let _ = WindowsAndMessaging::SendMessageW(
+            hwnd,
+            EM_SETMARGINS,
+            Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
+            Some(LPARAM((8 | (8 << 16)) as isize)),
+        );
+        OLD_URL_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            url_popup_edit_proc as *const () as isize,
+        ));
+        Ok(hwnd)
+    }
+}
+
+unsafe extern "system" fn url_popup_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        if w_param.0 as u32 == VK_RETURN.0 as u32 {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| app.handle_url_popup_submit());
+            }
+            return LRESULT(0);
+        }
+        if w_param.0 as u32 == 0x1B {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| app.close_url_popup());
+            }
+            return LRESULT(0);
+        }
+    }
+    if msg == WM_CHAR && (w_param.0 as u32 == VK_RETURN.0 as u32 || w_param.0 as u32 == 0x1B) {
+        return LRESULT(0);
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_URL_POPUP_PROC, hwnd, msg, w_param, l_param)
+}
+
 struct Tab {
     id: usize,
     title: String,
@@ -132,6 +189,13 @@ enum HoverTarget {
     ModeAuto,
     ModeDark,
     ModeLight,
+    UrlBar,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum UrlPopupMode {
+    Display,
+    NewTab,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -212,7 +276,7 @@ impl Drop for UiBrushes {
 
 struct App {
     hwnd: HWND,
-    address_hwnd: HWND,
+    url_popup_edit_hwnd: HWND,
     environment: ICoreWebView2Environment,
     tabs: Vec<Tab>,
     active: usize,
@@ -233,6 +297,8 @@ struct App {
     site_mode: SiteMode,
     settings_open: bool,
     mode_menu_open: bool,
+    url_popup_open: bool,
+    url_popup_mode: UrlPopupMode,
     fullscreen: bool,
     saved_style: isize,
     saved_rect: RECT,
@@ -253,10 +319,10 @@ impl App {
             edit: solid_brush(0x151515),
         };
 
-        let address_hwnd = create_address_bar(hwnd)?;
+        let url_popup_edit_hwnd = create_url_popup_edit(hwnd)?;
         unsafe {
             let _ = WindowsAndMessaging::SendMessageW(
-                address_hwnd,
+                url_popup_edit_hwnd,
                 WM_SETFONT,
                 Some(WPARAM(fonts.url.0 as usize)),
                 Some(LPARAM(1)),
@@ -264,7 +330,7 @@ impl App {
         }
         let mut app = Self {
             hwnd,
-            address_hwnd,
+            url_popup_edit_hwnd,
             environment,
             tabs: Vec::new(),
             active: 0,
@@ -285,6 +351,8 @@ impl App {
             site_mode: SiteMode::Auto,
             settings_open: false,
             mode_menu_open: false,
+            url_popup_open: false,
+            url_popup_mode: UrlPopupMode::Display,
             fullscreen: false,
             saved_style: 0,
             saved_rect: RECT::default(),
@@ -317,7 +385,7 @@ impl App {
             controller.SetIsVisible(false)?;
         }
 
-        let child_hwnd = find_webview_child(self.hwnd, self.address_hwnd);
+        let child_hwnd = find_webview_child(self.hwnd);
 
         self.tabs.push(Tab {
             id,
@@ -457,7 +525,7 @@ impl App {
                 url
             };
             if index == self.active {
-                set_window_text(self.address_hwnd, &tab.url);
+                self.refresh();
             }
         }
         self.refresh();
@@ -475,7 +543,6 @@ impl App {
         self.active = index;
         self.layout();
         if let Some(tab) = self.tabs.get(index) {
-            set_window_text(self.address_hwnd, &tab.url);
             unsafe {
                 let _ = tab
                     .controller
@@ -502,23 +569,63 @@ impl App {
         self.switch_to(next);
     }
 
-    fn navigate_active_from_address(&mut self) {
-        let raw = get_window_text(self.address_hwnd);
-        let url = normalize_address(&raw);
-        self.navigate_active(&url);
+    fn current_url(&self) -> String {
+        self.tabs.get(self.active).map(|t| t.url.clone()).unwrap_or_default()
     }
 
     fn navigate_active(&mut self, url: &str) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.url = url.to_string();
             tab.title = label_for_url(url);
-            set_window_text(self.address_hwnd, url);
             let wide = CoTaskMemPWSTR::from(url);
             unsafe {
                 let _ = tab.webview.Navigate(*wide.as_ref().as_pcwstr());
             }
         }
         self.refresh();
+    }
+
+    fn open_url_popup(&mut self, mode: UrlPopupMode) {
+        self.url_popup_open = true;
+        self.url_popup_mode = mode;
+        let text = match mode {
+            UrlPopupMode::Display => self.current_url(),
+            UrlPopupMode::NewTab => String::new(),
+        };
+        set_window_text(self.url_popup_edit_hwnd, &text);
+        unsafe {
+            let _ = WindowsAndMessaging::ShowWindow(self.url_popup_edit_hwnd, WindowsAndMessaging::SW_SHOW);
+            let _ = WindowsAndMessaging::SendMessageW(
+                self.url_popup_edit_hwnd,
+                EM_SETSEL,
+                Some(WPARAM(0)),
+                Some(LPARAM(-1)),
+            );
+            let _ = SetFocus(Some(self.url_popup_edit_hwnd));
+        }
+        self.refresh();
+    }
+
+    fn close_url_popup(&mut self) {
+        self.url_popup_open = false;
+        unsafe {
+            let _ = WindowsAndMessaging::ShowWindow(self.url_popup_edit_hwnd, WindowsAndMessaging::SW_HIDE);
+        }
+        self.refresh();
+    }
+
+    fn handle_url_popup_submit(&mut self) {
+        let raw = get_window_text(self.url_popup_edit_hwnd);
+        let url = normalize_address(&raw);
+        match self.url_popup_mode {
+            UrlPopupMode::Display => {
+                self.navigate_active(&url);
+            }
+            UrlPopupMode::NewTab => {
+                let _ = self.create_tab(&url);
+            }
+        }
+        self.close_url_popup();
     }
 
     fn go_back(&self) {
@@ -576,24 +683,9 @@ impl App {
     fn top_button_rects(&self) -> (RECT, RECT, RECT) {
         let x = self.top_button_x();
         (
-            RECT {
-                left: x,
-                top: 13,
-                right: x + 36,
-                bottom: 49,
-            },
-            RECT {
-                left: x + 44,
-                top: 13,
-                right: x + 80,
-                bottom: 49,
-            },
-            RECT {
-                left: x + 88,
-                top: 13,
-                right: x + 124,
-                bottom: 49,
-            },
+            RECT { left: x, top: 15, right: x + 28, bottom: 43 },
+            RECT { left: x + 32, top: 15, right: x + 60, bottom: 43 },
+            RECT { left: x + 64, top: 15, right: x + 92, bottom: 43 },
         )
     }
 
@@ -609,10 +701,10 @@ impl App {
     fn new_tab_rect(&self) -> RECT {
         let right = self.sidebar_width().max(SIDEBAR_EXPANDED as i32) - 16;
         RECT {
-            left: right - 36,
-            top: 13,
+            left: right - 28,
+            top: 15,
             right,
-            bottom: 49,
+            bottom: 43,
         }
     }
 
@@ -657,14 +749,45 @@ impl App {
         }
     }
 
-    fn address_rect(&self) -> RECT {
-        let rect = client_rect(self.hwnd);
+    fn compact_url_rect(&self) -> RECT {
+        let _rect = client_rect(self.hwnd);
         let (_, _, reload) = self.top_button_rects();
+        let new_tab = self.new_tab_rect();
+        let available_left = reload.right + 12;
+        let available_right = new_tab.left - 12;
+        let max_width = 200;
+        let available = (available_right - available_left).max(80);
+        let width = available.min(max_width);
+        let center = (available_left + available_right) / 2;
         RECT {
-            left: reload.right + 14,
-            top: 13,
-            right: (rect.right - 18).max(reload.right + 220),
-            bottom: 49,
+            left: center - width / 2,
+            top: 15,
+            right: center + width / 2,
+            bottom: 43,
+        }
+    }
+
+    fn url_popup_rect(&self) -> RECT {
+        let rect = client_rect(self.hwnd);
+        let width = 550;
+        let height = 220;
+        let left = ((rect.right - rect.left) - width) / 2;
+        let top = TOPBAR_HEIGHT + 22;
+        RECT {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        }
+    }
+
+    fn url_popup_input_rect(&self) -> RECT {
+        let popup = self.url_popup_rect();
+        RECT {
+            left: popup.left + 12,
+            top: popup.top + 12,
+            right: popup.right - 12,
+            bottom: popup.top + 52,
         }
     }
 
@@ -674,22 +797,20 @@ impl App {
 
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
-        let address = self.address_rect();
-        unsafe {
-            let flags = if self.animating_sidebar {
-                WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW
-            } else {
-                WindowsAndMessaging::SWP_NOZORDER
-            };
-            let _ = WindowsAndMessaging::SetWindowPos(
-                self.address_hwnd,
-                None,
-                address.left + 36,
-                address.top + 7,
-                (address.right - address.left - 52).max(120),
-                22,
-                flags,
-            );
+
+        if self.url_popup_open {
+            let input = self.url_popup_input_rect();
+            unsafe {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.url_popup_edit_hwnd,
+                    None,
+                    input.left,
+                    input.top,
+                    input.right - input.left,
+                    input.bottom - input.top,
+                    WindowsAndMessaging::SWP_NOZORDER,
+                );
+            }
         }
 
         let sidebar_width = self.sidebar_width();
@@ -838,57 +959,24 @@ impl App {
             );
             let new_tab_opacity = self.new_tab_opacity();
             if new_tab_opacity > 0.08 {
-                draw_icon_button(
+                draw_icon_plain(
                     hdc,
                     self.new_tab_rect(),
                     IconKind::Plus,
                     self.hover_target == Some(HoverTarget::NewTab),
-                    new_tab_opacity,
                     &self.fonts.icon,
+                    new_tab_opacity,
                 );
             }
 
             let (back, forward, reload) = self.top_button_rects();
-            draw_icon_button(
-                hdc,
-                back,
-                IconKind::Back,
-                self.hover_target == Some(HoverTarget::Back),
-                1.0,
-                &self.fonts.icon,
-            );
-            draw_icon_button(
-                hdc,
-                forward,
-                IconKind::Forward,
-                self.hover_target == Some(HoverTarget::Forward),
-                1.0,
-                &self.fonts.icon,
-            );
-            draw_icon_button(
-                hdc,
-                reload,
-                IconKind::Reload,
-                self.hover_target == Some(HoverTarget::Reload),
-                1.0,
-                &self.fonts.icon,
-            );
+            draw_icon_plain(hdc, back, IconKind::Back, self.hover_target == Some(HoverTarget::Back), &self.fonts.icon, 1.0);
+            draw_icon_plain(hdc, forward, IconKind::Forward, self.hover_target == Some(HoverTarget::Forward), &self.fonts.icon, 1.0);
+            draw_icon_plain(hdc, reload, IconKind::Reload, self.hover_target == Some(HoverTarget::Reload), &self.fonts.icon, 1.0);
 
-            let edit_rect = self.address_rect();
-            fill_round_rect(hdc, edit_rect, 0x151515, 12);
-            draw_outline(hdc, edit_rect, COLOR_BORDER, 12);
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.icon,
-                glyph(0xE774).as_str(),
-                RECT {
-                    left: edit_rect.left + 10,
-                    top: edit_rect.top,
-                    right: edit_rect.left + 34,
-                    bottom: edit_rect.bottom,
-                },
-                COLOR_MUTED,
-            );
+            if !self.url_popup_open {
+                self.paint_compact_url_bar(hdc);
+            }
 
             draw_settings_button(
                 hdc,
@@ -906,6 +994,81 @@ impl App {
             if self.settings_open {
                 self.paint_settings_menu(hdc);
             }
+
+            if self.url_popup_open {
+                self.paint_url_popup(hdc);
+            }
+        }
+    }
+
+    fn paint_compact_url_bar(&self, hdc: HDC) {
+        let rect = self.compact_url_rect();
+        unsafe {
+            if self.hover_target == Some(HoverTarget::UrlBar) {
+                fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 8);
+            }
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE774).as_str(),
+                RECT {
+                    left: rect.left + 6,
+                    top: rect.top,
+                    right: rect.left + 26,
+                    bottom: rect.bottom,
+                },
+                COLOR_MUTED,
+            );
+            let url = self.current_url();
+            let display = truncate_url_for_display(&url);
+            let text_rect = RECT {
+                left: rect.left + 24,
+                top: rect.top,
+                right: rect.right - 8,
+                bottom: rect.bottom,
+            };
+            draw_text(hdc, &self.fonts.url, &display, text_rect, COLOR_TEXT);
+        }
+    }
+
+    fn paint_url_popup(&self, hdc: HDC) {
+        let popup = self.url_popup_rect();
+        unsafe {
+            fill_round_rect(hdc, popup, 0x1a1a1a, 12);
+            draw_outline(hdc, popup, COLOR_BORDER, 12);
+
+            let input = self.url_popup_input_rect();
+            fill_round_rect(hdc, input, 0x151515, 8);
+            draw_outline(hdc, input, COLOR_BORDER, 8);
+
+            let hint = match self.url_popup_mode {
+                UrlPopupMode::Display => "Enter to navigate",
+                UrlPopupMode::NewTab => "Enter to create tab",
+            };
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                hint,
+                RECT {
+                    left: popup.left + 16,
+                    top: popup.bottom - 28,
+                    right: popup.right / 2,
+                    bottom: popup.bottom - 8,
+                },
+                COLOR_MUTED,
+            );
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                "Esc",
+                RECT {
+                    left: popup.right / 2,
+                    top: popup.bottom - 28,
+                    right: popup.right - 16,
+                    bottom: popup.bottom - 8,
+                },
+                COLOR_MUTED,
+            );
         }
     }
 
@@ -1079,6 +1242,14 @@ impl App {
     }
 
     fn handle_click(&mut self, x: i32, y: i32) {
+        if self.url_popup_open {
+            if !point_in_rect(x, y, self.url_popup_rect()) {
+                self.close_url_popup();
+                return;
+            }
+            return;
+        }
+
         if self.sidebar_mode == SidebarMode::Overlay
             && self.sidebar_width > SIDEBAR_EXPANDED * 0.5
             && (x as f32) >= self.sidebar_width
@@ -1117,6 +1288,7 @@ impl App {
                 self.mode_menu_open = false;
                 self.refresh();
             }
+            return;
         }
 
         if point_in_rect(x, y, self.logo_rect()) {
@@ -1124,8 +1296,13 @@ impl App {
             return;
         }
 
+        if point_in_rect(x, y, self.compact_url_rect()) {
+            self.open_url_popup(UrlPopupMode::Display);
+            return;
+        }
+
         if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
-            let _ = self.create_tab(DEFAULT_URL);
+            self.open_url_popup(UrlPopupMode::NewTab);
             return;
         }
 
@@ -1186,6 +1363,8 @@ impl App {
 
         if point_in_rect(x, y, self.logo_rect()) {
             self.hover_target = Some(HoverTarget::Logo);
+        } else if !self.url_popup_open && point_in_rect(x, y, self.compact_url_rect()) {
+            self.hover_target = Some(HoverTarget::UrlBar);
         } else if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
             self.hover_target = Some(HoverTarget::NewTab);
         } else {
@@ -1597,55 +1776,6 @@ fn enable_dark_titlebar(hwnd: HWND) {
     }
 }
 
-fn create_address_bar(parent: HWND) -> AppResult<HWND> {
-    unsafe {
-        let hwnd = WindowsAndMessaging::CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("EDIT"),
-            w!(""),
-            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0),
-            SIDEBAR_EXPANDED as i32 + 168,
-            20,
-            680,
-            22,
-            Some(parent),
-            Some(HMENU(ADDRESS_ID as usize as *mut _)),
-            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
-            None,
-        )?;
-        let _ = WindowsAndMessaging::SendMessageW(
-            hwnd,
-            EM_SETMARGINS,
-            Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
-            Some(LPARAM((2 | (2 << 16)) as isize)),
-        );
-        OLD_ADDRESS_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
-            hwnd,
-            GWLP_WNDPROC,
-            address_bar_proc as *const () as isize,
-        ));
-        Ok(hwnd)
-    }
-}
-
-unsafe extern "system" fn address_bar_proc(
-    hwnd: HWND,
-    msg: u32,
-    w_param: WPARAM,
-    l_param: LPARAM,
-) -> LRESULT {
-    if msg == WM_KEYDOWN && w_param.0 as u32 == VK_RETURN.0 as u32 {
-        if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
-            with_app(parent, |app| app.navigate_active_from_address());
-        }
-        return LRESULT(0);
-    }
-    if msg == WM_CHAR && w_param.0 as u32 == VK_RETURN.0 as u32 {
-        return LRESULT(0);
-    }
-    WindowsAndMessaging::CallWindowProcW(OLD_ADDRESS_PROC, hwnd, msg, w_param, l_param)
-}
-
 extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     match msg {
         WM_NCCREATE => {
@@ -1705,19 +1835,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
         WM_COMMAND => {
-            let id = loword(w_param.0 as u32) as i32;
-            let code = hiword(w_param.0 as u32) as u16;
-            if id == ADDRESS_ID && code == 0 {
-                with_app(hwnd, |app| app.navigate_active_from_address());
-                return LRESULT(0);
-            }
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
         WM_CHAR => {
-            if w_param.0 as u32 == VK_RETURN.0 as u32 {
-                with_app(hwnd, |app| app.navigate_active_from_address());
-                return LRESULT(0);
-            }
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
         WM_KEYDOWN => {
@@ -1771,18 +1891,9 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
         with_app(hwnd, |app| match key {
-            0x4C if ctrl => {
-                let _ = SetFocus(Some(app.address_hwnd));
-                let _ = WindowsAndMessaging::SendMessageW(
-                    app.address_hwnd,
-                    EM_SETSEL,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(-1)),
-                );
-            }
-            0x54 if ctrl => {
-                let _ = app.create_tab(DEFAULT_URL);
-            }
+            0x1B if app.url_popup_open => app.close_url_popup(),
+            0x4C if ctrl => app.open_url_popup(UrlPopupMode::Display),
+            0x54 if ctrl => app.open_url_popup(UrlPopupMode::NewTab),
             0x53 if ctrl => app.toggle_sidebar(),
             0x57 if ctrl => app.close_tab(app.active),
             0x25 if alt => app.go_back(),
@@ -1798,7 +1909,7 @@ fn is_aster_shortcut(key: u32) -> bool {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
-        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 if ctrl)
+        matches!(key, 0x1B | 0x4C | 0x53 | 0x54 | 0x57 if ctrl || key == 0x1B)
             || matches!(key, 0x25 | 0x27 if alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
@@ -1883,6 +1994,25 @@ fn draw_icon_button(
         fill_round_rect(hdc, rect, fill, 10);
         draw_outline(hdc, rect, border, 10);
         draw_icon_glyph(hdc, icon_font, icon.glyph(), rect, icon_color);
+    }
+}
+
+fn draw_icon_plain(hdc: HDC, rect: RECT, icon: IconKind, hovered: bool, icon_font: &HFONT, opacity: f32) {
+    unsafe {
+        if hovered {
+            let cx = (rect.left + rect.right) / 2;
+            let cy = (rect.top + rect.bottom) / 2;
+            let r = 15;
+            let highlight = RECT {
+                left: cx - r,
+                top: cy - r,
+                right: cx + r,
+                bottom: cy + r,
+            };
+            fill_round_rect(hdc, highlight, COLOR_SURFACE_HOVER, r);
+        }
+        let color = mix_color(COLOR_PANEL, COLOR_TEXT, opacity);
+        draw_icon_glyph(hdc, icon_font, icon.glyph(), rect, color);
     }
 }
 
@@ -2016,6 +2146,26 @@ fn glyph(codepoint: u32) -> String {
     char::from_u32(codepoint).unwrap_or(' ').to_string()
 }
 
+fn truncate_url_for_display(url: &str) -> String {
+    let mut s = url;
+    if let Some(stripped) = s.strip_prefix("https://") {
+        s = stripped;
+    } else if let Some(stripped) = s.strip_prefix("http://") {
+        s = stripped;
+    }
+    if let Some(stripped) = s.strip_prefix("www.") {
+        s = stripped;
+    }
+    if s.ends_with('/') && s.len() > 1 {
+        s = &s[..s.len() - 1];
+    }
+    if s.len() > 40 {
+        format!("{}...", &s[..37])
+    } else {
+        s.to_string()
+    }
+}
+
 fn mix_color(from: u32, to: u32, amount: f32) -> u32 {
     let t = amount.clamp(0.0, 1.0);
     let fr = (from & 0xff) as f32;
@@ -2038,16 +2188,9 @@ fn client_rect(hwnd: HWND) -> RECT {
     rect
 }
 
-fn find_webview_child(parent: HWND, exclude: HWND) -> HWND {
+fn find_webview_child(parent: HWND) -> HWND {
     unsafe {
-        let mut child = GetTopWindow(Some(parent)).unwrap_or_default();
-        while !child.is_invalid() {
-            if child != exclude {
-                return child;
-            }
-            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
-        }
-        HWND::default()
+        GetTopWindow(Some(parent)).unwrap_or_default()
     }
 }
 
