@@ -30,9 +30,9 @@ use windows::{
                 GWLP_WNDPROC, GWL_STYLE, HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG,
                 WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
                 WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
-                WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
+                WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
                 WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
-                WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
+                WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
                 WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
@@ -1282,7 +1282,7 @@ fn create_main_window() -> AppResult<HWND> {
             WS_EX_DLGMODALFRAME,
             CLASS_NAME,
             APP_NAME,
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1280,
@@ -1464,6 +1464,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             LRESULT(brush.0 as isize)
         },
         WM_SETCURSOR => unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) },
+        WM_ERASEBKGND => LRESULT(1),
         WM_CLOSE => {
             unsafe {
                 let _ = WindowsAndMessaging::DestroyWindow(hwnd);
