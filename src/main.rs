@@ -544,7 +544,9 @@ impl App {
     fn top_button_x(&self) -> i32 {
         match self.sidebar_mode {
             SidebarMode::Hidden => {
-                if self.sidebar_target >= SIDEBAR_EXPANDED {
+                if self.animating_sidebar {
+                    56
+                } else if self.sidebar_target >= SIDEBAR_EXPANDED {
                     match self.sidebar_expand_mode {
                         SidebarMode::Overlay => 56,
                         SidebarMode::Pushed => self.sidebar_width().max(56),
@@ -555,7 +557,13 @@ impl App {
                 }
             }
             SidebarMode::Overlay => 56,
-            SidebarMode::Pushed => self.sidebar_width().max(56),
+            SidebarMode::Pushed => {
+                if self.animating_sidebar {
+                    56
+                } else {
+                    self.sidebar_width().max(56)
+                }
+            }
         }
     }
 
@@ -659,14 +667,25 @@ impl App {
     }
 
     fn layout(&self) {
+        self.layout_for_mode(self.sidebar_mode);
+    }
+
+    fn layout_for_mode(&self, mode: SidebarMode) {
         let rect = client_rect(self.hwnd);
-        let address = self.address_rect();
+        let sidebar_width = self.sidebar_width();
+        let (address_left, webview_left) = match mode {
+            SidebarMode::Hidden => (56 + 18, HOVER_ZONE),
+            SidebarMode::Overlay => (56 + 18, 0),
+            SidebarMode::Pushed => (sidebar_width + 18, sidebar_width),
+        };
+
+        let address = RECT {
+            left: address_left,
+            top: 13,
+            right: (rect.right - 18).max(address_left + 220),
+            bottom: 49,
+        };
         unsafe {
-            let flags = if self.animating_sidebar {
-                WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW
-            } else {
-                WindowsAndMessaging::SWP_NOZORDER
-            };
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.address_hwnd,
                 None,
@@ -674,85 +693,66 @@ impl App {
                 address.top + 7,
                 (address.right - address.left - 52).max(120),
                 22,
-                flags,
+                WindowsAndMessaging::SWP_NOZORDER,
             );
         }
 
-        let sidebar_width = self.sidebar_width();
-        let bounds = match self.sidebar_mode {
-            SidebarMode::Hidden => {
-                if self.sidebar_target >= SIDEBAR_EXPANDED {
-                    match self.sidebar_expand_mode {
-                        SidebarMode::Overlay => RECT {
-                            left: 0,
-                            top: TOPBAR_HEIGHT,
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        },
-                        SidebarMode::Pushed => RECT {
-                            left: sidebar_width,
-                            top: TOPBAR_HEIGHT,
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        },
-                        _ => RECT {
-                            left: HOVER_ZONE,
-                            top: TOPBAR_HEIGHT,
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        },
-                    }
-                } else {
-                    RECT {
-                        left: HOVER_ZONE,
-                        top: TOPBAR_HEIGHT,
-                        right: rect.right,
-                        bottom: rect.bottom,
-                    }
-                }
-            }
-            SidebarMode::Overlay => RECT {
-                left: 0,
-                top: TOPBAR_HEIGHT,
-                right: rect.right,
-                bottom: rect.bottom,
-            },
-            SidebarMode::Pushed => RECT {
-                left: sidebar_width,
-                top: TOPBAR_HEIGHT,
-                right: rect.right,
-                bottom: rect.bottom,
-            },
+        let bounds = RECT {
+            left: webview_left,
+            top: TOPBAR_HEIGHT,
+            right: rect.right,
+            bottom: rect.bottom,
         };
-        for (i, tab) in self.tabs.iter().enumerate() {
+        for tab in self.tabs.iter() {
             unsafe {
                 let _ = tab.controller.SetBounds(bounds);
-                let is_overlay_mode = self.sidebar_mode == SidebarMode::Overlay
-                    || (self.sidebar_mode == SidebarMode::Hidden
-                        && self.sidebar_expand_mode == SidebarMode::Overlay
-                        && self.sidebar_target >= SIDEBAR_EXPANDED);
-                if is_overlay_mode && sidebar_width > 0 {
-                    if (sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 {
-                        let clip_left = sidebar_width;
-                        let clip_top = 0;
-                        let clip_right = rect.right;
-                        let clip_bottom = rect.bottom - TOPBAR_HEIGHT;
-                        let region = CreateRectRgn(
-                            clip_left,
-                            clip_top,
-                            clip_right,
-                            clip_bottom,
-                        );
-                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
-                        self.last_clip_width.set(sidebar_width as f32);
-                    }
+                let _ = SetWindowRgn(tab.child_hwnd, None, true);
+            }
+        }
+    }
+
+    fn layout_animation_frame(&self) {
+        let rect = client_rect(self.hwnd);
+        let sidebar_width = self.sidebar_width();
+        let address_left = 56 + 18;
+        let address = RECT {
+            left: address_left,
+            top: 13,
+            right: (rect.right - 18).max(address_left + 220),
+            bottom: 49,
+        };
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.address_hwnd,
+                None,
+                address.left + 36,
+                address.top + 7,
+                (address.right - address.left - 52).max(120),
+                22,
+                WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW,
+            );
+        }
+
+        for tab in self.tabs.iter() {
+            unsafe {
+                let bounds = RECT {
+                    left: 0,
+                    top: TOPBAR_HEIGHT,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                };
+                let _ = tab.controller.SetBounds(bounds);
+                if sidebar_width > 0 {
+                    let region = CreateRectRgn(
+                        sidebar_width,
+                        0,
+                        rect.right,
+                        rect.bottom - TOPBAR_HEIGHT,
+                    );
+                    let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
                 } else {
-                    if self.last_clip_width.get() != 0.0 {
-                        let _ = SetWindowRgn(tab.child_hwnd, None, true);
-                        self.last_clip_width.set(0.0);
-                    }
+                    let _ = SetWindowRgn(tab.child_hwnd, None, true);
                 }
-                let _ = tab.controller.SetIsVisible(i == self.active);
             }
         }
     }
@@ -1267,29 +1267,10 @@ impl App {
                 let _ = Gdi::UpdateWindow(self.hwnd);
             }
         } else {
-            let old_sidebar_width = self.sidebar_width;
             self.sidebar_width += distance * 0.22;
-            self.layout();
+            self.layout_animation_frame();
             let rect = client_rect(self.hwnd);
-            let old_sw = old_sidebar_width.ceil() as i32;
-            let new_sw = self.sidebar_width.ceil() as i32;
-            let old_button_right = match self.sidebar_mode {
-                SidebarMode::Hidden => {
-                    if self.sidebar_target >= SIDEBAR_EXPANDED {
-                        match self.sidebar_expand_mode {
-                            SidebarMode::Overlay => 56 + 124 + 8,
-                            SidebarMode::Pushed => old_sw + 124 + 8,
-                            _ => 56 + 124 + 8,
-                        }
-                    } else {
-                        56 + 124 + 8
-                    }
-                }
-                SidebarMode::Overlay => 56 + 124 + 8,
-                SidebarMode::Pushed => old_sw + 124 + 8,
-            };
-            let new_button_right = self.top_button_x() + 124 + 8;
-            let max_right = old_sw.max(new_sw).max(old_button_right).max(new_button_right).min(rect.right) + 8;
+            let max_right = (self.sidebar_width.ceil() as i32 + 8).min(rect.right);
             let region = RECT {
                 left: 0,
                 top: 0,
