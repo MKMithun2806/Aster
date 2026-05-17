@@ -178,6 +178,7 @@ struct UiFonts {
     body: HFONT,
     small: HFONT,
     icon: HFONT,
+    url: HFONT,
 }
 
 impl Drop for UiFonts {
@@ -186,6 +187,7 @@ impl Drop for UiFonts {
             let _ = DeleteObject(HGDIOBJ(self.body.0));
             let _ = DeleteObject(HGDIOBJ(self.small.0));
             let _ = DeleteObject(HGDIOBJ(self.icon.0));
+            let _ = DeleteObject(HGDIOBJ(self.url.0));
         }
     }
 }
@@ -242,6 +244,7 @@ impl App {
             body: create_font(14, 400)?,
             small: create_font(12, 400)?,
             icon: create_font_with_face(18, 400, w!("Segoe Fluent Icons"))?,
+            url: create_font_with_face(13, 400, w!("Segoe UI Variable Text"))?,
         };
         let brushes = UiBrushes {
             black: solid_brush(COLOR_BLACK),
@@ -255,7 +258,7 @@ impl App {
             let _ = WindowsAndMessaging::SendMessageW(
                 address_hwnd,
                 WM_SETFONT,
-                Some(WPARAM(fonts.body.0 as usize)),
+                Some(WPARAM(fonts.url.0 as usize)),
                 Some(LPARAM(1)),
             );
         }
@@ -883,22 +886,6 @@ impl App {
                 },
                 COLOR_MUTED,
             );
-            if self.animating_sidebar {
-                if let Some(tab) = self.tabs.get(self.active) {
-                    draw_text(
-                        hdc,
-                        &self.fonts.body,
-                        &tab.url,
-                        RECT {
-                            left: edit_rect.left + 38,
-                            top: edit_rect.top,
-                            right: edit_rect.right - 14,
-                            bottom: edit_rect.bottom,
-                        },
-                        COLOR_MUTED,
-                    );
-                }
-            }
 
             draw_settings_button(
                 hdc,
