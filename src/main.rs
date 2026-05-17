@@ -33,7 +33,7 @@ use windows::{
                 WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
                 WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
                 WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
-                WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
+                WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME,
                 WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
@@ -227,6 +227,7 @@ struct App {
     animating_sidebar: bool,
     hovering_sidebar: bool,
     last_clip_width: Cell<f32>,
+    last_bounds_left: Cell<i32>,
     site_mode: SiteMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -277,6 +278,7 @@ impl App {
             animating_sidebar: false,
             hovering_sidebar: false,
             last_clip_width: Cell::new(0.0),
+            last_bounds_left: Cell::new(-1),
             site_mode: SiteMode::Auto,
             settings_open: false,
             mode_menu_open: false,
@@ -670,18 +672,16 @@ impl App {
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
         let address = self.address_rect();
-        if !self.animating_sidebar {
-            unsafe {
-                let _ = WindowsAndMessaging::SetWindowPos(
-                    self.address_hwnd,
-                    None,
-                    address.left + 36,
-                    address.top + 7,
-                    (address.right - address.left - 52).max(120),
-                    22,
-                    WindowsAndMessaging::SWP_NOZORDER,
-                );
-            }
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.address_hwnd,
+                None,
+                address.left + 36,
+                address.top + 7,
+                (address.right - address.left - 52).max(120),
+                22,
+                WindowsAndMessaging::SWP_NOZORDER,
+            );
         }
 
         let sidebar_width = self.sidebar_width();
@@ -732,7 +732,9 @@ impl App {
         };
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
-                let _ = tab.controller.SetBounds(bounds);
+                if bounds.left != self.last_bounds_left.get() {
+                    let _ = tab.controller.SetBounds(bounds);
+                }
                 let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
                     || (self.sidebar_mode == SidebarMode::Hidden
                         && self.sidebar_expand_mode == SidebarMode::Overlay
@@ -758,8 +760,13 @@ impl App {
                         self.last_clip_width.set(0.0);
                     }
                 }
-                let _ = tab.controller.SetIsVisible(i == self.active);
+                if i == self.active {
+                    let _ = tab.controller.SetIsVisible(true);
+                }
             }
+        }
+        if bounds.left != self.last_bounds_left.get() {
+            self.last_bounds_left.set(bounds.left);
         }
     }
 
@@ -1285,27 +1292,10 @@ impl App {
                 let _ = Gdi::UpdateWindow(self.hwnd);
             }
         } else {
-            let old_sw = self.sidebar_width.ceil() as i32;
             self.sidebar_width += distance * 0.22;
             self.layout();
-            let rect = client_rect(self.hwnd);
-            let new_sw = self.sidebar_width.ceil() as i32;
-            let max_sw = old_sw.max(new_sw);
-            let topbar = RECT {
-                left: 0,
-                top: 0,
-                right: rect.right,
-                bottom: TOPBAR_HEIGHT,
-            };
-            let sidebar = RECT {
-                left: 0,
-                top: TOPBAR_HEIGHT,
-                right: max_sw,
-                bottom: rect.bottom,
-            };
             unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), Some(&topbar), false);
-                let _ = InvalidateRect(Some(self.hwnd), Some(&sidebar), false);
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
     }
@@ -1540,7 +1530,7 @@ fn create_main_window() -> AppResult<HWND> {
             WS_EX_DLGMODALFRAME,
             CLASS_NAME,
             APP_NAME,
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1280,
