@@ -718,11 +718,22 @@ impl App {
                 right: rect.right,
                 bottom: rect.bottom,
             },
-            SidebarMode::Pushed => RECT {
-                left: 0,
-                top: TOPBAR_HEIGHT,
-                right: rect.right,
-                bottom: rect.bottom,
+            SidebarMode::Pushed => {
+                if self.animating_sidebar {
+                    RECT {
+                        left: 0,
+                        top: TOPBAR_HEIGHT,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    }
+                } else {
+                    RECT {
+                        left: sidebar_width,
+                        top: TOPBAR_HEIGHT,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    }
+                }
             },
         };
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -1274,9 +1285,6 @@ impl App {
                             None,
                         );
                     }
-                } else if self.sidebar_mode == SidebarMode::Pushed {
-                    self.clear_webview_clipping();
-                    self.set_webview_pushed_bounds();
                 }
             }
             self.layout();
@@ -1296,23 +1304,6 @@ impl App {
             };
             unsafe {
                 let _ = InvalidateRect(Some(self.hwnd), Some(&region), false);
-            }
-        }
-    }
-
-    fn set_webview_pushed_bounds(&self) {
-        let rect = client_rect(self.hwnd);
-        let sidebar_width = self.sidebar_width();
-        let bounds = RECT {
-            left: sidebar_width,
-            top: TOPBAR_HEIGHT,
-            right: rect.right,
-            bottom: rect.bottom,
-        };
-        for tab in &self.tabs {
-            unsafe {
-                let _ = SetWindowRgn(tab.child_hwnd, None, false);
-                let _ = tab.controller.SetBounds(bounds);
             }
         }
     }
