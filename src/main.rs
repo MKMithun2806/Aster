@@ -1,6 +1,6 @@
 #![windows_subsystem = "windows"]
 
-use std::{cell::Cell, mem, sync::mpsc};
+use std::{cell::Cell, fs, mem, path::PathBuf, ptr, sync::mpsc};
 
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
@@ -12,13 +12,19 @@ use windows::{
             DWMWA_USE_IMMERSIVE_DARK_MODE,
         },
         Graphics::Gdi::{
-            self, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
-            CreatePen, CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-            EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo,
-            MonitorFromWindow, MoveToEx, RoundRect, ScreenToClient, SelectObject, SetBkMode,
-            SetTextColor, SetWindowRgn, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE,
-            DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            self, AlphaBlend, BeginPaint, BitBlt, ClientToScreen, CreateBitmap,
+            CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
+            CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
+            GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx,
+            RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
+            AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+            DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+            HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
             NULL_BRUSH, NULL_PEN, SRCCOPY, TRANSPARENT,
+        },
+        Graphics::Imaging::{
+            CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+            WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
         },
         System::{Com::*, LibraryLoader},
         UI::{
@@ -28,15 +34,17 @@ use windows::{
                 GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE, VK_F11, VK_F5, VK_MENU, VK_RETURN,
             },
             WindowsAndMessaging::{
-                self, GetCursorPos, GetTopWindow, GetWindow, CREATESTRUCTW, CW_USEDEFAULT,
-                EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GW_HWNDNEXT,
-                HMENU, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, MSG, WINDOW_EX_STYLE,
-                WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND,
-                WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY,
-                WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
-                WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
-                WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME, WS_OVERLAPPEDWINDOW,
-                WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                self, AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, GetCursorPos,
+                GetTopWindow, GetWindow, CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN,
+                EC_RIGHTMARGIN, GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GW_HWNDNEXT, HICON, HMENU,
+                HWND_TOP, ICONINFO, ICON_BIG, ICON_SMALL, IDC_ARROW, MF_STRING, MSG, TPM_RETURNCMD,
+                TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP,
+                WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
+                WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+                WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS,
+                WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD,
+                WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP,
+                WS_VISIBLE,
             },
         },
     },
@@ -51,11 +59,21 @@ const SIDEBAR_EXPANDED: f32 = 248.0;
 const SIDEBAR_HIDDEN: f32 = 0.0;
 const HOVER_ZONE: i32 = 8;
 const TOPBAR_HEIGHT: i32 = 58;
-const TAB_HEIGHT: i32 = 48;
-const TAB_TOP: i32 = 76;
+const SIDEBAR_HEADER_TOP: i32 = TOPBAR_HEIGHT + 14;
+const SIDEBAR_ROWS_TOP: i32 = TOPBAR_HEIGHT + 68;
 const SIDEBAR_TIMER_ID: usize = 42;
 const HOVER_LEAVE_TIMER_ID: usize = 43;
 const HOVER_DETECT_TIMER_ID: usize = 44;
+const STATE_FILE: &str = ".aster-state";
+const MENU_TAB_PIN: usize = 3101;
+const MENU_TAB_UNPIN: usize = 3102;
+const MENU_TAB_REMOVE_FOLDER: usize = 3103;
+const MENU_TAB_MOVE_FOLDER_BASE: usize = 3200;
+const MENU_WORKSPACE_RENAME: usize = 3301;
+const MENU_WORKSPACE_NEW_FOLDER: usize = 3302;
+const MENU_WORKSPACE_NEW: usize = 3303;
+const MENU_FOLDER_RENAME: usize = 3401;
+const MENU_FOLDER_DELETE: usize = 3402;
 
 const COLOR_BLACK: u32 = 0x000000;
 const COLOR_PANEL: u32 = 0x090909;
@@ -115,14 +133,65 @@ impl From<mpsc::RecvError> for AppError {
     }
 }
 
+struct FaviconBitmap {
+    handle: HBITMAP,
+    width: i32,
+    height: i32,
+}
+
+impl Drop for FaviconBitmap {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.handle.0));
+        }
+    }
+}
+
+struct Workspace {
+    id: usize,
+    name: String,
+}
+
+struct Folder {
+    id: usize,
+    workspace_id: usize,
+    name: String,
+}
+
 struct Tab {
     id: usize,
+    workspace_id: usize,
+    folder_id: Option<usize>,
+    pinned: bool,
     title: String,
     url: String,
     favicon_uri: String,
+    favicon_bitmap: Option<FaviconBitmap>,
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
     child_hwnd: HWND,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarRow {
+    Label(SidebarLabel),
+    Folder(usize),
+    Tab(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarLabel {
+    Pinned,
+    Tabs,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarHit {
+    WorkspaceHeader,
+    WorkspaceButton(usize),
+    AddWorkspace,
+    Folder(usize),
+    Tab(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,6 +227,10 @@ enum SiteMode {
 enum CommandMode {
     Navigate,
     NewTab,
+    NewWorkspace,
+    RenameWorkspace(usize),
+    NewFolder,
+    RenameFolder(usize),
 }
 
 impl SiteMode {
@@ -229,9 +302,16 @@ struct App {
     address_hwnd: HWND,
     command_hwnd: HWND,
     environment: ICoreWebView2Environment,
+    workspaces: Vec<Workspace>,
+    folders: Vec<Folder>,
     tabs: Vec<Tab>,
+    active_workspace: usize,
     active: usize,
     next_id: usize,
+    next_workspace_id: usize,
+    next_folder_id: usize,
+    workspace_active_tabs: Vec<(usize, usize)>,
+    loading_state: bool,
     fonts: UiFonts,
     brushes: UiBrushes,
     hover_close: Option<usize>,
@@ -281,14 +361,24 @@ impl App {
                 Some(LPARAM(1)),
             );
         }
-        let app = Self {
+        let mut app = Self {
             hwnd,
             address_hwnd,
             command_hwnd,
             environment,
+            workspaces: vec![Workspace {
+                id: 1,
+                name: "Space 1".to_string(),
+            }],
+            folders: Vec::new(),
             tabs: Vec::new(),
+            active_workspace: 1,
             active: 0,
             next_id: 1,
+            next_workspace_id: 2,
+            next_folder_id: 1,
+            workspace_active_tabs: Vec::new(),
+            loading_state: false,
             fonts,
             brushes,
             hover_close: None,
@@ -316,6 +406,7 @@ impl App {
             saved_style: 0,
             saved_rect: RECT::default(),
         };
+        app.load_state()?;
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
         }
@@ -323,6 +414,18 @@ impl App {
     }
 
     fn create_tab(&mut self, url: &str) -> AppResult<()> {
+        self.create_tab_in_workspace(url, self.active_workspace, None, false, true, None)
+    }
+
+    fn create_tab_in_workspace(
+        &mut self,
+        url: &str,
+        workspace_id: usize,
+        folder_id: Option<usize>,
+        pinned: bool,
+        activate: bool,
+        title: Option<String>,
+    ) -> AppResult<()> {
         let controller = create_webview_controller(&self.environment, self.hwnd)?;
         let webview = unsafe { controller.CoreWebView2()? };
         configure_webview(&webview)?;
@@ -342,16 +445,438 @@ impl App {
 
         self.tabs.push(Tab {
             id,
+            workspace_id,
+            folder_id,
+            pinned,
             title: "New Tab".to_string(),
             url: url.to_string(),
             favicon_uri: String::new(),
+            favicon_bitmap: None,
             controller,
             webview,
             child_hwnd,
         });
-        self.switch_to(index);
-        self.navigate_active(url);
+        if let Some(title) = title {
+            if let Some(tab) = self.tabs.get_mut(index) {
+                if !title.trim().is_empty() {
+                    tab.title = title;
+                }
+            }
+        }
+        if activate {
+            self.active_workspace = workspace_id;
+            self.switch_to(index);
+        }
+        let wide = CoTaskMemPWSTR::from(url);
+        unsafe {
+            let _ = self.tabs[index]
+                .webview
+                .Navigate(*wide.as_ref().as_pcwstr());
+        }
+        self.save_state();
         Ok(())
+    }
+
+    fn active_tab_index(&self) -> Option<usize> {
+        self.tabs.get(self.active).and_then(|tab| {
+            if tab.workspace_id == self.active_workspace {
+                Some(self.active)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn active_workspace_name(&self) -> &str {
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.active_workspace)
+            .map(|workspace| workspace.name.as_str())
+            .unwrap_or("Space")
+    }
+
+    fn set_workspace_active_tab(&mut self, workspace_id: usize, tab_id: usize) {
+        if let Some((_, active_tab)) = self
+            .workspace_active_tabs
+            .iter_mut()
+            .find(|(id, _)| *id == workspace_id)
+        {
+            *active_tab = tab_id;
+        } else {
+            self.workspace_active_tabs.push((workspace_id, tab_id));
+        }
+    }
+
+    fn switch_workspace(&mut self, workspace_id: usize) {
+        if !self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            return;
+        }
+        self.active_workspace = workspace_id;
+        for tab in &self.tabs {
+            unsafe {
+                let _ = tab.controller.SetIsVisible(false);
+            }
+        }
+        let preferred_tab = self
+            .workspace_active_tabs
+            .iter()
+            .find(|(id, _)| *id == workspace_id)
+            .map(|(_, tab_id)| *tab_id);
+        let next_index = preferred_tab
+            .and_then(|tab_id| {
+                self.tabs
+                    .iter()
+                    .position(|tab| tab.workspace_id == workspace_id && tab.id == tab_id)
+            })
+            .or_else(|| {
+                self.tabs
+                    .iter()
+                    .position(|tab| tab.workspace_id == workspace_id)
+            });
+        if let Some(index) = next_index {
+            self.switch_to(index);
+        } else {
+            self.active = 0;
+            set_window_text(self.address_hwnd, "");
+            self.layout();
+            self.refresh();
+            self.save_state();
+        }
+    }
+
+    fn active_workspace_tabs(&self) -> Vec<usize> {
+        self.sidebar_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Tab(index) => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        let mut rows = Vec::new();
+        let pinned: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.workspace_id == self.active_workspace && tab.pinned)
+            .map(|(index, _)| index)
+            .collect();
+        if !pinned.is_empty() {
+            rows.push(SidebarRow::Label(SidebarLabel::Pinned));
+            rows.extend(pinned.into_iter().map(SidebarRow::Tab));
+        }
+
+        let mut has_tabs_label = false;
+        for folder in self
+            .folders
+            .iter()
+            .filter(|folder| folder.workspace_id == self.active_workspace)
+        {
+            let folder_tabs: Vec<usize> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, tab)| {
+                    tab.workspace_id == self.active_workspace
+                        && !tab.pinned
+                        && tab.folder_id == Some(folder.id)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if folder_tabs.is_empty() {
+                continue;
+            }
+            if !has_tabs_label {
+                rows.push(SidebarRow::Label(SidebarLabel::Tabs));
+                has_tabs_label = true;
+            }
+            rows.push(SidebarRow::Folder(folder.id));
+            rows.extend(folder_tabs.into_iter().map(SidebarRow::Tab));
+        }
+
+        let loose_tabs: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                tab.workspace_id == self.active_workspace && !tab.pinned && tab.folder_id.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if !loose_tabs.is_empty() {
+            if !has_tabs_label {
+                rows.push(SidebarRow::Label(SidebarLabel::Tabs));
+            }
+            rows.extend(loose_tabs.into_iter().map(SidebarRow::Tab));
+        }
+        rows
+    }
+
+    fn sidebar_row_rects(&self) -> Vec<(SidebarRow, RECT)> {
+        let mut rects = Vec::new();
+        let width = self.sidebar_width();
+        if width <= 92 {
+            return rects;
+        }
+        let bottom_limit = self.workspace_switcher_bounds().top - 10;
+        let mut y = SIDEBAR_ROWS_TOP;
+        for row in self.sidebar_rows() {
+            let height = match row {
+                SidebarRow::Label(_) => 24,
+                SidebarRow::Folder(_) => 36,
+                SidebarRow::Tab(_) => 44,
+            };
+            if y + height > bottom_limit {
+                break;
+            }
+            rects.push((
+                row,
+                RECT {
+                    left: 10,
+                    top: y,
+                    right: width - 10,
+                    bottom: y + height,
+                },
+            ));
+            y += height;
+        }
+        rects
+    }
+
+    fn workspace_header_rect(&self) -> RECT {
+        RECT {
+            left: 12,
+            top: SIDEBAR_HEADER_TOP,
+            right: self.sidebar_width() - 12,
+            bottom: SIDEBAR_HEADER_TOP + 38,
+        }
+    }
+
+    fn workspace_switcher_bounds(&self) -> RECT {
+        let settings = self.settings_rect();
+        RECT {
+            left: 12,
+            top: settings.top - 48,
+            right: self.sidebar_width() - 12,
+            bottom: settings.top - 14,
+        }
+    }
+
+    fn workspace_switcher_items(&self) -> Vec<(SidebarHit, RECT)> {
+        let bounds = self.workspace_switcher_bounds();
+        let mut items = Vec::new();
+        let mut x = bounds.left + 2;
+        for workspace in &self.workspaces {
+            let rect = RECT {
+                left: x,
+                top: bounds.top + 4,
+                right: x + 28,
+                bottom: bounds.top + 32,
+            };
+            if rect.right > bounds.right - 34 {
+                break;
+            }
+            items.push((SidebarHit::WorkspaceButton(workspace.id), rect));
+            x += 34;
+        }
+        items.push((
+            SidebarHit::AddWorkspace,
+            RECT {
+                left: (bounds.right - 30).max(bounds.left + 2),
+                top: bounds.top + 4,
+                right: bounds.right - 2,
+                bottom: bounds.top + 32,
+            },
+        ));
+        items
+    }
+
+    fn hit_sidebar(&self, x: i32, y: i32) -> Option<SidebarHit> {
+        if self.sidebar_width() <= 92 || (x as f32) >= self.sidebar_width {
+            return None;
+        }
+        if point_in_rect(x, y, self.workspace_header_rect()) {
+            return Some(SidebarHit::WorkspaceHeader);
+        }
+        for (hit, rect) in self.workspace_switcher_items() {
+            if point_in_rect(x, y, rect) {
+                return Some(hit);
+            }
+        }
+        for (row, rect) in self.sidebar_row_rects() {
+            if point_in_rect(x, y, rect) {
+                return match row {
+                    SidebarRow::Folder(id) => Some(SidebarHit::Folder(id)),
+                    SidebarRow::Tab(index) => Some(SidebarHit::Tab(index)),
+                    SidebarRow::Label(_) => None,
+                };
+            }
+        }
+        None
+    }
+
+    fn load_state(&mut self) -> AppResult<()> {
+        let path = state_path();
+        let Ok(raw) = fs::read_to_string(path) else {
+            return Ok(());
+        };
+        self.loading_state = true;
+        self.workspaces.clear();
+        self.folders.clear();
+        self.tabs.clear();
+        self.workspace_active_tabs.clear();
+
+        let mut tab_records = Vec::new();
+        let mut active_workspace = 1usize;
+        for line in raw.lines() {
+            let parts: Vec<String> = line.split('\t').map(unescape_state).collect();
+            if parts.is_empty() {
+                continue;
+            }
+            match parts[0].as_str() {
+                "workspace" if parts.len() >= 3 => {
+                    if let Ok(id) = parts[1].parse::<usize>() {
+                        self.workspaces.push(Workspace {
+                            id,
+                            name: parts[2].clone(),
+                        });
+                    }
+                }
+                "folder" if parts.len() >= 4 => {
+                    if let (Ok(id), Ok(workspace_id)) =
+                        (parts[1].parse::<usize>(), parts[2].parse::<usize>())
+                    {
+                        self.folders.push(Folder {
+                            id,
+                            workspace_id,
+                            name: parts[3].clone(),
+                        });
+                    }
+                }
+                "tab" if parts.len() >= 6 => {
+                    if let Ok(workspace_id) = parts[1].parse::<usize>() {
+                        let folder_id = if parts[2].is_empty() {
+                            None
+                        } else {
+                            parts[2].parse::<usize>().ok()
+                        };
+                        let pinned = parts[3] == "1";
+                        tab_records.push((
+                            workspace_id,
+                            folder_id,
+                            pinned,
+                            parts[4].clone(),
+                            parts[5].clone(),
+                        ));
+                    }
+                }
+                "active_workspace" if parts.len() >= 2 => {
+                    if let Ok(id) = parts[1].parse::<usize>() {
+                        active_workspace = id;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if self.workspaces.is_empty() {
+            self.workspaces.push(Workspace {
+                id: 1,
+                name: "Space 1".to_string(),
+            });
+        }
+        self.next_workspace_id = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.next_folder_id = self
+            .folders
+            .iter()
+            .map(|folder| folder.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.active_workspace = if self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == active_workspace)
+        {
+            active_workspace
+        } else {
+            self.workspaces[0].id
+        };
+
+        for (workspace_id, folder_id, pinned, title, url) in tab_records {
+            if !url.trim().is_empty()
+                && self
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == workspace_id)
+            {
+                let safe_folder = folder_id.filter(|id| {
+                    self.folders
+                        .iter()
+                        .any(|folder| folder.id == *id && folder.workspace_id == workspace_id)
+                });
+                self.create_tab_in_workspace(
+                    &url,
+                    workspace_id,
+                    safe_folder,
+                    pinned,
+                    false,
+                    Some(title),
+                )?;
+            }
+        }
+        self.loading_state = false;
+        self.switch_workspace(self.active_workspace);
+        Ok(())
+    }
+
+    fn save_state(&self) {
+        if self.loading_state {
+            return;
+        }
+        let mut lines = Vec::new();
+        lines.push(format!("active_workspace\t{}", self.active_workspace));
+        for workspace in &self.workspaces {
+            lines.push(format!(
+                "workspace\t{}\t{}",
+                workspace.id,
+                escape_state(&workspace.name)
+            ));
+        }
+        for folder in &self.folders {
+            lines.push(format!(
+                "folder\t{}\t{}\t{}",
+                folder.id,
+                folder.workspace_id,
+                escape_state(&folder.name)
+            ));
+        }
+        for tab in &self.tabs {
+            if tab.url.trim().is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "tab\t{}\t{}\t{}\t{}\t{}",
+                tab.workspace_id,
+                tab.folder_id.map(|id| id.to_string()).unwrap_or_default(),
+                if tab.pinned { "1" } else { "0" },
+                escape_state(&tab.title),
+                escape_state(&tab.url)
+            ));
+        }
+        let _ = fs::write(state_path(), lines.join("\n"));
     }
 
     fn attach_controller_events(&self, controller: &ICoreWebView2Controller) -> AppResult<()> {
@@ -444,6 +969,28 @@ impl App {
                                         app.update_tab_favicon_uri(tab_id, favicon_uri)
                                     });
                                 }
+                                let hwnd = hwnd;
+                                let _ = sender15.GetFavicon(
+                                    COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+                                    &GetFaviconCompletedHandler::create(Box::new(
+                                        move |error_code, stream| {
+                                            if error_code.is_ok() {
+                                                if let Some(stream) = stream {
+                                                    if let Some(favicon) =
+                                                        decode_favicon_stream(&stream)
+                                                    {
+                                                        with_app(hwnd, |app| {
+                                                            app.update_tab_favicon_bitmap(
+                                                                tab_id, favicon,
+                                                            )
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            Ok(())
+                                        },
+                                    )),
+                                );
                             }
                         }
                         Ok(())
@@ -485,10 +1032,12 @@ impl App {
                 tab.title = trimmed.to_string();
             }
         }
+        self.save_state();
         self.refresh();
     }
 
     fn update_tab_url(&mut self, tab_id: usize, url: String) {
+        let active_index = self.active_tab_index();
         if let Some((index, tab)) = self
             .tabs
             .iter_mut()
@@ -500,10 +1049,11 @@ impl App {
             } else {
                 url
             };
-            if index == self.active {
+            if Some(index) == active_index {
                 set_window_text(self.address_hwnd, &tab.url);
             }
         }
+        self.save_state();
         self.refresh();
     }
 
@@ -514,16 +1064,28 @@ impl App {
         self.refresh();
     }
 
+    fn update_tab_favicon_bitmap(&mut self, tab_id: usize, favicon: FaviconBitmap) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.favicon_bitmap = Some(favicon);
+        }
+        self.refresh();
+    }
+
     fn switch_to(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
+        let workspace_id = self.tabs[index].workspace_id;
+        self.active_workspace = workspace_id;
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
-                let _ = tab.controller.SetIsVisible(i == index);
+                let _ = tab
+                    .controller
+                    .SetIsVisible(i == index && tab.workspace_id == workspace_id);
             }
         }
         self.active = index;
+        self.set_workspace_active_tab(workspace_id, self.tabs[index].id);
         self.layout();
         if let Some(tab) = self.tabs.get(index) {
             set_window_text(self.address_hwnd, &tab.url);
@@ -533,6 +1095,7 @@ impl App {
                     .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
             }
         }
+        self.save_state();
         self.refresh();
     }
 
@@ -540,19 +1103,38 @@ impl App {
         if self.tabs.is_empty() || index >= self.tabs.len() {
             return;
         }
+        let workspace_id = self.tabs[index].workspace_id;
         self.tabs.remove(index);
-        if self.tabs.is_empty() {
+        if self.tabs.iter().all(|tab| tab.workspace_id != workspace_id) {
             self.active = 0;
+            if self.active_workspace == workspace_id {
+                set_window_text(self.address_hwnd, "");
+            }
             self.layout();
+            self.save_state();
             self.refresh();
             return;
         }
-        let next = if index >= self.tabs.len() {
-            self.tabs.len() - 1
+        if self.active_workspace == workspace_id {
+            let ordered = self.active_workspace_tabs();
+            let next = ordered
+                .into_iter()
+                .find(|candidate| *candidate >= index)
+                .or_else(|| {
+                    self.tabs
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, tab)| tab.workspace_id == workspace_id)
+                        .map(|(index, _)| index)
+                });
+            if let Some(next) = next {
+                self.switch_to(next);
+            }
         } else {
-            index
-        };
-        self.switch_to(next);
+            self.save_state();
+            self.refresh();
+        }
     }
 
     fn navigate_active_from_address(&mut self) {
@@ -566,7 +1148,11 @@ impl App {
     }
 
     fn navigate_active(&mut self, url: &str) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
+        let Some(index) = self.active_tab_index() else {
+            let _ = self.create_tab(url);
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = url.to_string();
             tab.title = label_for_url(url);
             set_window_text(self.address_hwnd, url);
@@ -575,6 +1161,7 @@ impl App {
                 let _ = tab.webview.Navigate(*wide.as_ref().as_pcwstr());
             }
         }
+        self.save_state();
         self.refresh();
     }
 
@@ -583,14 +1170,33 @@ impl App {
         self.command_open = true;
         let initial_text = match mode {
             CommandMode::Navigate => self
-                .tabs
-                .get(self.active)
+                .active_tab_index()
+                .and_then(|index| self.tabs.get(index))
                 .map(|tab| tab.url.as_str())
                 .unwrap_or(""),
             CommandMode::NewTab => "",
+            CommandMode::NewWorkspace => "New Space",
+            CommandMode::RenameWorkspace(id) => self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == id)
+                .map(|workspace| workspace.name.as_str())
+                .unwrap_or("Space"),
+            CommandMode::NewFolder => "New Folder",
+            CommandMode::RenameFolder(id) => self
+                .folders
+                .iter()
+                .find(|folder| folder.id == id)
+                .map(|folder| folder.name.as_str())
+                .unwrap_or("Folder"),
         };
         set_window_text(self.address_hwnd, initial_text);
-        set_edit_cue_banner(self.address_hwnd, "Search or Enter URL...");
+        let cue = match mode {
+            CommandMode::Navigate | CommandMode::NewTab => "Search or Enter URL...",
+            CommandMode::NewWorkspace | CommandMode::RenameWorkspace(_) => "Workspace name...",
+            CommandMode::NewFolder | CommandMode::RenameFolder(_) => "Folder name...",
+        };
+        set_edit_cue_banner(self.address_hwnd, cue);
         self.layout();
         unsafe {
             let _ =
@@ -635,7 +1241,10 @@ impl App {
         }
         self.command_open = false;
         self.layout();
-        if let Some(tab) = self.tabs.get(self.active) {
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
             unsafe {
                 let _ = tab
                     .controller
@@ -653,11 +1262,14 @@ impl App {
         self.layout();
         match mode {
             CommandMode::Navigate => {
-                if self.tabs.is_empty() {
+                if self.active_tab_index().is_none() {
                     let _ = self.create_tab(&url);
                 } else {
                     self.navigate_active(&url);
-                    if let Some(tab) = self.tabs.get(self.active) {
+                    if let Some(tab) = self
+                        .active_tab_index()
+                        .and_then(|index| self.tabs.get(index))
+                    {
                         unsafe {
                             let _ = tab
                                 .controller
@@ -669,11 +1281,68 @@ impl App {
             CommandMode::NewTab => {
                 let _ = self.create_tab(&url);
             }
+            CommandMode::NewWorkspace => {
+                let name = raw.trim();
+                let id = self.next_workspace_id;
+                self.next_workspace_id += 1;
+                self.workspaces.push(Workspace {
+                    id,
+                    name: if name.is_empty() {
+                        format!("Space {}", self.workspaces.len() + 1)
+                    } else {
+                        name.to_string()
+                    },
+                });
+                self.switch_workspace(id);
+            }
+            CommandMode::RenameWorkspace(id) => {
+                let name = raw.trim();
+                if !name.is_empty() {
+                    if let Some(workspace) = self
+                        .workspaces
+                        .iter_mut()
+                        .find(|workspace| workspace.id == id)
+                    {
+                        workspace.name = name.to_string();
+                    }
+                    self.save_state();
+                    self.refresh();
+                }
+            }
+            CommandMode::NewFolder => {
+                let name = raw.trim();
+                let id = self.next_folder_id;
+                self.next_folder_id += 1;
+                self.folders.push(Folder {
+                    id,
+                    workspace_id: self.active_workspace,
+                    name: if name.is_empty() {
+                        "New Folder".to_string()
+                    } else {
+                        name.to_string()
+                    },
+                });
+                self.save_state();
+                self.refresh();
+            }
+            CommandMode::RenameFolder(id) => {
+                let name = raw.trim();
+                if !name.is_empty() {
+                    if let Some(folder) = self.folders.iter_mut().find(|folder| folder.id == id) {
+                        folder.name = name.to_string();
+                    }
+                    self.save_state();
+                    self.refresh();
+                }
+            }
         }
     }
 
     fn go_back(&self) {
-        if let Some(tab) = self.tabs.get(self.active) {
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
             unsafe {
                 let mut can = BOOL::from(false);
                 if tab.webview.CanGoBack(&mut can).is_ok() && can.as_bool() {
@@ -684,7 +1353,10 @@ impl App {
     }
 
     fn go_forward(&self) {
-        if let Some(tab) = self.tabs.get(self.active) {
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
             unsafe {
                 let mut can = BOOL::from(false);
                 if tab.webview.CanGoForward(&mut can).is_ok() && can.as_bool() {
@@ -695,7 +1367,10 @@ impl App {
     }
 
     fn reload(&self) {
-        if let Some(tab) = self.tabs.get(self.active) {
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
             unsafe {
                 let _ = tab.webview.Reload();
             }
@@ -895,6 +1570,11 @@ impl App {
         }
 
         let sidebar_width = self.sidebar_width();
+        let pushed_left = if self.animating_sidebar {
+            0
+        } else {
+            sidebar_width
+        };
         let bounds = match self.sidebar_mode {
             SidebarMode::Hidden => {
                 if self.sidebar_target >= SIDEBAR_EXPANDED {
@@ -906,7 +1586,7 @@ impl App {
                             bottom: rect.bottom,
                         },
                         SidebarMode::Pushed => RECT {
-                            left: sidebar_width,
+                            left: pushed_left,
                             top: TOPBAR_HEIGHT,
                             right: rect.right,
                             bottom: rect.bottom,
@@ -934,7 +1614,7 @@ impl App {
                 bottom: rect.bottom,
             },
             SidebarMode::Pushed => RECT {
-                left: sidebar_width,
+                left: pushed_left,
                 top: TOPBAR_HEIGHT,
                 right: rect.right,
                 bottom: rect.bottom,
@@ -942,14 +1622,7 @@ impl App {
         };
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
-                let last = self.last_bounds_rect.get();
-                if bounds.left != last.left
-                    || bounds.right != last.right
-                    || bounds.top != last.top
-                    || bounds.bottom != last.bottom
-                {
-                    let _ = tab.controller.SetBounds(bounds);
-                }
+                let _ = tab.controller.SetBounds(bounds);
                 let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
                     || (self.sidebar_mode == SidebarMode::Hidden
                         && self.sidebar_expand_mode == SidebarMode::Overlay
@@ -970,9 +1643,9 @@ impl App {
                         self.last_clip_width.set(0.0);
                     }
                 }
-                if i == self.active {
-                    let _ = tab.controller.SetIsVisible(true);
-                }
+                let _ = tab
+                    .controller
+                    .SetIsVisible(Some(i) == self.active_tab_index());
             }
         }
         let last = self.last_bounds_rect.get();
@@ -1010,7 +1683,7 @@ impl App {
                 0x202020,
             );
 
-            if self.tabs.is_empty() {
+            if self.active_tab_index().is_none() {
                 draw_aster_background(
                     hdc,
                     RECT {
@@ -1084,29 +1757,21 @@ impl App {
             );
 
             let edit_rect = self.address_pill_rect();
-            fill_round_rect(
-                hdc,
-                edit_rect,
-                if self.hover_target == Some(HoverTarget::Address) || self.command_open {
-                    0x232323
-                } else {
-                    0x181818
-                },
-                11,
-            );
-            draw_outline(
-                hdc,
-                edit_rect,
-                if self.command_open {
-                    0x515151
-                } else {
-                    0x2f2f2f
-                },
-                11,
-            );
+            if self.hover_target == Some(HoverTarget::Address) || self.command_open {
+                fill_rect(
+                    hdc,
+                    RECT {
+                        left: edit_rect.left + 22,
+                        top: edit_rect.bottom - 2,
+                        right: edit_rect.right - 22,
+                        bottom: edit_rect.bottom - 1,
+                    },
+                    COLOR_ACCENT,
+                );
+            }
             let address_label = self
-                .tabs
-                .get(self.active)
+                .active_tab_index()
+                .and_then(|index| self.tabs.get(index))
                 .map(|tab| {
                     if tab.url.is_empty() {
                         "Search or Enter URL..."
@@ -1136,9 +1801,21 @@ impl App {
             );
 
             if sidebar_width > 92 {
-                for (index, tab) in self.tabs.iter().enumerate() {
-                    self.paint_tab(hdc, index, tab);
+                self.paint_workspace_header(hdc);
+                for (row, row_rect) in self.sidebar_row_rects() {
+                    match row {
+                        SidebarRow::Label(label) => self.paint_sidebar_label(hdc, label, row_rect),
+                        SidebarRow::Folder(folder_id) => {
+                            self.paint_folder_row(hdc, folder_id, row_rect)
+                        }
+                        SidebarRow::Tab(index) => {
+                            if let Some(tab) = self.tabs.get(index) {
+                                self.paint_tab(hdc, index, tab, row_rect);
+                            }
+                        }
+                    }
                 }
+                self.paint_workspace_switcher(hdc);
             }
 
             if self.settings_open {
@@ -1259,7 +1936,7 @@ impl App {
                 bottom: rect.bottom - rect.top,
             };
             fill_round_rect(hdc, panel, 0x080808, 14);
-            draw_outline(hdc, panel, 0x55505e, 14);
+            draw_outline(hdc, panel, COLOR_ACCENT, 14);
 
             let input = RECT {
                 left: 18,
@@ -1281,24 +1958,6 @@ impl App {
                 COLOR_TEXT,
             );
 
-            let mode_text = match self.command_mode {
-                CommandMode::Navigate if self.tabs.is_empty() => "New tab",
-                CommandMode::Navigate => "Current tab",
-                CommandMode::NewTab => "New tab",
-            };
-            draw_text(
-                hdc,
-                &self.fonts.small,
-                mode_text,
-                RECT {
-                    left: input.right - 96,
-                    top: input.top,
-                    right: input.right - 6,
-                    bottom: input.bottom,
-                },
-                COLOR_MUTED,
-            );
-
             fill_rect(
                 hdc,
                 RECT {
@@ -1310,13 +1969,18 @@ impl App {
                 0x222222,
             );
 
-            for (index, tab) in self.tabs.iter().take(4).enumerate() {
-                let mut row = self.command_tab_row_rect(index);
+            for (row_index, tab_index) in
+                self.active_workspace_tabs().into_iter().take(4).enumerate()
+            {
+                let Some(tab) = self.tabs.get(tab_index) else {
+                    continue;
+                };
+                let mut row = self.command_tab_row_rect(row_index);
                 row.left -= self.command_popup_rect().left;
                 row.right -= self.command_popup_rect().left;
                 row.top -= self.command_popup_rect().top;
                 row.bottom -= self.command_popup_rect().top;
-                if index == self.active {
+                if Some(tab_index) == self.active_tab_index() {
                     fill_round_rect(hdc, row, COLOR_ACCENT, 8);
                 }
                 let favicon = RECT {
@@ -1325,7 +1989,7 @@ impl App {
                     right: row.left + 30,
                     bottom: row.top + 24,
                 };
-                draw_favicon_mark(hdc, &self.fonts.small, favicon, tab);
+                draw_tab_favicon(hdc, &self.fonts.small, favicon, tab);
                 draw_text(
                     hdc,
                     &self.fonts.body,
@@ -1341,7 +2005,7 @@ impl App {
                 draw_text(
                     hdc,
                     &self.fonts.small,
-                    if index == self.active {
+                    if Some(tab_index) == self.active_tab_index() {
                         "Active"
                     } else {
                         "Switch to Tab"
@@ -1352,7 +2016,7 @@ impl App {
                         right: row.right - 28,
                         bottom: row.bottom,
                     },
-                    if index == self.active {
+                    if Some(tab_index) == self.active_tab_index() {
                         COLOR_TEXT
                     } else {
                         COLOR_MUTED
@@ -1368,7 +2032,7 @@ impl App {
                         right: row.right - 8,
                         bottom: row.bottom,
                     },
-                    if index == self.active {
+                    if Some(tab_index) == self.active_tab_index() {
                         COLOR_TEXT
                     } else {
                         COLOR_MUTED
@@ -1378,37 +2042,199 @@ impl App {
         }
     }
 
-    fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab) {
-        let top = TAB_TOP + index as i32 * TAB_HEIGHT;
-        let right = self.sidebar_width() - 12;
-        let item = RECT {
-            left: 12,
-            top,
-            right,
-            bottom: top + TAB_HEIGHT - 8,
+    fn paint_workspace_header(&self, hdc: HDC) {
+        unsafe {
+            let rect = self.workspace_header_rect();
+            fill_round_rect(hdc, rect, 0x101010, 9);
+            draw_outline(hdc, rect, 0x262626, 9);
+            fill_round_rect(
+                hdc,
+                RECT {
+                    left: rect.left + 10,
+                    top: rect.top + 13,
+                    right: rect.left + 20,
+                    bottom: rect.top + 23,
+                },
+                COLOR_ACCENT,
+                5,
+            );
+            draw_text(
+                hdc,
+                &self.fonts.body,
+                self.active_workspace_name(),
+                RECT {
+                    left: rect.left + 30,
+                    top: rect.top,
+                    right: rect.right - 36,
+                    bottom: rect.bottom,
+                },
+                COLOR_TEXT,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.toolbar_icon,
+                glyph(0xE710).as_str(),
+                RECT {
+                    left: rect.right - 32,
+                    top: rect.top,
+                    right: rect.right - 8,
+                    bottom: rect.bottom,
+                },
+                COLOR_MUTED,
+            );
+        }
+    }
+
+    fn paint_sidebar_label(&self, hdc: HDC, label: SidebarLabel, rect: RECT) {
+        unsafe {
+            let text = match label {
+                SidebarLabel::Pinned => "Pinned",
+                SidebarLabel::Tabs => "Tabs",
+            };
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                text,
+                RECT {
+                    left: rect.left + 12,
+                    top: rect.top + 2,
+                    right: rect.right - 8,
+                    bottom: rect.bottom,
+                },
+                0x888888,
+            );
+        }
+    }
+
+    fn paint_folder_row(&self, hdc: HDC, folder_id: usize, rect: RECT) {
+        let Some(folder) = self.folders.iter().find(|folder| folder.id == folder_id) else {
+            return;
         };
         unsafe {
-            if self.hover_tab == Some(index) {
+            let item = RECT {
+                left: rect.left + 2,
+                top: rect.top + 2,
+                right: rect.right - 2,
+                bottom: rect.bottom - 2,
+            };
+            if self.hover_tab.is_none() && self.hover_target.is_none() {
+                let _ = item;
+            }
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.toolbar_icon,
+                glyph(0xE8B7).as_str(),
+                RECT {
+                    left: item.left + 10,
+                    top: item.top,
+                    right: item.left + 32,
+                    bottom: item.bottom,
+                },
+                COLOR_MUTED,
+            );
+            draw_text(
+                hdc,
+                &self.fonts.body,
+                &folder.name,
+                RECT {
+                    left: item.left + 38,
+                    top: item.top,
+                    right: item.right - 8,
+                    bottom: item.bottom,
+                },
+                COLOR_MUTED,
+            );
+        }
+    }
+
+    fn paint_workspace_switcher(&self, hdc: HDC) {
+        unsafe {
+            for (hit, rect) in self.workspace_switcher_items() {
+                match hit {
+                    SidebarHit::WorkspaceButton(id) => {
+                        let active = id == self.active_workspace;
+                        fill_round_rect(
+                            hdc,
+                            rect,
+                            if active { COLOR_ACCENT } else { 0x151515 },
+                            14,
+                        );
+                        draw_outline(hdc, rect, if active { COLOR_ACCENT } else { 0x2f2f2f }, 14);
+                        let label = self
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == id)
+                            .and_then(|workspace| workspace.name.chars().next())
+                            .unwrap_or('S')
+                            .to_ascii_uppercase()
+                            .to_string();
+                        draw_centered_text(
+                            hdc,
+                            &self.fonts.small,
+                            &label,
+                            rect,
+                            if active { COLOR_TEXT } else { COLOR_MUTED },
+                        );
+                    }
+                    SidebarHit::AddWorkspace => {
+                        draw_icon_glyph(
+                            hdc,
+                            &self.fonts.toolbar_icon,
+                            glyph(0xE710).as_str(),
+                            rect,
+                            COLOR_TEXT,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab, item: RECT) {
+        unsafe {
+            if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
                 fill_round_rect(hdc, item, 0x151515, 10);
             }
+            let mut text_left = item.left + 40;
+            if tab.pinned {
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.toolbar_icon,
+                    glyph(0xE718).as_str(),
+                    RECT {
+                        left: item.left + 8,
+                        top: item.top,
+                        right: item.left + 28,
+                        bottom: item.bottom,
+                    },
+                    COLOR_ACCENT,
+                );
+                text_left = item.left + 62;
+            }
+            let favicon_left = if tab.pinned {
+                item.left + 34
+            } else {
+                item.left + 12
+            };
             let favicon = RECT {
-                left: item.left + 12,
+                left: favicon_left,
                 top: item.top + 11,
-                right: item.left + 30,
+                right: favicon_left + 18,
                 bottom: item.top + 29,
             };
-            draw_favicon_mark(hdc, &self.fonts.small, favicon, tab);
+            draw_tab_favicon(hdc, &self.fonts.small, favicon, tab);
             draw_text(
                 hdc,
                 &self.fonts.body,
                 &tab.title,
                 RECT {
-                    left: item.left + 40,
+                    left: text_left,
                     top: item.top,
                     right: item.right - 36,
                     bottom: item.bottom,
                 },
-                if index == self.active {
+                if Some(index) == self.active_tab_index() {
                     COLOR_TEXT
                 } else {
                     COLOR_MUTED
@@ -1521,16 +2347,188 @@ impl App {
             return;
         }
 
-        if self.sidebar_width() > 92 && (x as f32) < self.sidebar_width && y >= TAB_TOP {
-            let index = ((y - TAB_TOP) / TAB_HEIGHT) as usize;
-            if index < self.tabs.len() {
-                let close_left = self.sidebar_width() - 42;
-                if x >= close_left {
-                    self.close_tab(index);
-                } else {
-                    self.switch_to(index);
+        if let Some(hit) = self.hit_sidebar(x, y) {
+            match hit {
+                SidebarHit::WorkspaceHeader => {
+                    if x >= self.workspace_header_rect().right - 42 {
+                        self.open_command(CommandMode::NewFolder);
+                    }
+                }
+                SidebarHit::WorkspaceButton(id) => self.switch_workspace(id),
+                SidebarHit::AddWorkspace => self.open_command(CommandMode::NewWorkspace),
+                SidebarHit::Folder(_) => {}
+                SidebarHit::Tab(index) => {
+                    let row =
+                        self.sidebar_row_rects()
+                            .into_iter()
+                            .find_map(|(row, rect)| match row {
+                                SidebarRow::Tab(row_index) if row_index == index => Some(rect),
+                                _ => None,
+                            });
+                    if let Some(row) = row {
+                        if x >= row.right - 34 {
+                            self.close_tab(index);
+                        } else {
+                            self.switch_to(index);
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    fn handle_right_click(&mut self, x: i32, y: i32) {
+        let Some(hit) = self.hit_sidebar(x, y) else {
+            return;
+        };
+        match hit {
+            SidebarHit::WorkspaceHeader | SidebarHit::WorkspaceButton(_) => {
+                let workspace_id = match hit {
+                    SidebarHit::WorkspaceButton(id) => id,
+                    _ => self.active_workspace,
+                };
+                let cmd = self.show_context_menu(
+                    x,
+                    y,
+                    &[
+                        (MENU_WORKSPACE_RENAME, "Rename Workspace"),
+                        (MENU_WORKSPACE_NEW_FOLDER, "New Folder"),
+                        (MENU_WORKSPACE_NEW, "New Workspace"),
+                    ],
+                );
+                match cmd {
+                    MENU_WORKSPACE_RENAME => {
+                        self.open_command(CommandMode::RenameWorkspace(workspace_id))
+                    }
+                    MENU_WORKSPACE_NEW_FOLDER => self.open_command(CommandMode::NewFolder),
+                    MENU_WORKSPACE_NEW => self.open_command(CommandMode::NewWorkspace),
+                    _ => {}
+                }
+            }
+            SidebarHit::AddWorkspace => self.open_command(CommandMode::NewWorkspace),
+            SidebarHit::Folder(folder_id) => {
+                let cmd = self.show_context_menu(
+                    x,
+                    y,
+                    &[
+                        (MENU_FOLDER_RENAME, "Rename Folder"),
+                        (MENU_FOLDER_DELETE, "Remove Folder"),
+                    ],
+                );
+                match cmd {
+                    MENU_FOLDER_RENAME => self.open_command(CommandMode::RenameFolder(folder_id)),
+                    MENU_FOLDER_DELETE => {
+                        self.folders.retain(|folder| folder.id != folder_id);
+                        for tab in &mut self.tabs {
+                            if tab.folder_id == Some(folder_id) {
+                                tab.folder_id = None;
+                            }
+                        }
+                        self.save_state();
+                        self.refresh();
+                    }
+                    _ => {}
+                }
+            }
+            SidebarHit::Tab(index) => {
+                let Some(tab) = self.tabs.get(index) else {
+                    return;
+                };
+                let folders: Vec<(usize, String)> = self
+                    .folders
+                    .iter()
+                    .filter(|folder| folder.workspace_id == tab.workspace_id)
+                    .map(|folder| (folder.id, folder.name.clone()))
+                    .collect();
+                let mut labels: Vec<(usize, String)> = Vec::new();
+                labels.push((
+                    if tab.pinned {
+                        MENU_TAB_UNPIN
+                    } else {
+                        MENU_TAB_PIN
+                    },
+                    if tab.pinned {
+                        "Unpin Tab".to_string()
+                    } else {
+                        "Pin Tab".to_string()
+                    },
+                ));
+                labels.push((MENU_WORKSPACE_NEW_FOLDER, "New Folder".to_string()));
+                if tab.folder_id.is_some() {
+                    labels.push((MENU_TAB_REMOVE_FOLDER, "Remove From Folder".to_string()));
+                }
+                for (offset, (_, name)) in folders.iter().enumerate() {
+                    labels.push((
+                        MENU_TAB_MOVE_FOLDER_BASE + offset,
+                        format!("Move to {}", name),
+                    ));
+                }
+                let borrowed: Vec<(usize, &str)> = labels
+                    .iter()
+                    .map(|(id, label)| (*id, label.as_str()))
+                    .collect();
+                let cmd = self.show_context_menu(x, y, &borrowed);
+                match cmd {
+                    MENU_TAB_PIN => {
+                        if let Some(tab) = self.tabs.get_mut(index) {
+                            tab.pinned = true;
+                            tab.folder_id = None;
+                        }
+                    }
+                    MENU_TAB_UNPIN => {
+                        if let Some(tab) = self.tabs.get_mut(index) {
+                            tab.pinned = false;
+                        }
+                    }
+                    MENU_TAB_REMOVE_FOLDER => {
+                        if let Some(tab) = self.tabs.get_mut(index) {
+                            tab.folder_id = None;
+                        }
+                    }
+                    MENU_WORKSPACE_NEW_FOLDER => {
+                        self.open_command(CommandMode::NewFolder);
+                        return;
+                    }
+                    id if id >= MENU_TAB_MOVE_FOLDER_BASE
+                        && id < MENU_TAB_MOVE_FOLDER_BASE + folders.len() =>
+                    {
+                        let folder_id = folders[id - MENU_TAB_MOVE_FOLDER_BASE].0;
+                        if let Some(tab) = self.tabs.get_mut(index) {
+                            tab.pinned = false;
+                            tab.folder_id = Some(folder_id);
+                        }
+                    }
+                    _ => {}
+                }
+                self.save_state();
+                self.refresh();
+            }
+        }
+    }
+
+    fn show_context_menu(&self, x: i32, y: i32, items: &[(usize, &str)]) -> usize {
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else {
+                return 0;
+            };
+            let labels: Vec<Vec<u16>> = items.iter().map(|(_, label)| to_wide(label)).collect();
+            for ((id, _), label) in items.iter().zip(labels.iter()) {
+                let _ = AppendMenuW(menu, MF_STRING, *id, PCWSTR(label.as_ptr()));
+            }
+            let mut point = POINT { x, y };
+            let _ = ClientToScreen(self.hwnd, &mut point);
+            let cmd = WindowsAndMessaging::TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                None,
+                self.hwnd,
+                None,
+            )
+            .0 as usize;
+            let _ = DestroyMenu(menu);
+            cmd
         }
     }
 
@@ -1591,11 +2589,14 @@ impl App {
             }
         }
 
-        if self.sidebar_width() > 92 && (x as f32) < self.sidebar_width && y >= TAB_TOP {
-            let index = ((y - TAB_TOP) / TAB_HEIGHT) as usize;
-            if index < self.tabs.len() {
-                self.hover_tab = Some(index);
-                if x >= self.sidebar_width() - 42 {
+        if let Some(SidebarHit::Tab(index)) = self.hit_sidebar(x, y) {
+            self.hover_tab = Some(index);
+            if let Some((_, row)) = self
+                .sidebar_row_rects()
+                .into_iter()
+                .find(|(row, _)| matches!(row, SidebarRow::Tab(row_index) if *row_index == index))
+            {
+                if x >= row.right - 34 {
                     self.hover_close = Some(index);
                 }
             }
@@ -1650,6 +2651,8 @@ impl App {
             }
             if self.sidebar_width < 0.5 {
                 self.sidebar_mode = SidebarMode::Hidden;
+                self.sidebar_expand_mode = SidebarMode::Hidden;
+                self.hovering_sidebar = false;
                 self.clear_webview_clipping();
                 unsafe {
                     let _ = WindowsAndMessaging::SetTimer(
@@ -1929,18 +2932,22 @@ fn create_main_window() -> AppResult<HWND> {
             Some(hinstance),
             None,
         )?;
-        let _ = WindowsAndMessaging::SendMessageW(
-            hwnd,
-            WM_SETICON,
-            Some(WPARAM(ICON_SMALL as usize)),
-            Some(LPARAM(0)),
-        );
-        let _ = WindowsAndMessaging::SendMessageW(
-            hwnd,
-            WM_SETICON,
-            Some(WPARAM(ICON_BIG as usize)),
-            Some(LPARAM(0)),
-        );
+        if let Some(icon) = create_aster_icon(32) {
+            let _ = WindowsAndMessaging::SendMessageW(
+                hwnd,
+                WM_SETICON,
+                Some(WPARAM(ICON_SMALL as usize)),
+                Some(LPARAM(icon.0 as isize)),
+            );
+        }
+        if let Some(icon) = create_aster_icon(64) {
+            let _ = WindowsAndMessaging::SendMessageW(
+                hwnd,
+                WM_SETICON,
+                Some(WPARAM(ICON_BIG as usize)),
+                Some(LPARAM(icon.0 as isize)),
+            );
+        }
         enable_dark_titlebar(hwnd);
         Ok(hwnd)
     }
@@ -2074,8 +3081,10 @@ unsafe extern "system" fn command_popup_proc(
             let y = hiword(l_param.0 as u32) as i16 as i32;
             if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
                 with_app(parent, |app| {
-                    for index in 0..app.tabs.len().min(4) {
-                        let mut row = app.command_tab_row_rect(index);
+                    for (row_index, tab_index) in
+                        app.active_workspace_tabs().into_iter().take(4).enumerate()
+                    {
+                        let mut row = app.command_tab_row_rect(row_index);
                         let popup = app.command_popup_rect();
                         row.left -= popup.left;
                         row.right -= popup.left;
@@ -2083,7 +3092,7 @@ unsafe extern "system" fn command_popup_proc(
                         row.bottom -= popup.top;
                         if point_in_rect(x, y, row) {
                             app.close_command();
-                            app.switch_to(index);
+                            app.switch_to(tab_index);
                             return;
                         }
                     }
@@ -2110,7 +3119,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         }
         WM_CREATE => LRESULT(0),
         WM_SIZE => {
-            with_app(hwnd, |app| app.layout());
+            with_app(hwnd, |app| {
+                app.layout();
+                app.refresh();
+            });
             LRESULT(0)
         }
         WM_PAINT => {
@@ -2141,6 +3153,12 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             let x = loword(l_param.0 as u32) as i16 as i32;
             let y = hiword(l_param.0 as u32) as i16 as i32;
             with_app(hwnd, |app| app.handle_click(x, y));
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            with_app(hwnd, |app| app.handle_right_click(x, y));
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -2186,7 +3204,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         }
         WM_SETFOCUS => {
             with_app(hwnd, |app| {
-                if let Some(tab) = app.tabs.get(app.active) {
+                if let Some(tab) = app.active_tab_index().and_then(|index| app.tabs.get(index)) {
                     unsafe {
                         let _ = tab
                             .controller
@@ -2238,7 +3256,11 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
                 app.open_command(CommandMode::NewTab);
             }
             0x53 if ctrl => app.toggle_sidebar(),
-            0x57 if ctrl => app.close_tab(app.active),
+            0x57 if ctrl => {
+                if let Some(index) = app.active_tab_index() {
+                    app.close_tab(index);
+                }
+            }
             0x25 if alt => app.go_back(),
             0x27 if alt => app.go_forward(),
             code if code == VK_F5.0 as u32 => app.reload(),
@@ -2314,13 +3336,10 @@ fn draw_toolbar_icon_button(
     hdc: HDC,
     rect: RECT,
     icon: IconKind,
-    hovered: bool,
+    _hovered: bool,
     icon_font: &HFONT,
 ) {
     unsafe {
-        if hovered {
-            fill_round_rect(hdc, rect, 0x1d1d1d, 7);
-        }
         draw_icon_glyph(
             hdc,
             icon_font,
@@ -2331,7 +3350,7 @@ fn draw_toolbar_icon_button(
                 right: rect.right - 1,
                 bottom: rect.bottom - 1,
             },
-            if hovered { COLOR_TEXT } else { COLOR_MUTED },
+            COLOR_TEXT,
         );
     }
 }
@@ -2481,7 +3500,11 @@ unsafe fn draw_icon_glyph(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, co
     let _ = SelectObject(hdc, old_font);
 }
 
-unsafe fn draw_favicon_mark(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab) {
+unsafe fn draw_tab_favicon(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab) {
+    if let Some(favicon) = tab.favicon_bitmap.as_ref() {
+        draw_bitmap_fit(hdc, rect, favicon);
+        return;
+    }
     let host = display_host(&tab.url);
     let label_source = if host.is_empty() {
         tab.title.as_str()
@@ -2493,115 +3516,381 @@ unsafe fn draw_favicon_mark(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab) {
         .find(|ch| ch.is_ascii_alphanumeric())
         .map(|ch| ch.to_ascii_uppercase().to_string())
         .unwrap_or_else(|| "A".to_string());
-    let color = site_color(if tab.favicon_uri.is_empty() {
-        label_source
-    } else {
-        tab.favicon_uri.as_str()
-    });
-    fill_round_rect(hdc, rect, 0xf6f6f6, 5);
-    draw_centered_text(hdc, font, &letter, rect, color);
+    draw_centered_text(hdc, font, &letter, rect, COLOR_ACCENT);
+}
+
+unsafe fn draw_bitmap_fit(hdc: HDC, rect: RECT, bitmap: &FaviconBitmap) {
+    let target_w = rect.right - rect.left;
+    let target_h = rect.bottom - rect.top;
+    if target_w <= 0 || target_h <= 0 || bitmap.width <= 0 || bitmap.height <= 0 {
+        return;
+    }
+    let scale = (target_w as f32 / bitmap.width as f32).min(target_h as f32 / bitmap.height as f32);
+    let width = (bitmap.width as f32 * scale).round() as i32;
+    let height = (bitmap.height as f32 * scale).round() as i32;
+    let x = rect.left + (target_w - width) / 2;
+    let y = rect.top + (target_h - height) / 2;
+    let mem_dc = CreateCompatibleDC(Some(hdc));
+    if mem_dc.is_invalid() {
+        return;
+    }
+    let old = SelectObject(mem_dc, HGDIOBJ(bitmap.handle.0));
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let _ = AlphaBlend(
+        hdc,
+        x,
+        y,
+        width,
+        height,
+        mem_dc,
+        0,
+        0,
+        bitmap.width,
+        bitmap.height,
+        blend,
+    );
+    let _ = SelectObject(mem_dc, old);
+    let _ = DeleteDC(mem_dc);
+}
+
+fn decode_favicon_stream(stream: &IStream) -> Option<FaviconBitmap> {
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let decoder = factory
+            .CreateDecoderFromStream(stream, ptr::null(), WICDecodeMetadataCacheOnDemand)
+            .ok()?;
+        let frame = decoder.GetFrame(0).ok()?;
+        let converter = factory.CreateFormatConverter().ok()?;
+        converter
+            .Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None::<&windows::Win32::Graphics::Imaging::IWICPalette>,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .ok()?;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        converter.GetSize(&mut width, &mut height).ok()?;
+        if width == 0 || height == 0 || width > 256 || height > 256 {
+            return None;
+        }
+        let stride = width * 4;
+        let mut pixels = vec![0u8; (stride * height) as usize];
+        converter
+            .CopyPixels(ptr::null(), stride, &mut pixels)
+            .ok()?;
+        let handle = create_bgra_bitmap(width as i32, height as i32, &pixels)?;
+        Some(FaviconBitmap {
+            handle,
+            width: width as i32,
+            height: height as i32,
+        })
+    }
+}
+
+fn create_aster_icon(size: i32) -> Option<HICON> {
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+    let cx = size as f32 / 2.0;
+    let cy = size as f32 / 2.0;
+    let radius = size as f32 * 0.30;
+    let stroke = (size as f32 * 0.13).max(4.0);
+    draw_icon_line(&mut pixels, size, cx, cy - radius, cx, cy + radius, stroke);
+    draw_icon_line(
+        &mut pixels,
+        size,
+        cx - radius * 0.9,
+        cy - radius * 0.5,
+        cx + radius * 0.9,
+        cy + radius * 0.5,
+        stroke,
+    );
+    draw_icon_line(
+        &mut pixels,
+        size,
+        cx + radius * 0.9,
+        cy - radius * 0.5,
+        cx - radius * 0.9,
+        cy + radius * 0.5,
+        stroke,
+    );
+    unsafe {
+        let color = create_bgra_bitmap(size, size, &pixels)?;
+        let mask = CreateBitmap(size, size, 1, 1, None);
+        if mask.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(color.0));
+            return None;
+        }
+        let info = ICONINFO {
+            fIcon: BOOL::from(true),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        let icon = CreateIconIndirect(&info).ok();
+        let _ = DeleteObject(HGDIOBJ(color.0));
+        let _ = DeleteObject(HGDIOBJ(mask.0));
+        icon
+    }
+}
+
+fn draw_icon_line(pixels: &mut [u8], size: i32, x1: f32, y1: f32, x2: f32, y2: f32, stroke: f32) {
+    let steps = ((x2 - x1).abs().max((y2 - y1).abs()) * 2.0).max(1.0) as i32;
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let x = x1 + (x2 - x1) * t;
+        let y = y1 + (y2 - y1) * t;
+        draw_icon_dot(pixels, size, x, y, stroke / 2.0);
+    }
+}
+
+fn draw_icon_dot(pixels: &mut [u8], size: i32, cx: f32, cy: f32, radius: f32) {
+    let min_x = (cx - radius).floor() as i32;
+    let max_x = (cx + radius).ceil() as i32;
+    let min_y = (cy - radius).floor() as i32;
+    let max_y = (cy + radius).ceil() as i32;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            if x < 0 || y < 0 || x >= size || y >= size {
+                continue;
+            }
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= radius * radius {
+                let index = ((y * size + x) * 4) as usize;
+                pixels[index] = 0xf1;
+                pixels[index + 1] = 0x6f;
+                pixels[index + 2] = 0x63;
+                pixels[index + 3] = 0xff;
+            }
+        }
+    }
+}
+
+unsafe fn create_bgra_bitmap(width: i32, height: i32, pixels: &[u8]) -> Option<HBITMAP> {
+    if width <= 0 || height <= 0 || pixels.len() < (width * height * 4) as usize {
+        return None;
+    }
+    let mut info = BITMAPINFO::default();
+    info.bmiHeader = BITMAPINFOHEADER {
+        biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+    let mut bits: *mut core::ffi::c_void = ptr::null_mut();
+    let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    if bits.is_null() {
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        return None;
+    }
+    ptr::copy_nonoverlapping(
+        pixels.as_ptr(),
+        bits as *mut u8,
+        (width * height * 4) as usize,
+    );
+    Some(bitmap)
 }
 
 unsafe fn draw_aster_background(hdc: HDC, rect: RECT) {
     let _ = ASTER_BACKGROUND_SVG.len();
-    let clip = CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom);
-    let _ = Gdi::SelectClipRgn(hdc, Some(clip));
-    fill_rect(hdc, rect, COLOR_BLACK);
+    let width = (rect.right - rect.left).max(1);
     let height = (rect.bottom - rect.top).max(1);
-    for step in 0..56 {
-        let y1 = rect.top + height * step / 56;
-        let y2 = rect.top + height * (step + 1) / 56 + 1;
-        let t = step as f32 / 55.0;
-        let color = mix_color(0x050505, 0x160f28, (1.0 - t) * 0.55);
-        fill_rect(
-            hdc,
-            RECT {
-                left: rect.left,
-                top: y1,
-                right: rect.right,
-                bottom: y2,
-            },
-            color,
-        );
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    let accent = (0x63u8, 0x6fu8, 0xf1u8);
+    let sx = width as f32 / 1920.0;
+    let sy = height as f32 / 1080.0;
+    let scale = sx.min(sy).max(0.35);
+
+    for y in 0..height {
+        let ny = y as f32 / height as f32;
+        for x in 0..width {
+            let nx = x as f32 / width as f32;
+            let mut r = 0.0f32;
+            let mut g = 0.0f32;
+            let mut b = 0.0f32;
+
+            let dm = ((nx * nx) + ((ny - 1.0) * (ny - 1.0))).sqrt() / 1.10;
+            let gm = if dm <= 0.45 {
+                0.60 + (0.15 - 0.60) * (dm / 0.45)
+            } else if dm <= 1.0 {
+                0.15 * (1.0 - (dm - 0.45) / 0.55)
+            } else {
+                0.0
+            };
+            blend_rgb(&mut r, &mut g, &mut b, accent, gm);
+
+            let ds = (((nx - 1.0) * (nx - 1.0)) + (ny * ny)).sqrt() / 0.65;
+            let gs = if ds <= 1.0 { 0.22 * (1.0 - ds) } else { 0.0 };
+            blend_rgb(&mut r, &mut g, &mut b, accent, gs);
+
+            let dc = (((nx - 0.5) * (nx - 0.5)) + ((ny - 0.5) * (ny - 0.5))).sqrt() / 0.50;
+            let gc = if dc <= 1.0 { 0.06 * (1.0 - dc) } else { 0.0 };
+            blend_rgb(&mut r, &mut g, &mut b, accent, gc);
+
+            let d_bottom = ((x as f32).powi(2) + (y as f32 - height as f32).powi(2)).sqrt();
+            for (radius, alpha, stroke) in [
+                (280.0f32, 0.12f32, 1.0f32),
+                (460.0f32, 0.08f32, 0.8f32),
+                (650.0f32, 0.05f32, 0.7f32),
+                (880.0f32, 0.03f32, 0.6f32),
+                (1100.0f32, 0.02f32, 0.5f32),
+            ] {
+                if (d_bottom - radius * scale).abs() <= stroke.max(0.7f32) {
+                    blend_rgb(&mut r, &mut g, &mut b, accent, alpha);
+                }
+            }
+
+            let d_top = ((x as f32 - width as f32).powi(2) + (y as f32).powi(2)).sqrt();
+            for (radius, alpha, stroke) in
+                [(220.0f32, 0.07f32, 0.7f32), (400.0f32, 0.04f32, 0.5f32)]
+            {
+                if (d_top - radius * scale).abs() <= stroke.max(0.7f32) {
+                    blend_rgb(&mut r, &mut g, &mut b, accent, alpha);
+                }
+            }
+
+            let index = ((y * width + x) * 4) as usize;
+            pixels[index] = b.round().clamp(0.0, 255.0) as u8;
+            pixels[index + 1] = g.round().clamp(0.0, 255.0) as u8;
+            pixels[index + 2] = r.round().clamp(0.0, 255.0) as u8;
+            pixels[index + 3] = 255;
+        }
     }
 
-    let bottom_left = POINT {
-        x: rect.left,
-        y: rect.bottom,
-    };
-    let top_right = POINT {
-        x: rect.right,
-        y: rect.top,
-    };
-    draw_glow(hdc, bottom_left, rect, 660, 22);
-    draw_glow(hdc, top_right, rect, 430, 10);
-
-    for y in (rect.top + 24..rect.bottom).step_by(48) {
-        for x in (rect.left + 24..rect.right).step_by(48) {
-            fill_round_rect(
-                hdc,
-                RECT {
-                    left: x,
-                    top: y,
-                    right: x + 2,
-                    bottom: y + 2,
-                },
-                0x2f2f2f,
-                1,
+    let dot_step = (48.0 * scale).round().max(28.0) as i32;
+    let dot_radius = (0.9 * scale).max(0.7);
+    let mut y = (24.0 * scale) as i32;
+    while y < height {
+        let mut x = (24.0 * scale) as i32;
+        while x < width {
+            blend_disc(
+                &mut pixels,
+                width,
+                height,
+                x as f32,
+                y as f32,
+                dot_radius,
+                (255, 255, 255),
+                0.18,
             );
+            x += dot_step;
         }
+        y += dot_step;
     }
 
-    for (radius, color) in [
-        (280, 0x4f3631),
-        (460, 0x33241f),
-        (650, 0x241918),
-        (880, 0x191212),
+    for (x, y, radius, amount, white) in [
+        (192.0, 216.0, 1.8, 0.60, false),
+        (576.0, 108.0, 1.2, 0.40, true),
+        (960.0, 270.0, 1.5, 0.40, false),
+        (1440.0, 162.0, 2.0, 0.35, true),
+        (1700.0, 350.0, 1.2, 0.45, false),
+        (1300.0, 500.0, 1.6, 0.25, true),
+        (340.0, 480.0, 1.4, 0.50, false),
+        (740.0, 670.0, 1.1, 0.30, true),
+        (1580.0, 770.0, 1.7, 0.30, false),
+        (230.0, 830.0, 1.9, 0.55, false),
+        (1190.0, 920.0, 1.2, 0.20, true),
+        (1780.0, 990.0, 1.4, 0.25, false),
+        (620.0, 900.0, 1.0, 0.30, true),
+        (860.0, 80.0, 1.3, 0.35, false),
+        (1060.0, 760.0, 1.1, 0.30, false),
+        (440.0, 200.0, 0.9, 0.25, true),
+        (1820.0, 540.0, 1.5, 0.20, false),
+        (90.0, 680.0, 1.6, 0.40, false),
     ] {
-        draw_ring(hdc, bottom_left, radius, color);
+        let color = if white { (255, 255, 255) } else { accent };
+        blend_disc(
+            &mut pixels,
+            width,
+            height,
+            x * sx,
+            y * sy,
+            (radius * scale).max(0.8),
+            color,
+            amount,
+        );
     }
-    for (radius, color) in [(220, 0x322421), (400, 0x221918)] {
-        draw_ring(hdc, top_right, radius, color);
+
+    if let Some(bitmap) = create_bgra_bitmap(width, height, &pixels) {
+        let mem_dc = CreateCompatibleDC(Some(hdc));
+        if !mem_dc.is_invalid() {
+            let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+            let _ = BitBlt(
+                hdc,
+                rect.left,
+                rect.top,
+                width,
+                height,
+                Some(mem_dc),
+                0,
+                0,
+                SRCCOPY,
+            );
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteDC(mem_dc);
+        }
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
     }
-    let _ = Gdi::SelectClipRgn(hdc, None);
-    let _ = DeleteObject(HGDIOBJ(clip.0));
 }
 
-unsafe fn draw_glow(hdc: HDC, center: POINT, bounds: RECT, radius: i32, steps: i32) {
-    for step in (1..=steps).rev() {
-        let r = radius * step / steps;
-        let amount = step as f32 / steps as f32;
-        let color = mix_color(0x050505, COLOR_ACCENT, amount * amount * 0.12);
-        let glow = RECT {
-            left: center.x - r,
-            top: center.y - r,
-            right: center.x + r,
-            bottom: center.y + r,
-        };
-        let clipped = RECT {
-            left: glow.left.max(bounds.left),
-            top: glow.top.max(bounds.top),
-            right: glow.right.min(bounds.right),
-            bottom: glow.bottom.min(bounds.bottom),
-        };
-        if clipped.left < clipped.right && clipped.top < clipped.bottom {
-            fill_round_rect(hdc, glow, color, r * 2);
+fn blend_rgb(r: &mut f32, g: &mut f32, b: &mut f32, color: (u8, u8, u8), alpha: f32) {
+    let a = alpha.clamp(0.0, 1.0);
+    *r = *r * (1.0 - a) + color.0 as f32 * a;
+    *g = *g * (1.0 - a) + color.1 as f32 * a;
+    *b = *b * (1.0 - a) + color.2 as f32 * a;
+}
+
+fn blend_disc(
+    pixels: &mut [u8],
+    width: i32,
+    height: i32,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    color: (u8, u8, u8),
+    alpha: f32,
+) {
+    let min_x = (cx - radius).floor() as i32;
+    let max_x = (cx + radius).ceil() as i32;
+    let min_y = (cy - radius).floor() as i32;
+    let max_y = (cy + radius).ceil() as i32;
+    let radius_sq = radius * radius;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            if x < 0 || y < 0 || x >= width || y >= height {
+                continue;
+            }
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy > radius_sq {
+                continue;
+            }
+            let index = ((y * width + x) * 4) as usize;
+            let a = alpha.clamp(0.0, 1.0);
+            pixels[index] = (pixels[index] as f32 * (1.0 - a) + color.2 as f32 * a)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            pixels[index + 1] = (pixels[index + 1] as f32 * (1.0 - a) + color.1 as f32 * a)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            pixels[index + 2] = (pixels[index + 2] as f32 * (1.0 - a) + color.0 as f32 * a)
+                .round()
+                .clamp(0.0, 255.0) as u8;
         }
     }
-}
-
-unsafe fn draw_ring(hdc: HDC, center: POINT, radius: i32, color: u32) {
-    with_pen(hdc, color, 1, || {
-        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = Gdi::Ellipse(
-            hdc,
-            center.x - radius,
-            center.y - radius,
-            center.x + radius,
-            center.y + radius,
-        );
-        let _ = SelectObject(hdc, old_brush);
-    });
 }
 
 fn glyph(codepoint: u32) -> String {
@@ -2722,18 +4011,37 @@ fn display_host(url: &str) -> String {
         .to_string()
 }
 
-fn site_color(value: &str) -> u32 {
-    if value.is_empty() {
-        return COLOR_ACCENT;
+fn state_path() -> PathBuf {
+    PathBuf::from(STATE_FILE)
+}
+
+fn escape_state(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+}
+
+fn unescape_state(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
     }
-    let mut hash = 0u32;
-    for byte in value.bytes() {
-        hash = hash.wrapping_mul(16777619) ^ byte as u32;
-    }
-    let palette = [
-        0xf16f63, 0x62c455, 0x54b8ef, 0xe779d8, 0x68d7d1, 0x7ca8ff, 0x86d45f, 0xd8bd5f,
-    ];
-    palette[hash as usize % palette.len()]
+    out
 }
 
 fn solid_brush(color: u32) -> HBRUSH {
