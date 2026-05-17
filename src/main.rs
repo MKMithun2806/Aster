@@ -17,7 +17,7 @@ use windows::{
             MonitorFromWindow, MoveToEx, RedrawWindow, RoundRect, SelectObject, SetBkMode, SetTextColor,
             DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT,
             HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, TRANSPARENT,
-            RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+            RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_NOCHILDREN, RDW_UPDATENOW,
         },
         System::{Com::*, LibraryLoader},
         UI::{
@@ -1112,11 +1112,16 @@ impl App {
         }
         self.layout();
         unsafe {
+            let flags = if self.animating_sidebar {
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN
+            } else {
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN
+            };
             let _ = RedrawWindow(
                 Some(self.hwnd),
                 None,
                 None,
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                flags,
             );
         }
     }
