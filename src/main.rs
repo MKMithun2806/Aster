@@ -1267,13 +1267,29 @@ impl App {
                 let _ = Gdi::UpdateWindow(self.hwnd);
             }
         } else {
+            let old_sidebar_width = self.sidebar_width;
             self.sidebar_width += distance * 0.22;
             self.layout();
             let rect = client_rect(self.hwnd);
-            let button_right = self.top_button_x() + 124 + 4;
-            let max_right = (self.sidebar_width.ceil() as i32 + 4)
-                .max(button_right)
-                .min(rect.right);
+            let old_sw = old_sidebar_width.ceil() as i32;
+            let new_sw = self.sidebar_width.ceil() as i32;
+            let old_button_right = match self.sidebar_mode {
+                SidebarMode::Hidden => {
+                    if self.sidebar_target >= SIDEBAR_EXPANDED {
+                        match self.sidebar_expand_mode {
+                            SidebarMode::Overlay => 56 + 124 + 8,
+                            SidebarMode::Pushed => old_sw + 124 + 8,
+                            _ => 56 + 124 + 8,
+                        }
+                    } else {
+                        56 + 124 + 8
+                    }
+                }
+                SidebarMode::Overlay => 56 + 124 + 8,
+                SidebarMode::Pushed => old_sw + 124 + 8,
+            };
+            let new_button_right = self.top_button_x() + 124 + 8;
+            let max_right = old_sw.max(new_sw).max(old_button_right).max(new_button_right).min(rect.right) + 8;
             let region = RECT {
                 left: 0,
                 top: 0,
