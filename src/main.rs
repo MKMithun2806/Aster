@@ -531,16 +531,22 @@ impl App {
         self.sidebar_width.round() as i32
     }
 
-    fn content_left(&self) -> i32 {
+    fn top_button_x(&self) -> i32 {
         match self.sidebar_mode {
-            SidebarMode::Hidden => HOVER_ZONE,
+            SidebarMode::Hidden => {
+                if self.sidebar_target >= SIDEBAR_EXPANDED {
+                    self.sidebar_width()
+                } else {
+                    56
+                }
+            }
             SidebarMode::Overlay => 0,
             SidebarMode::Pushed => self.sidebar_width(),
         }
     }
 
     fn top_button_rects(&self) -> (RECT, RECT, RECT) {
-        let x = self.content_left() + 18;
+        let x = self.top_button_x();
         (
             RECT {
                 left: x,
@@ -660,12 +666,23 @@ impl App {
 
         let sidebar_width = self.sidebar_width();
         let bounds = match self.sidebar_mode {
-            SidebarMode::Hidden => RECT {
-                left: HOVER_ZONE,
-                top: TOPBAR_HEIGHT,
-                right: rect.right,
-                bottom: rect.bottom,
-            },
+            SidebarMode::Hidden => {
+                if self.sidebar_target >= SIDEBAR_EXPANDED {
+                    RECT {
+                        left: sidebar_width,
+                        top: TOPBAR_HEIGHT,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    }
+                } else {
+                    RECT {
+                        left: HOVER_ZONE,
+                        top: TOPBAR_HEIGHT,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    }
+                }
+            }
             SidebarMode::Overlay => RECT {
                 left: 0,
                 top: TOPBAR_HEIGHT,
@@ -1157,12 +1174,10 @@ impl App {
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
-        if mode == SidebarMode::Hidden {
-            self.sidebar_target = SIDEBAR_HIDDEN;
-        } else {
-            self.sidebar_target = SIDEBAR_EXPANDED;
-            self.sidebar_mode = mode;
-        }
+        self.sidebar_target = match mode {
+            SidebarMode::Hidden => SIDEBAR_HIDDEN,
+            SidebarMode::Overlay | SidebarMode::Pushed => SIDEBAR_EXPANDED,
+        };
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
@@ -1179,7 +1194,7 @@ impl App {
             }
             if self.sidebar_width < 0.5 {
                 self.sidebar_mode = SidebarMode::Hidden;
-            } else if self.sidebar_mode == SidebarMode::Hidden {
+            } else if self.sidebar_target >= SIDEBAR_EXPANDED {
                 self.sidebar_mode = SidebarMode::Pushed;
             }
         } else {
