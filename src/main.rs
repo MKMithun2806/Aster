@@ -718,22 +718,11 @@ impl App {
                 right: rect.right,
                 bottom: rect.bottom,
             },
-            SidebarMode::Pushed => {
-                if self.animating_sidebar {
-                    RECT {
-                        left: 0,
-                        top: TOPBAR_HEIGHT,
-                        right: rect.right,
-                        bottom: rect.bottom,
-                    }
-                } else {
-                    RECT {
-                        left: sidebar_width,
-                        top: TOPBAR_HEIGHT,
-                        right: rect.right,
-                        bottom: rect.bottom,
-                    }
-                }
+            SidebarMode::Pushed => RECT {
+                left: sidebar_width,
+                top: TOPBAR_HEIGHT,
+                right: rect.right,
+                bottom: rect.bottom,
             },
         };
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -742,12 +731,7 @@ impl App {
                 let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
                     || (self.sidebar_mode == SidebarMode::Hidden
                         && self.sidebar_expand_mode == SidebarMode::Overlay
-                        && self.sidebar_target >= SIDEBAR_EXPANDED)
-                    || (self.sidebar_mode == SidebarMode::Pushed && self.animating_sidebar)
-                    || (self.sidebar_mode == SidebarMode::Hidden
-                        && self.sidebar_expand_mode == SidebarMode::Pushed
-                        && self.sidebar_target >= SIDEBAR_EXPANDED
-                        && self.animating_sidebar);
+                        && self.sidebar_target >= SIDEBAR_EXPANDED);
                 if needs_clipping && sidebar_width > 0 {
                     if (sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 {
                         let clip_left = sidebar_width;
@@ -760,12 +744,12 @@ impl App {
                             clip_right,
                             clip_bottom,
                         );
-                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), false);
+                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
                         self.last_clip_width.set(sidebar_width as f32);
                     }
                 } else {
                     if self.last_clip_width.get() != 0.0 {
-                        let _ = SetWindowRgn(tab.child_hwnd, None, false);
+                        let _ = SetWindowRgn(tab.child_hwnd, None, true);
                         self.last_clip_width.set(0.0);
                     }
                 }
@@ -1266,12 +1250,30 @@ impl App {
                 self.sidebar_mode = SidebarMode::Hidden;
                 self.clear_webview_clipping();
                 unsafe {
-                    let _ = WindowsAndMessaging::SetTimer(
-                        Some(self.hwnd),
-                        HOVER_DETECT_TIMER_ID,
-                        100,
-                        None,
-                    );
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok()
+                        && ScreenToClient(self.hwnd, &mut pt).as_bool()
+                        && pt.x < HOVER_ZONE
+                        && pt.x >= 0
+                        && pt.y >= 0
+                    {
+                        self.sidebar_expand_mode = SidebarMode::Overlay;
+                        self.sidebar_target = SIDEBAR_EXPANDED;
+                        self.animating_sidebar = true;
+                        let _ = WindowsAndMessaging::SetTimer(
+                            Some(self.hwnd),
+                            SIDEBAR_TIMER_ID,
+                            15,
+                            None,
+                        );
+                    } else {
+                        let _ = WindowsAndMessaging::SetTimer(
+                            Some(self.hwnd),
+                            HOVER_DETECT_TIMER_ID,
+                            100,
+                            None,
+                        );
+                    }
                 }
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
                 self.sidebar_mode = self.sidebar_expand_mode;
@@ -1296,11 +1298,12 @@ impl App {
             self.sidebar_width += distance * 0.22;
             self.layout();
             let rect = client_rect(self.hwnd);
+            let sw = self.sidebar_width.ceil() as i32;
             let region = RECT {
                 left: 0,
                 top: 0,
-                right: rect.right,
-                bottom: rect.bottom,
+                right: sw.max(124 + 56 + 8),
+                bottom: TOPBAR_HEIGHT.max(rect.bottom),
             };
             unsafe {
                 let _ = InvalidateRect(Some(self.hwnd), Some(&region), false);
@@ -1312,7 +1315,7 @@ impl App {
         self.last_clip_width.set(0.0);
         for tab in &self.tabs {
             unsafe {
-                let _ = SetWindowRgn(tab.child_hwnd, None, false);
+                let _ = SetWindowRgn(tab.child_hwnd, None, true);
             }
         }
     }
