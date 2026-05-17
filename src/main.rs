@@ -227,7 +227,7 @@ struct App {
     animating_sidebar: bool,
     hovering_sidebar: bool,
     last_clip_width: Cell<f32>,
-    last_bounds_left: Cell<i32>,
+    last_bounds_rect: Cell<RECT>,
     site_mode: SiteMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -278,7 +278,7 @@ impl App {
             animating_sidebar: false,
             hovering_sidebar: false,
             last_clip_width: Cell::new(0.0),
-            last_bounds_left: Cell::new(-1),
+            last_bounds_rect: Cell::new(RECT { left: -1, top: -1, right: -1, bottom: -1 }),
             site_mode: SiteMode::Auto,
             settings_open: false,
             mode_menu_open: false,
@@ -734,7 +734,10 @@ impl App {
         };
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
-                if bounds.left != self.last_bounds_left.get() {
+                let last = self.last_bounds_rect.get();
+                if bounds.left != last.left || bounds.right != last.right
+                    || bounds.top != last.top || bounds.bottom != last.bottom
+                {
                     let _ = tab.controller.SetBounds(bounds);
                 }
                 let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
@@ -767,8 +770,11 @@ impl App {
                 }
             }
         }
-        if bounds.left != self.last_bounds_left.get() {
-            self.last_bounds_left.set(bounds.left);
+        let last = self.last_bounds_rect.get();
+        if bounds.left != last.left || bounds.right != last.right
+            || bounds.top != last.top || bounds.bottom != last.bottom
+        {
+            self.last_bounds_rect.set(bounds);
         }
     }
 
