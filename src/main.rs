@@ -52,6 +52,7 @@ const TAB_HEIGHT: i32 = 48;
 const TAB_TOP: i32 = 76;
 const SIDEBAR_TIMER_ID: usize = 42;
 const HOVER_LEAVE_TIMER_ID: usize = 43;
+const HOVER_DETECT_TIMER_ID: usize = 44;
 
 const COLOR_BLACK: u32 = 0x000000;
 const COLOR_PANEL: u32 = 0x090909;
@@ -704,7 +705,7 @@ impl App {
                     }
                 } else {
                     RECT {
-                        left: HOVER_ZONE,
+                        left: 0,
                         top: TOPBAR_HEIGHT,
                         right: rect.right,
                         bottom: rect.bottom,
@@ -748,12 +749,12 @@ impl App {
                             clip_right,
                             clip_bottom,
                         );
-                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
+                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), false);
                         self.last_clip_width.set(sidebar_width as f32);
                     }
                 } else {
                     if self.last_clip_width.get() != 0.0 {
-                        let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                        let _ = SetWindowRgn(tab.child_hwnd, None, false);
                         self.last_clip_width.set(0.0);
                     }
                 }
@@ -1234,6 +1235,7 @@ impl App {
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
+            let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
             if mode == SidebarMode::Hidden {
                 self.clear_webview_clipping();
             }
@@ -1252,6 +1254,14 @@ impl App {
             if self.sidebar_width < 0.5 {
                 self.sidebar_mode = SidebarMode::Hidden;
                 self.clear_webview_clipping();
+                unsafe {
+                    let _ = WindowsAndMessaging::SetTimer(
+                        Some(self.hwnd),
+                        HOVER_DETECT_TIMER_ID,
+                        100,
+                        None,
+                    );
+                }
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
                 self.sidebar_mode = self.sidebar_expand_mode;
                 if self.sidebar_mode == SidebarMode::Overlay {
@@ -1301,7 +1311,7 @@ impl App {
         };
         for tab in &self.tabs {
             unsafe {
-                let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                let _ = SetWindowRgn(tab.child_hwnd, None, false);
                 let _ = tab.controller.SetBounds(bounds);
             }
         }
@@ -1311,7 +1321,7 @@ impl App {
         self.last_clip_width.set(0.0);
         for tab in &self.tabs {
             unsafe {
-                let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                let _ = SetWindowRgn(tab.child_hwnd, None, false);
             }
         }
     }
@@ -1332,6 +1342,27 @@ impl App {
                         let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
                         self.sidebar_expand_mode = SidebarMode::Hidden;
                         self.set_sidebar_mode(SidebarMode::Hidden);
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_hover_detect(&mut self) {
+        if self.sidebar_mode != SidebarMode::Hidden || self.animating_sidebar {
+            unsafe {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
+            }
+            return;
+        }
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                if ScreenToClient(self.hwnd, &mut pt).as_bool() {
+                    if pt.x < HOVER_ZONE && pt.x >= 0 && pt.y >= 0 {
+                        let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
+                        self.sidebar_expand_mode = SidebarMode::Overlay;
+                        self.set_sidebar_mode(SidebarMode::Overlay);
                     }
                 }
             }
@@ -1667,6 +1698,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             }
             if w_param.0 == HOVER_LEAVE_TIMER_ID {
                 with_app(hwnd, |app| app.check_hover_leave());
+                return LRESULT(0);
+            }
+            if w_param.0 == HOVER_DETECT_TIMER_ID {
+                with_app(hwnd, |app| app.check_hover_detect());
                 return LRESULT(0);
             }
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
