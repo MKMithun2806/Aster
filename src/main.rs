@@ -544,9 +544,7 @@ impl App {
     fn top_button_x(&self) -> i32 {
         match self.sidebar_mode {
             SidebarMode::Hidden => {
-                if self.animating_sidebar {
-                    56
-                } else if self.sidebar_target >= SIDEBAR_EXPANDED {
+                if self.sidebar_target >= SIDEBAR_EXPANDED {
                     match self.sidebar_expand_mode {
                         SidebarMode::Overlay => 56,
                         SidebarMode::Pushed => self.sidebar_width().max(56),
@@ -557,13 +555,7 @@ impl App {
                 }
             }
             SidebarMode::Overlay => 56,
-            SidebarMode::Pushed => {
-                if self.animating_sidebar {
-                    56
-                } else {
-                    self.sidebar_width().max(56)
-                }
-            }
+            SidebarMode::Pushed => self.sidebar_width().max(56),
         }
     }
 
@@ -667,25 +659,14 @@ impl App {
     }
 
     fn layout(&self) {
-        self.layout_for_mode(self.sidebar_mode);
-    }
-
-    fn layout_for_mode(&self, mode: SidebarMode) {
         let rect = client_rect(self.hwnd);
-        let sidebar_width = self.sidebar_width();
-        let (address_left, webview_left) = match mode {
-            SidebarMode::Hidden => (56 + 18, HOVER_ZONE),
-            SidebarMode::Overlay => (56 + 18, 0),
-            SidebarMode::Pushed => (sidebar_width + 18, sidebar_width),
-        };
-
-        let address = RECT {
-            left: address_left,
-            top: 13,
-            right: (rect.right - 18).max(address_left + 220),
-            bottom: 49,
-        };
+        let address = self.address_rect();
         unsafe {
+            let flags = if self.animating_sidebar {
+                WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW
+            } else {
+                WindowsAndMessaging::SWP_NOZORDER
+            };
             let _ = WindowsAndMessaging::SetWindowPos(
                 self.address_hwnd,
                 None,
@@ -693,66 +674,90 @@ impl App {
                 address.top + 7,
                 (address.right - address.left - 52).max(120),
                 22,
-                WindowsAndMessaging::SWP_NOZORDER,
+                flags,
             );
         }
 
-        let bounds = RECT {
-            left: webview_left,
-            top: TOPBAR_HEIGHT,
-            right: rect.right,
-            bottom: rect.bottom,
-        };
-        for tab in self.tabs.iter() {
-            unsafe {
-                let _ = tab.controller.SetBounds(bounds);
-                let _ = SetWindowRgn(tab.child_hwnd, None, true);
-            }
-        }
-    }
-
-    fn layout_animation_frame(&self) {
-        let rect = client_rect(self.hwnd);
         let sidebar_width = self.sidebar_width();
-        let address_left = 56 + 18;
-        let address = RECT {
-            left: address_left,
-            top: 13,
-            right: (rect.right - 18).max(address_left + 220),
-            bottom: 49,
-        };
-        unsafe {
-            let _ = WindowsAndMessaging::SetWindowPos(
-                self.address_hwnd,
-                None,
-                address.left + 36,
-                address.top + 7,
-                (address.right - address.left - 52).max(120),
-                22,
-                WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW,
-            );
-        }
-
-        for tab in self.tabs.iter() {
-            unsafe {
-                let bounds = RECT {
-                    left: 0,
-                    top: TOPBAR_HEIGHT,
-                    right: rect.right,
-                    bottom: rect.bottom,
-                };
-                let _ = tab.controller.SetBounds(bounds);
-                if sidebar_width > 0 {
-                    let region = CreateRectRgn(
-                        sidebar_width,
-                        0,
-                        rect.right,
-                        rect.bottom - TOPBAR_HEIGHT,
-                    );
-                    let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
+        let bounds = match self.sidebar_mode {
+            SidebarMode::Hidden => {
+                if self.sidebar_target >= SIDEBAR_EXPANDED {
+                    match self.sidebar_expand_mode {
+                        SidebarMode::Overlay => RECT {
+                            left: 0,
+                            top: TOPBAR_HEIGHT,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        },
+                        SidebarMode::Pushed => RECT {
+                            left: 0,
+                            top: TOPBAR_HEIGHT,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        },
+                        _ => RECT {
+                            left: HOVER_ZONE,
+                            top: TOPBAR_HEIGHT,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        },
+                    }
                 } else {
-                    let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                    RECT {
+                        left: HOVER_ZONE,
+                        top: TOPBAR_HEIGHT,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    }
                 }
+            }
+            SidebarMode::Overlay => RECT {
+                left: 0,
+                top: TOPBAR_HEIGHT,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            SidebarMode::Pushed => RECT {
+                left: 0,
+                top: TOPBAR_HEIGHT,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+        };
+        for (i, tab) in self.tabs.iter().enumerate() {
+            unsafe {
+                let _ = tab.controller.SetBounds(bounds);
+                let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
+                    || (self.sidebar_mode == SidebarMode::Hidden
+                        && self.sidebar_expand_mode == SidebarMode::Overlay
+                        && self.sidebar_target >= SIDEBAR_EXPANDED)
+                    || (self.sidebar_mode == SidebarMode::Pushed && self.animating_sidebar)
+                    || (self.sidebar_mode == SidebarMode::Hidden
+                        && self.sidebar_expand_mode == SidebarMode::Pushed
+                        && self.sidebar_target >= SIDEBAR_EXPANDED
+                        && self.animating_sidebar);
+                if needs_clipping && sidebar_width > 0 {
+                    if (sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 {
+                        let clip_left = sidebar_width;
+                        let clip_top = 0;
+                        let clip_right = rect.right;
+                        let clip_bottom = rect.bottom - TOPBAR_HEIGHT;
+                        let region = CreateRectRgn(
+                            clip_left,
+                            clip_top,
+                            clip_right,
+                            clip_bottom,
+                        );
+                        let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
+                        self.last_clip_width.set(sidebar_width as f32);
+                    }
+                } else {
+                    if self.last_clip_width.get() != 0.0 {
+                        let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                        self.last_clip_width.set(0.0);
+                    }
+                }
+                let _ = tab.controller.SetIsVisible(i == self.active);
             }
         }
     }
@@ -1259,6 +1264,9 @@ impl App {
                             None,
                         );
                     }
+                } else if self.sidebar_mode == SidebarMode::Pushed {
+                    self.clear_webview_clipping();
+                    self.set_webview_pushed_bounds();
                 }
             }
             self.layout();
@@ -1268,17 +1276,33 @@ impl App {
             }
         } else {
             self.sidebar_width += distance * 0.22;
-            self.layout_animation_frame();
+            self.layout();
             let rect = client_rect(self.hwnd);
-            let max_right = (self.sidebar_width.ceil() as i32 + 8).min(rect.right);
             let region = RECT {
                 left: 0,
                 top: 0,
-                right: max_right,
+                right: rect.right,
                 bottom: rect.bottom,
             };
             unsafe {
                 let _ = InvalidateRect(Some(self.hwnd), Some(&region), false);
+            }
+        }
+    }
+
+    fn set_webview_pushed_bounds(&self) {
+        let rect = client_rect(self.hwnd);
+        let sidebar_width = self.sidebar_width();
+        let bounds = RECT {
+            left: sidebar_width,
+            top: TOPBAR_HEIGHT,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        for tab in &self.tabs {
+            unsafe {
+                let _ = SetWindowRgn(tab.child_hwnd, None, true);
+                let _ = tab.controller.SetBounds(bounds);
             }
         }
     }
