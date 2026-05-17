@@ -782,7 +782,7 @@ impl App {
                 0x202020,
             );
 
-            if sidebar_width > 0 {
+            if sidebar_width >= 1 {
                 let sidebar = RECT {
                     left: 0,
                     top: TOPBAR_HEIGHT,
@@ -1267,20 +1267,21 @@ impl App {
                 let _ = Gdi::UpdateWindow(self.hwnd);
             }
         } else {
-            let old_width = self.sidebar_width;
             self.sidebar_width += distance * 0.22;
             self.layout();
             let rect = client_rect(self.hwnd);
-            let max_w = (old_width.max(self.sidebar_width).ceil() as i32 + 4).min(rect.right);
+            let button_right = self.top_button_x() + 124 + 4;
+            let max_right = (self.sidebar_width.ceil() as i32 + 4)
+                .max(button_right)
+                .min(rect.right);
             let region = RECT {
                 left: 0,
                 top: 0,
-                right: max_w,
+                right: max_right,
                 bottom: rect.bottom,
             };
             unsafe {
                 let _ = InvalidateRect(Some(self.hwnd), Some(&region), false);
-                let _ = Gdi::UpdateWindow(self.hwnd);
             }
         }
     }
