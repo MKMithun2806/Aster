@@ -675,18 +675,21 @@ impl App {
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
         let address = self.address_rect();
-        if !self.animating_sidebar {
-            unsafe {
-                let _ = WindowsAndMessaging::SetWindowPos(
-                    self.address_hwnd,
-                    None,
-                    address.left + 36,
-                    address.top + 7,
-                    (address.right - address.left - 52).max(120),
-                    22,
-                    WindowsAndMessaging::SWP_NOZORDER,
-                );
-            }
+        unsafe {
+            let flags = if self.animating_sidebar {
+                WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOREDRAW
+            } else {
+                WindowsAndMessaging::SWP_NOZORDER
+            };
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.address_hwnd,
+                None,
+                address.left + 36,
+                address.top + 7,
+                (address.right - address.left - 52).max(120),
+                22,
+                flags,
+            );
         }
 
         let sidebar_width = self.sidebar_width();
