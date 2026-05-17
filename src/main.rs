@@ -547,7 +547,7 @@ impl App {
                 if self.sidebar_target >= SIDEBAR_EXPANDED {
                     match self.sidebar_expand_mode {
                         SidebarMode::Overlay => 56,
-                        SidebarMode::Pushed => self.sidebar_width(),
+                        SidebarMode::Pushed => self.sidebar_width().max(56),
                         _ => 56,
                     }
                 } else {
@@ -555,7 +555,7 @@ impl App {
                 }
             }
             SidebarMode::Overlay => 56,
-            SidebarMode::Pushed => self.sidebar_width(),
+            SidebarMode::Pushed => self.sidebar_width().max(56),
         }
     }
 
@@ -785,7 +785,7 @@ impl App {
             if sidebar_width > 0 {
                 let sidebar = RECT {
                     left: 0,
-                    top: 0,
+                    top: TOPBAR_HEIGHT,
                     right: sidebar_width,
                     bottom: rect.bottom,
                 };
@@ -795,7 +795,7 @@ impl App {
                         hdc,
                         RECT {
                             left: sidebar.right - 1,
-                            top: 0,
+                            top: TOPBAR_HEIGHT,
                             right: sidebar.right,
                             bottom: rect.bottom,
                         },
@@ -1261,13 +1261,27 @@ impl App {
                     }
                 }
             }
+            self.layout();
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+                let _ = Gdi::UpdateWindow(self.hwnd);
+            }
         } else {
+            let old_width = self.sidebar_width;
             self.sidebar_width += distance * 0.22;
-        }
-        self.layout();
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
-            let _ = Gdi::UpdateWindow(self.hwnd);
+            self.layout();
+            let rect = client_rect(self.hwnd);
+            let max_w = (old_width.max(self.sidebar_width).ceil() as i32 + 4).min(rect.right);
+            let region = RECT {
+                left: 0,
+                top: 0,
+                right: max_w,
+                bottom: rect.bottom,
+            };
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), Some(&region), false);
+                let _ = Gdi::UpdateWindow(self.hwnd);
+            }
         }
     }
 
