@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "A fast Chromium-based desktop browser with vertical tabs."
 
+[[bin]]
+name = "Aster"
+path = "src/main.rs"
+
 [dependencies]
 webview2-com = "0.36"
 windows = { version = "0.60", features = [
@@ -19,3 +23,6 @@ windows = { version = "0.60", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging"
 ] }
+
+[build-dependencies]
+embed-resource = "2.4"

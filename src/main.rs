@@ -81,6 +81,7 @@ const MENU_WORKSPACE_NEW: usize = 3303;
 const MENU_FOLDER_RENAME: usize = 3401;
 const MENU_FOLDER_DELETE: usize = 3402;
 const MENU_TAB_CLOSE: usize = 3501;
+const MENU_TAB_DELETE_PIN: usize = 3507;
 const MENU_TAB_NEW: usize = 3502;
 const MENU_NEW_SPACE: usize = 3503;
 const MENU_NEW_FOLDER: usize = 3504;
@@ -105,6 +106,9 @@ const ASTER_BACKGROUND_SVG: &str = include_str!("../assets/aster-background.svg"
 static mut OLD_ADDRESS_PROC: WNDPROC = None;
 static mut OLD_COMMAND_POPUP_PROC: WNDPROC = None;
 static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
+static mut OLD_OVERLAY_MENU_PROC: WNDPROC = None;
+static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
+static mut CURRENT_DRAG_GHOST_BITMAP: Option<HBITMAP> = None;
 
 type AppResult<T> = std::result::Result<T, AppError>;
 
@@ -187,6 +191,7 @@ struct Workspace {
 struct Folder {
     id: usize,
     workspace_id: usize,
+    parent_id: Option<usize>,
     name: String,
     collapsed: bool,
     pinned: bool,
@@ -209,6 +214,7 @@ struct Tab {
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
     child_hwnd: HWND,
+    unloaded: bool,
 }
 
 #[derive(Clone)]
@@ -216,6 +222,40 @@ struct HistoryEntry {
     title: String,
     url: String,
 }
+
+#[derive(Clone, Debug)]
+struct VisitedSite {
+    url: String,
+    visit_count: u32,
+    last_visit_time: u64,
+}
+
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn calculate_frecency(visit_count: u32, last_visit_time: u64, current_time: u64) -> u32 {
+    let age_seconds = current_time.saturating_sub(last_visit_time);
+    let age_hours = age_seconds / 3600;
+    
+    let recency_weight = if age_hours < 4 {
+        100
+    } else if age_hours < 24 {
+        80
+    } else if age_hours < 24 * 7 {
+        60
+    } else if age_hours < 24 * 30 {
+        30
+    } else {
+        10
+    };
+    
+    visit_count * recency_weight
+}
+
 
 #[derive(Clone)]
 struct OverlayMenu {
@@ -262,6 +302,7 @@ enum SidebarRow {
     Tab(usize),
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarLabel {
     Pinned,
@@ -388,6 +429,7 @@ struct App {
     hwnd: HWND,
     address_hwnd: HWND,
     command_hwnd: HWND,
+    overlay_menu_hwnd: HWND,
     environment: ICoreWebView2Environment,
     workspaces: Vec<Workspace>,
     folders: Vec<Folder>,
@@ -421,7 +463,7 @@ struct App {
     drag_ghost: RefCell<Option<DragGhost>>,
     drop_target: Option<DropTarget>,
     background_cache: RefCell<Option<BackgroundBitmap>>,
-    suggestions: Vec<String>,
+    visited_sites: Vec<VisitedSite>,
     command_open: bool,
     command_mode: CommandMode,
     renaming_folder_id: Option<usize>,
@@ -429,14 +471,13 @@ struct App {
     rename_selected: bool,
     renaming_edit: Option<HWND>,
     fullscreen: bool,
+    drag_ghost_hwnd: Cell<Option<HWND>>,
     saved_style: isize,
     saved_rect: RECT,
 }
 
 struct DragGhost {
     handle: HBITMAP,
-    width: i32,
-    height: i32,
 }
 
 impl Drop for DragGhost {
@@ -474,6 +515,7 @@ impl App {
 
         let address_hwnd = create_address_bar(hwnd)?;
         let command_hwnd = create_command_popup(hwnd)?;
+        let overlay_menu_hwnd = create_overlay_menu(hwnd)?;
         unsafe {
             let _ = WindowsAndMessaging::SendMessageW(
                 address_hwnd,
@@ -486,6 +528,7 @@ impl App {
             hwnd,
             address_hwnd,
             command_hwnd,
+            overlay_menu_hwnd,
             environment,
             workspaces: vec![Workspace {
                 id: 1,
@@ -527,7 +570,7 @@ impl App {
             drag_ghost: RefCell::new(None),
             drop_target: Some(DropTarget::None),
             background_cache: RefCell::new(None),
-            suggestions: Vec::new(),
+            visited_sites: Vec::new(),
             command_open: false,
             command_mode: CommandMode::Navigate,
             renaming_folder_id: None,
@@ -535,6 +578,7 @@ impl App {
             rename_selected: false,
             renaming_edit: None,
             fullscreen: false,
+            drag_ghost_hwnd: Cell::new(None),
             saved_style: 0,
             saved_rect: RECT::default(),
         };
@@ -600,6 +644,7 @@ impl App {
             controller,
             webview,
             child_hwnd,
+            unloaded: false,
         });
         if let Some(title) = title {
             if let Some(tab) = self.tabs.get_mut(index) {
@@ -610,7 +655,7 @@ impl App {
         }
         if activate {
             self.active_workspace = workspace_id;
-            self.switch_to(index);
+            self.switch_to(index, true);
         }
         let wide = CoTaskMemPWSTR::from(url);
         unsafe {
@@ -675,7 +720,7 @@ impl App {
                     .position(|tab| tab.workspace_id == workspace_id)
             });
         if let Some(index) = next_index {
-            self.switch_to(index);
+            self.switch_to(index, false);
         } else {
             self.active = 0;
             set_window_text(self.address_hwnd, "");
@@ -712,54 +757,136 @@ impl App {
             .collect()
     }
 
-    fn sidebar_rows(&self) -> Vec<SidebarRow> {
-        let mut rows = Vec::new();
-        let pinned_folders: Vec<usize> = self
-            .folders
-            .iter()
-            .filter(|folder| folder.workspace_id == self.active_workspace && folder.pinned)
-            .map(|folder| folder.id)
-            .collect();
-        let pinned_tabs: Vec<usize> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, tab)| tab.workspace_id == self.active_workspace && tab.pinned)
-            .map(|(index, _)| index)
-            .collect();
-        rows.push(SidebarRow::Label(SidebarLabel::Pinned));
-        rows.extend(pinned_folders.into_iter().map(SidebarRow::Folder));
-        rows.extend(pinned_tabs.into_iter().map(SidebarRow::Tab));
-
-        let mut has_tabs_label = false;
-        for folder in self
-            .folders
-            .iter()
-            .filter(|folder| folder.workspace_id == self.active_workspace && !folder.pinned)
-        {
-            let folder_tabs: Vec<usize> = self
-                .tabs
-                .iter()
-                .enumerate()
-                .filter(|(_, tab)| {
-                    tab.workspace_id == self.active_workspace
-                        && !tab.pinned
-                        && tab.folder_id == Some(folder.id)
-                })
-                .map(|(index, _)| index)
-                .collect();
-            if !has_tabs_label {
-                rows.push(SidebarRow::Label(SidebarLabel::Tabs));
-                has_tabs_label = true;
+    fn folder_depth(&self, folder_id: usize) -> usize {
+        let mut depth = 0;
+        let mut current_id = folder_id;
+        let mut visited = std::collections::HashSet::new();
+        while let Some(folder) = self.folders.iter().find(|f| f.id == current_id) {
+            if !visited.insert(current_id) {
+                break;
             }
-            rows.push(SidebarRow::Folder(folder.id));
-            if !folder.collapsed {
-                rows.extend(folder_tabs.into_iter().map(SidebarRow::Tab));
+            if let Some(parent) = folder.parent_id {
+                depth += 1;
+                current_id = parent;
+            } else {
+                break;
             }
         }
+        depth
+    }
 
-        let loose_tabs: Vec<usize> = self
-            .tabs
+    fn tab_depth(&self, index: usize) -> usize {
+        if let Some(tab) = self.tabs.get(index) {
+            if let Some(folder_id) = tab.folder_id {
+                return self.folder_depth(folder_id) + 1;
+            }
+        }
+        0
+    }
+
+    fn is_descendant_of(&self, folder_id: usize, potential_ancestor_id: usize) -> bool {
+        let mut current_id = folder_id;
+        let mut visited = std::collections::HashSet::new();
+        while let Some(folder) = self.folders.iter().find(|f| f.id == current_id) {
+            if !visited.insert(current_id) {
+                break;
+            }
+            if let Some(parent) = folder.parent_id {
+                if parent == potential_ancestor_id {
+                    return true;
+                }
+                current_id = parent;
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    fn propagate_folder_pinning(&mut self, folder_id: usize, pinned: bool) {
+        for tab in self.tabs.iter_mut() {
+            if tab.folder_id == Some(folder_id) {
+                tab.pinned = pinned;
+            }
+        }
+        let child_folder_ids: Vec<usize> = self.folders
+            .iter()
+            .filter(|f| f.parent_id == Some(folder_id))
+            .map(|f| f.id)
+            .collect();
+        for cf_id in child_folder_ids {
+            if let Some(cf) = self.folders.iter_mut().find(|f| f.id == cf_id) {
+                cf.pinned = pinned;
+            }
+            self.propagate_folder_pinning(cf_id, pinned);
+        }
+    }
+
+    fn add_folder_rows_recursive(&self, folder_id: usize, rows: &mut Vec<SidebarRow>) {
+        let child_folders: Vec<&Folder> = self.folders
+            .iter()
+            .filter(|f| f.workspace_id == self.active_workspace && f.parent_id == Some(folder_id))
+            .collect();
+        for cf in child_folders {
+            rows.push(SidebarRow::Folder(cf.id));
+            if !cf.collapsed {
+                self.add_folder_rows_recursive(cf.id, rows);
+            }
+        }
+        let child_tabs: Vec<usize> = self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                tab.workspace_id == self.active_workspace
+                    && tab.folder_id == Some(folder_id)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        rows.extend(child_tabs.into_iter().map(SidebarRow::Tab));
+    }
+
+    fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        let mut rows = Vec::new();
+        
+        // Pinned Section
+        let mut pinned_rows = Vec::new();
+        let root_pinned_folders: Vec<&Folder> = self.folders
+            .iter()
+            .filter(|f| f.workspace_id == self.active_workspace && f.pinned && f.parent_id.is_none())
+            .collect();
+        for folder in root_pinned_folders {
+            pinned_rows.push(SidebarRow::Folder(folder.id));
+            if !folder.collapsed {
+                self.add_folder_rows_recursive(folder.id, &mut pinned_rows);
+            }
+        }
+        let loose_pinned_tabs: Vec<usize> = self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                tab.workspace_id == self.active_workspace && tab.pinned && tab.folder_id.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        pinned_rows.extend(loose_pinned_tabs.into_iter().map(SidebarRow::Tab));
+        rows.extend(pinned_rows);
+
+        // Always push the divider line!
+        rows.push(SidebarRow::Label(SidebarLabel::Tabs));
+
+        // Unpinned Section
+        let mut unpinned_rows = Vec::new();
+        let root_unpinned_folders: Vec<&Folder> = self.folders
+            .iter()
+            .filter(|f| f.workspace_id == self.active_workspace && !f.pinned && f.parent_id.is_none())
+            .collect();
+        for folder in root_unpinned_folders {
+            unpinned_rows.push(SidebarRow::Folder(folder.id));
+            if !folder.collapsed {
+                self.add_folder_rows_recursive(folder.id, &mut unpinned_rows);
+            }
+        }
+        let loose_tabs: Vec<usize> = self.tabs
             .iter()
             .enumerate()
             .filter(|(_, tab)| {
@@ -767,12 +894,9 @@ impl App {
             })
             .map(|(index, _)| index)
             .collect();
-        if !loose_tabs.is_empty() {
-            if !has_tabs_label {
-                rows.push(SidebarRow::Label(SidebarLabel::Tabs));
-            }
-            rows.extend(loose_tabs.into_iter().map(SidebarRow::Tab));
-        }
+        unpinned_rows.extend(loose_tabs.into_iter().map(SidebarRow::Tab));
+        rows.extend(unpinned_rows);
+
         rows
     }
 
@@ -783,7 +907,13 @@ impl App {
             return rects;
         }
         let bottom_limit = self.workspace_switcher_bounds().top - 10;
-        let mut y = SIDEBAR_ROWS_TOP;
+        let has_pinned = self.folders.iter().any(|f| f.workspace_id == self.active_workspace && f.pinned)
+            || self.tabs.iter().any(|t| t.workspace_id == self.active_workspace && t.pinned);
+        let mut y = if has_pinned {
+            SIDEBAR_ROWS_TOP
+        } else {
+            SIDEBAR_ROWS_TOP + 72
+        };
         for row in self.sidebar_rows() {
             let height = match row {
                 SidebarRow::Label(_) => 24,
@@ -861,20 +991,15 @@ impl App {
             return None;
         }
         let rows = self.sidebar_rows();
-        if rows.len() <= 1 {
-            return None;
-        }
         let pinned_count = rows.iter().take_while(|row| {
             matches!(
                 row,
-                SidebarRow::Label(SidebarLabel::Pinned)
-                    | SidebarRow::Folder(_)
-                    | SidebarRow::Tab(_)
+                SidebarRow::Folder(_) | SidebarRow::Tab(_)
             )
         }).count();
-        if pinned_count <= 1 {
+        if pinned_count == 0 {
             let y = SIDEBAR_ROWS_TOP;
-            let height = 24;
+            let height = 72;
             Some(RECT {
                 left: 10,
                 top: y,
@@ -927,6 +1052,7 @@ impl App {
         self.folders.clear();
         self.tabs.clear();
         self.workspace_active_tabs.clear();
+        self.visited_sites.clear();
 
         let mut tab_records = Vec::new();
         let mut active_workspace = 1usize;
@@ -944,13 +1070,16 @@ impl App {
                         });
                     }
                 }
-                "folder" if parts.len() >= 4 => {
+                 "folder" if parts.len() >= 4 => {
                     if let (Ok(id), Ok(workspace_id)) =
                         (parts[1].parse::<usize>(), parts[2].parse::<usize>())
                     {
+                        let parent_id = parts.get(6)
+                            .and_then(|val| if val.is_empty() { None } else { val.parse::<usize>().ok() });
                         self.folders.push(Folder {
                             id,
                             workspace_id,
+                            parent_id,
                             name: parts[3].clone(),
                             collapsed: parts.get(4).map(|value| value == "1").unwrap_or(false),
                             pinned: parts.get(5).map(|value| value == "1").unwrap_or(false),
@@ -979,7 +1108,14 @@ impl App {
                     }
                 }
                 "suggestion" if parts.len() >= 2 => {
-                    self.remember_suggestion(parts[1].clone());
+                    let url = parts[1].clone();
+                    let visit_count = parts.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+                    let last_visit_time = parts.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(|| current_timestamp());
+                    self.visited_sites.push(VisitedSite {
+                        url,
+                        visit_count,
+                        last_visit_time,
+                    });
                 }
                 "active_workspace" if parts.len() >= 2 => {
                     if let Ok(id) = parts[1].parse::<usize>() {
@@ -1048,6 +1184,7 @@ impl App {
                     Some(title),
                 )?;
                 if let Some(tab) = self.tabs.last_mut() {
+                    tab.unloaded = true;
                     if !history.is_empty() {
                         tab.history = history;
                         tab.history_cursor = tab.history.len().saturating_sub(1);
@@ -1078,12 +1215,13 @@ impl App {
         }
         for folder in &self.folders {
             lines.push(format!(
-                "folder\t{}\t{}\t{}\t{}\t{}",
+                "folder\t{}\t{}\t{}\t{}\t{}\t{}",
                 folder.id,
                 folder.workspace_id,
                 escape_state(&folder.name),
                 if folder.collapsed { "1" } else { "0" },
-                if folder.pinned { "1" } else { "0" }
+                if folder.pinned { "1" } else { "0" },
+                folder.parent_id.map(|id| id.to_string()).unwrap_or_default()
             ));
         }
         for tab in &self.tabs {
@@ -1100,8 +1238,13 @@ impl App {
                 serialize_history(&tab.history)
             ));
         }
-        for suggestion in self.suggestions.iter().take(120) {
-            lines.push(format!("suggestion\t{}", escape_state(suggestion)));
+        for site in self.visited_sites.iter().take(500) {
+            lines.push(format!(
+                "suggestion\t{}\t{}\t{}",
+                escape_state(&site.url),
+                site.visit_count,
+                site.last_visit_time
+            ));
         }
         let _ = fs::write(state_path(), lines.join("\n"));
     }
@@ -1321,10 +1464,11 @@ impl App {
             .enumerate()
             .find(|(_, tab)| tab.id == tab_id)
         {
-            tab.url = if url == "about:blank" {
+            let clean_url = strip_google_transient_params(&url);
+            tab.url = if clean_url == "about:blank" {
                 String::new()
             } else {
-                url
+                clean_url
             };
             if !tab.url.trim().is_empty() {
                 let mut handled_history_jump = false;
@@ -1360,7 +1504,11 @@ impl App {
                 suggestion = Some(tab.url.clone());
             }
             if Some(index) == active_index {
-                set_window_text(self.address_hwnd, &tab.url);
+                if tab.unloaded {
+                    set_window_text(self.address_hwnd, "");
+                } else {
+                    set_window_text(self.address_hwnd, &tab.url);
+                }
             }
         }
         if let Some(url) = suggestion {
@@ -1401,35 +1549,67 @@ impl App {
         if value.is_empty() || value == "about:blank" {
             return;
         }
-        self.suggestions.retain(|item| item != value);
-        self.suggestions.insert(0, value.to_string());
-        if self.suggestions.len() > 120 {
-            self.suggestions.truncate(120);
+        let now = current_timestamp();
+        let norm_value = normalize_url_for_dedup(value);
+        if let Some(site) = self.visited_sites.iter_mut().find(|item| normalize_url_for_dedup(&item.url) == norm_value) {
+            site.visit_count += 1;
+            site.last_visit_time = now;
+            if value.len() < site.url.len() {
+                site.url = value.to_string();
+            }
+        } else {
+            self.visited_sites.push(VisitedSite {
+                url: value.to_string(),
+                visit_count: 1,
+                last_visit_time: now,
+            });
+        }
+        if self.visited_sites.len() > 500 {
+            self.visited_sites.sort_by_key(|s| s.last_visit_time);
+            self.visited_sites.remove(0);
         }
     }
 
-    fn switch_to(&mut self, index: usize) {
+    fn switch_to(&mut self, index: usize, wake_up: bool) {
         if index >= self.tabs.len() {
             return;
         }
         let workspace_id = self.tabs[index].workspace_id;
         self.active_workspace = workspace_id;
+        if let Some(tab) = self.tabs.get_mut(index) {
+            if wake_up {
+                tab.unloaded = false;
+            }
+            if !tab.unloaded {
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(tab.child_hwnd, WindowsAndMessaging::SW_SHOW);
+                }
+            } else {
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(tab.child_hwnd, WindowsAndMessaging::SW_HIDE);
+                }
+            }
+        }
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
                 let _ = tab
                     .controller
-                    .SetIsVisible(i == index && tab.workspace_id == workspace_id);
+                    .SetIsVisible(i == index && tab.workspace_id == workspace_id && !tab.unloaded);
             }
         }
         self.active = index;
         self.set_workspace_active_tab(workspace_id, self.tabs[index].id);
         self.layout();
         if let Some(tab) = self.tabs.get(index) {
-            set_window_text(self.address_hwnd, &tab.url);
-            unsafe {
-                let _ = tab
-                    .controller
-                    .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            if tab.unloaded {
+                set_window_text(self.address_hwnd, "");
+            } else {
+                set_window_text(self.address_hwnd, &tab.url);
+                unsafe {
+                    let _ = tab
+                        .controller
+                        .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                }
             }
         }
         self.save_state();
@@ -1456,6 +1636,43 @@ impl App {
             return;
         }
         let workspace_id = self.tabs[index].workspace_id;
+
+        if self.tabs[index].pinned {
+            let tab = &mut self.tabs[index];
+            tab.unloaded = true;
+            unsafe {
+                let _ = tab.controller.SetIsVisible(false);
+                let _ = WindowsAndMessaging::ShowWindow(tab.child_hwnd, WindowsAndMessaging::SW_HIDE);
+            }
+            if self.active == index {
+                let next = self.tabs
+                    .iter()
+                    .enumerate()
+                    .find(|(i, t)| t.workspace_id == workspace_id && *i != index && !t.unloaded)
+                    .map(|(i, _)| i)
+                    .or_else(|| {
+                        self.tabs
+                            .iter()
+                            .enumerate()
+                            .find(|(i, t)| t.workspace_id == workspace_id && *i != index)
+                            .map(|(i, _)| i)
+                    });
+                if let Some(next) = next {
+                    self.switch_to(next, false);
+                } else {
+                    set_window_text(self.address_hwnd, "");
+                    self.save_state();
+                    self.refresh();
+                    self.ensure_hover_detect_timer();
+                }
+            } else {
+                self.save_state();
+                self.refresh();
+                self.ensure_hover_detect_timer();
+            }
+            return;
+        }
+
         self.tabs.remove(index);
         if self.tabs.iter().all(|tab| tab.workspace_id != workspace_id) {
             self.active = 0;
@@ -1481,13 +1698,21 @@ impl App {
                         .map(|(index, _)| index)
                 });
             if let Some(next) = next {
-                self.switch_to(next);
+                self.switch_to(next, false);
             }
         } else {
             self.save_state();
             self.refresh();
             self.ensure_hover_detect_timer();
         }
+    }
+
+    fn delete_pin(&mut self, index: usize) {
+        if self.tabs.is_empty() || index >= self.tabs.len() {
+            return;
+        }
+        self.tabs[index].pinned = false;
+        self.close_tab(index);
     }
 
     fn navigate_active_from_address(&mut self) {
@@ -1664,6 +1889,7 @@ impl App {
         self.folders.push(Folder {
             id,
             workspace_id: self.active_workspace,
+            parent_id: None,
             name: "New Folder".to_string(),
             collapsed: false,
             pinned: false,
@@ -2087,31 +2313,61 @@ impl App {
         let query = get_window_text(self.address_hwnd)
             .trim()
             .to_ascii_lowercase();
-        let mut rows = Vec::new();
-        for tab_index in self.active_workspace_tabs() {
-            if let Some(tab) = self.tabs.get(tab_index) {
-                if query.is_empty()
-                    || tab.url.to_ascii_lowercase().starts_with(&query)
-                    || tab.title.to_ascii_lowercase().contains(&query)
-                {
-                    rows.push((Some(tab_index), tab.title.clone(), tab.url.clone()));
+        let mut rows: Vec<(Option<usize>, String, String)> = Vec::new();
+        let now = current_timestamp();
+
+        // 1. Get visited history sites matching query, sorted by frecency score descending
+        let mut matched_history: Vec<&VisitedSite> = self.visited_sites.iter()
+            .filter(|site| {
+                if query.is_empty() {
+                    true
+                } else {
+                    site.url.to_ascii_lowercase().contains(&query) ||
+                    extract_search_query(&site.url)
+                        .map(|q| q.to_ascii_lowercase().contains(&query))
+                        .unwrap_or(false)
                 }
+            })
+            .collect();
+        
+        matched_history.sort_by_cached_key(|site| {
+            std::cmp::Reverse(calculate_frecency(site.visit_count, site.last_visit_time, now))
+        });
+
+        // 2. Add top matching history suggestions to rows first (guarantees that the top frecent site is the first recommendation)
+        for site in &matched_history {
+            let norm_site = normalize_url_for_dedup(&site.url);
+            if rows.iter().any(|row| normalize_url_for_dedup(&row.2) == norm_site) {
+                continue;
             }
-            if rows.len() >= 5 {
-                return rows;
-            }
-        }
-        for url in &self.suggestions {
-            if query.is_empty() || url.to_ascii_lowercase().starts_with(&query) {
-                if rows.iter().any(|(_, _, row_url)| row_url == url) {
-                    continue;
-                }
-                rows.push((None, label_for_url(url), url.clone()));
-            }
+            rows.push((None, label_for_url(&site.url), site.url.clone()));
             if rows.len() >= 5 {
                 break;
             }
         }
+
+        // 3. Add open tabs that match the query
+        if rows.len() < 5 {
+            for tab_index in self.active_workspace_tabs() {
+                if let Some(tab) = self.tabs.get(tab_index) {
+                    if query.is_empty()
+                        || tab.url.to_ascii_lowercase().starts_with(&query)
+                        || tab.title.to_ascii_lowercase().contains(&query)
+                    {
+                        // Avoid duplicates
+                        let norm_tab = normalize_url_for_dedup(&tab.url);
+                        if rows.iter().any(|row| normalize_url_for_dedup(&row.2) == norm_tab) {
+                            continue;
+                        }
+                        rows.push((Some(tab_index), tab.title.clone(), tab.url.clone()));
+                    }
+                }
+                if rows.len() >= 5 {
+                    break;
+                }
+            }
+        }
+
         rows
     }
 
@@ -2235,7 +2491,7 @@ impl App {
                 }
                 let _ = tab
                     .controller
-                    .SetIsVisible(Some(i) == self.active_tab_index());
+                    .SetIsVisible(Some(i) == self.active_tab_index() && !tab.unloaded);
             }
         }
         if clip_changed {
@@ -2279,7 +2535,8 @@ impl App {
                 0x202020,
             );
 
-            if self.active_tab_index().is_none() {
+            let is_unloaded = self.tabs.get(self.active).map(|t| t.unloaded).unwrap_or(false);
+            if self.active_tab_index().is_none() || is_unloaded {
                 self.paint_cached_background(
                     hdc,
                     RECT {
@@ -2369,7 +2626,7 @@ impl App {
                 .active_tab_index()
                 .and_then(|index| self.tabs.get(index))
                 .map(|tab| {
-                    if tab.url.is_empty() {
+                    if tab.unloaded || tab.url.is_empty() {
                         "Search or Enter URL..."
                     } else {
                         tab.url.as_str()
@@ -2440,6 +2697,27 @@ impl App {
 
             if sidebar_width > 92 {
                 self.paint_workspace_header(hdc);
+                let has_pinned = self.folders.iter().any(|f| f.workspace_id == self.active_workspace && f.pinned)
+                    || self.tabs.iter().any(|t| t.workspace_id == self.active_workspace && t.pinned);
+                if !has_pinned {
+                    if let Some(rect) = self.pinned_section_rect() {
+                        if let Ok(large_pin_font) = create_font_with_face(58, 400, w!("Segoe Fluent Icons")) {
+                            draw_icon_glyph(
+                                hdc,
+                                &large_pin_font,
+                                glyph(0xE718).as_str(),
+                                RECT {
+                                    left: rect.left,
+                                    top: rect.top,
+                                    right: rect.right,
+                                    bottom: rect.bottom,
+                                },
+                                COLOR_ACCENT,
+                            );
+                            let _ = DeleteObject(HGDIOBJ(large_pin_font.0));
+                        }
+                    }
+                }
                 for (row, row_rect) in self.sidebar_row_rects() {
                     match row {
                         SidebarRow::Label(label) => self.paint_sidebar_label(hdc, label, row_rect),
@@ -2455,14 +2733,10 @@ impl App {
                 }
                 self.paint_drop_target_highlight(hdc);
                 self.paint_workspace_switcher(hdc);
-                self.paint_drag_ghost(hdc);
             }
 
             if self.settings_open {
                 self.paint_settings_menu(hdc);
-            }
-            if let Some(menu) = &self.overlay_menu {
-                self.paint_overlay_menu(hdc, menu);
             }
         }
     }
@@ -2504,14 +2778,17 @@ impl App {
 
     fn paint_overlay_menu(&self, hdc: HDC, menu: &OverlayMenu) {
         unsafe {
-            fill_round_rect(hdc, menu.rect, 0x111111, 10);
-            draw_outline(hdc, menu.rect, 0x343434, 10);
+            let width = menu.rect.right - menu.rect.left;
+            let height = menu.rect.bottom - menu.rect.top;
+            let local_rect = RECT { left: 0, top: 0, right: width, bottom: height };
+            fill_round_rect(hdc, local_rect, 0x111111, 10);
+            draw_outline(hdc, local_rect, 0x343434, 10);
             for (index, item) in menu.items.iter().enumerate() {
                 let row = RECT {
-                    left: menu.rect.left + 6,
-                    top: menu.rect.top + 6 + index as i32 * MENU_ROW_HEIGHT,
-                    right: menu.rect.right - 6,
-                    bottom: menu.rect.top + 6 + (index as i32 + 1) * MENU_ROW_HEIGHT,
+                    left: 6,
+                    top: 6 + index as i32 * MENU_ROW_HEIGHT,
+                    right: width - 6,
+                    bottom: 6 + (index as i32 + 1) * MENU_ROW_HEIGHT,
                 };
                 if self.hover_target.map(|_| false).unwrap_or(false) {
                     let _ = row;
@@ -2695,7 +2972,7 @@ impl App {
                 0x222222,
             );
 
-            for (row_index, (tab_index, title, _url)) in
+            for (row_index, (tab_index, title, url)) in
                 self.command_suggestions().into_iter().take(5).enumerate()
             {
                 let mut row = self.command_tab_row_rect(row_index);
@@ -2715,10 +2992,16 @@ impl App {
                 if let Some(index) = tab_index.and_then(|index| self.tabs.get(index)) {
                     draw_tab_favicon(hdc, &self.fonts.small, favicon, index);
                 } else {
+                    let is_search = extract_search_query(&url).is_some();
+                    let icon_glyph = if is_search {
+                        glyph(0xE721)
+                    } else {
+                        glyph(0xE774)
+                    };
                     draw_icon_glyph(
                         hdc,
                         &self.fonts.toolbar_icon,
-                        glyph(0xE774).as_str(),
+                        icon_glyph.as_str(),
                         favicon,
                         COLOR_ACCENT,
                     );
@@ -2794,55 +3077,18 @@ impl App {
         }
     }
 
-    fn paint_sidebar_label(&self, hdc: HDC, label: SidebarLabel, rect: RECT) {
+    fn paint_sidebar_label(&self, hdc: HDC, _label: SidebarLabel, rect: RECT) {
         unsafe {
-            let left = match label {
-                SidebarLabel::Pinned => rect.left + 12,
-                SidebarLabel::Tabs => rect.left + 22,
-            };
             fill_rect(
                 hdc,
                 RECT {
-                    left,
+                    left: rect.left + 12,
                     top: rect.top + 12,
                     right: rect.right - 8,
                     bottom: rect.top + 13,
                 },
                 0x2a2a2a,
             );
-            if label == SidebarLabel::Pinned {
-                let has_pinned_content = self
-                    .sidebar_rows()
-                    .iter()
-                    .skip(1)
-                    .take_while(|row| {
-                        matches!(
-                            row,
-                            SidebarRow::Folder(_) | SidebarRow::Tab(_)
-                        )
-                    })
-                    .count() > 0;
-                if !has_pinned_content {
-                    let workspace_name = self
-                        .workspaces
-                        .iter()
-                        .find(|w| w.id == self.active_workspace)
-                        .map(|w| w.name.as_str())
-                        .unwrap_or("Space");
-                    draw_text(
-                        hdc,
-                        &self.fonts.small,
-                        workspace_name,
-                        RECT {
-                            left: rect.left + 12,
-                            top: rect.top - 2,
-                            right: rect.right - 8,
-                            bottom: rect.top + 12,
-                        },
-                        COLOR_MUTED,
-                    );
-                }
-            }
         }
     }
 
@@ -2861,8 +3107,10 @@ impl App {
             folder.name.clone()
         };
         unsafe {
+            let depth = self.folder_depth(folder_id);
+            let shift = (depth * 16) as i32;
             let item = RECT {
-                left: rect.left + 2,
+                left: rect.left + 2 + shift,
                 top: rect.top + 2,
                 right: rect.right - 2,
                 bottom: rect.bottom - 2,
@@ -3044,53 +3292,20 @@ impl App {
         }
     }
 
-    fn paint_drag_ghost(&self, hdc: HDC) {
-        if !self.drag_state.as_ref().map(|d| d.active).unwrap_or(false) {
-            return;
-        }
-        let binding = self.drag_ghost.borrow();
-        let Some(ghost) = binding.as_ref() else {
-            return;
-        };
-        let drag = self.drag_state.unwrap();
-        unsafe {
-            let mem_dc = CreateCompatibleDC(Some(hdc));
-            let old = SelectObject(mem_dc, HGDIOBJ(ghost.handle.0));
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 180,
-                AlphaFormat: 0,
-            };
-            let _ = AlphaBlend(
-                hdc,
-                drag.current_x + 10,
-                drag.current_y + 10,
-                ghost.width,
-                ghost.height,
-                mem_dc,
-                0,
-                0,
-                ghost.width,
-                ghost.height,
-                blend,
-            );
-            SelectObject(mem_dc, old);
-            let _ = DeleteDC(mem_dc);
-        }
-    }
 
     fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab, item: RECT) {
         unsafe {
             let mut item = item;
-            if tab.folder_id.is_some() && !tab.pinned {
-                item.left += 14;
+            let depth = self.tab_depth(index);
+            if depth > 0 {
+                item.left += (depth * 16) as i32;
             }
             if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
                 fill_round_rect(hdc, item, 0x151515, 10);
             }
             let mut text_left = item.left + 40;
-            if tab.pinned {
+            let show_pin = tab.pinned && tab.folder_id.is_none();
+            if show_pin {
                 draw_icon_glyph(
                     hdc,
                     &self.fonts.toolbar_icon,
@@ -3105,7 +3320,7 @@ impl App {
                 );
                 text_left = item.left + 62;
             }
-            let favicon_left = if tab.pinned {
+            let favicon_left = if show_pin {
                 item.left + 34
             } else {
                 item.left + 12
@@ -3157,10 +3372,19 @@ impl App {
                 } else {
                     COLOR_MUTED
                 };
+                let close_glyph = if tab.pinned {
+                    if tab.unloaded {
+                        glyph(0xE711)
+                    } else {
+                        glyph(0xE108)
+                    }
+                } else {
+                    glyph(0xE711)
+                };
                 draw_icon_glyph(
                     hdc,
                     &self.fonts.icon,
-                    glyph(0xE711).as_str(),
+                    close_glyph.as_str(),
                     RECT {
                         left: item.right - 30,
                         top: item.top,
@@ -3342,9 +3566,15 @@ impl App {
                         {
                             self.toggle_tab_mute(index);
                         } else if x >= row.right - 34 {
-                            self.close_tab(index);
-                        } else if index != self.active {
-                            self.switch_to(index);
+                            if let Some(tab) = self.tabs.get(index) {
+                                if tab.pinned && tab.unloaded {
+                                    self.delete_pin(index);
+                                } else {
+                                    self.close_tab(index);
+                                }
+                            }
+                        } else if index != self.active || self.tabs[index].unloaded {
+                            self.switch_to(index, true);
                         }
                     }
                 }
@@ -3440,6 +3670,9 @@ impl App {
                     ));
                 }
                 labels.push((MENU_TAB_CLOSE, "Close Tab".to_string()));
+                if tab.pinned {
+                    labels.push((MENU_TAB_DELETE_PIN, "Delete Pin".to_string()));
+                }
                 let items: Vec<OverlayMenuItem> = labels
                     .iter()
                     .map(|(id, label)| menu_item(*id, label))
@@ -3484,22 +3717,42 @@ impl App {
     ) {
         if items.is_empty() {
             self.overlay_menu = None;
+            unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(self.overlay_menu_hwnd, WindowsAndMessaging::SW_HIDE);
+            }
             return;
         }
         let rect = client_rect(self.hwnd);
         let height = 12 + items.len() as i32 * MENU_ROW_HEIGHT;
         let left = x.min(rect.right - MENU_WIDTH - 8).max(8);
         let top = y.min(rect.bottom - height - 8).max(TOPBAR_HEIGHT + 8);
+        let menu_rect = RECT {
+            left,
+            top,
+            right: left + MENU_WIDTH,
+            bottom: top + height,
+        };
         self.overlay_menu = Some(OverlayMenu {
-            rect: RECT {
-                left,
-                top,
-                right: left + MENU_WIDTH,
-                bottom: top + height,
-            },
+            rect: menu_rect,
             target,
             items,
         });
+
+        unsafe {
+            let flags = WindowsAndMessaging::SWP_NOZORDER;
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.overlay_menu_hwnd,
+                Some(HWND_TOP),
+                left,
+                top,
+                MENU_WIDTH,
+                height,
+                flags,
+            );
+            let _ = WindowsAndMessaging::ShowWindow(self.overlay_menu_hwnd, WindowsAndMessaging::SW_SHOW);
+            let _ = InvalidateRect(Some(self.overlay_menu_hwnd), None, false);
+            let _ = SetFocus(Some(self.overlay_menu_hwnd));
+        }
         self.refresh();
     }
 
@@ -3560,6 +3813,9 @@ impl App {
         let Some(menu) = self.overlay_menu.clone() else {
             return false;
         };
+        unsafe {
+            let _ = WindowsAndMessaging::ShowWindow(self.overlay_menu_hwnd, WindowsAndMessaging::SW_HIDE);
+        }
         if !point_in_rect(x, y, menu.rect) {
             self.overlay_menu = None;
             self.refresh();
@@ -3567,6 +3823,7 @@ impl App {
         }
         let row_index = (y - menu.rect.top - 6) / MENU_ROW_HEIGHT;
         if row_index < 0 || row_index as usize >= menu.items.len() {
+            self.overlay_menu = None;
             return true;
         }
         let id = menu.items[row_index as usize].id;
@@ -3612,6 +3869,11 @@ impl App {
             MENU_FOLDER_DELETE => {
                 if let SidebarHit::Folder(folder_id) = hit {
                     self.folders.retain(|folder| folder.id != folder_id);
+                    for f in &mut self.folders {
+                        if f.parent_id == Some(folder_id) {
+                            f.parent_id = None;
+                        }
+                    }
                     for tab in &mut self.tabs {
                         if tab.folder_id == Some(folder_id) {
                             tab.folder_id = None;
@@ -3625,6 +3887,7 @@ impl App {
                     if let Some(folder) = self.folders.iter_mut().find(|f| f.id == folder_id) {
                         folder.pinned = true;
                     }
+                    self.propagate_folder_pinning(folder_id, true);
                     self.save_state();
                 }
             }
@@ -3633,10 +3896,11 @@ impl App {
                     if let Some(folder) = self.folders.iter_mut().find(|f| f.id == folder_id) {
                         folder.pinned = false;
                     }
+                    self.propagate_folder_pinning(folder_id, false);
                     self.save_state();
                 }
             }
-            MENU_TAB_PIN | MENU_TAB_UNPIN | MENU_TAB_REMOVE_FOLDER | MENU_TAB_CLOSE
+            MENU_TAB_PIN | MENU_TAB_UNPIN | MENU_TAB_REMOVE_FOLDER | MENU_TAB_CLOSE | MENU_TAB_DELETE_PIN
                 if matches!(hit, SidebarHit::Tab(_)) =>
             {
                 if let SidebarHit::Tab(index) = hit {
@@ -3658,6 +3922,7 @@ impl App {
                             }
                         }
                         MENU_TAB_CLOSE => self.close_tab(index),
+                        MENU_TAB_DELETE_PIN => self.delete_pin(index),
                         _ => {}
                     }
                     self.save_state();
@@ -3712,15 +3977,42 @@ impl App {
     }
 
     fn handle_mouse_move(&mut self, x: i32, y: i32) {
+        let mut should_create_ghost = false;
+        let mut drag_coords = None;
         if let Some(drag) = self.drag_state.as_mut() {
             drag.current_x = x;
             drag.current_y = y;
             if !drag.active && (x - drag.start_x).abs() + (y - drag.start_y).abs() > 6 {
                 drag.active = true;
+                should_create_ghost = true;
+            }
+            drag_coords = Some((drag.current_x, drag.current_y));
+        }
+
+        if should_create_ghost {
+            unsafe {
+                let _ = SetCapture(self.hwnd);
+            }
+            self.create_drag_ghost();
+        }
+
+        if let Some((cx, cy)) = drag_coords {
+            if let Some(hwnd) = self.drag_ghost_hwnd.get() {
+                let mut screen_pt = POINT { x: cx + 10, y: cy + 10 };
                 unsafe {
-                    let _ = SetCapture(self.hwnd);
+                    let _ = Gdi::ClientToScreen(self.hwnd, &mut screen_pt);
+                    let _ = WindowsAndMessaging::SetWindowPos(
+                        hwnd,
+                        None,
+                        screen_pt.x,
+                        screen_pt.y,
+                        0,
+                        0,
+                        WindowsAndMessaging::SWP_NOSIZE
+                            | WindowsAndMessaging::SWP_NOZORDER
+                            | WindowsAndMessaging::SWP_NOACTIVATE,
+                    );
                 }
-                self.create_drag_ghost();
             }
         }
 
@@ -3884,6 +4176,12 @@ impl App {
             let _ = ReleaseCapture();
         }
         *self.drag_ghost.borrow_mut() = None;
+        if let Some(hwnd) = self.drag_ghost_hwnd.take() {
+            unsafe {
+                let _ = WindowsAndMessaging::DestroyWindow(hwnd);
+                CURRENT_DRAG_GHOST_BITMAP = None;
+            }
+        }
         self.drop_target = Some(DropTarget::None);
         if !drag.active {
             return false;
@@ -3891,9 +4189,25 @@ impl App {
         self.handle_drop(drag.source, x, y);
         true
     }
-
     fn handle_drop(&mut self, source: DragSource, x: i32, y: i32) {
         let hit = self.hit_sidebar(x, y);
+        let divider_y = self.sidebar_row_rects().iter()
+            .find(|(row, _)| matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
+            .map(|(_, rect)| rect.top)
+            .unwrap_or(SIDEBAR_ROWS_TOP + 72);
+
+        let hit = if hit.is_none() && x >= 0 && (x as f32) < self.sidebar_width {
+            if y <= divider_y {
+                Some(SidebarHit::PinnedSection)
+            } else {
+                None
+            }
+        } else {
+            hit
+        };
+
+        let is_normal_fallback = hit.is_none() && x >= 0 && (x as f32) < self.sidebar_width && y > divider_y;
+
         match source {
             DragSource::Tab(from_index) => {
                 if from_index >= self.tabs.len() {
@@ -3911,13 +4225,11 @@ impl App {
                     }
                     Some(SidebarHit::Folder(folder_id)) => {
                         if let Some(folder) = self.folders.iter().find(|folder| {
-                            folder.id == folder_id && folder.workspace_id == dragged_workspace && !folder.pinned
+                            folder.id == folder_id && folder.workspace_id == dragged_workspace
                         }) {
-                            if !dragged_pinned {
-                                let _ = folder;
-                                if let Some(tab) = self.tabs.get_mut(from_index) {
-                                    tab.folder_id = Some(folder_id);
-                                }
+                            if let Some(tab) = self.tabs.get_mut(from_index) {
+                                tab.folder_id = Some(folder_id);
+                                tab.pinned = folder.pinned;
                             }
                         }
                     }
@@ -3933,8 +4245,8 @@ impl App {
                         let target_pinned = self.tabs[target_index].pinned;
                         let tab_id = self.tabs[from_index].id;
                         let mut tab = self.tabs.remove(from_index);
-                        tab.pinned = if dragged_pinned { target_pinned } else { false };
-                        tab.folder_id = if tab.pinned { None } else { target_folder };
+                        tab.pinned = target_pinned;
+                        tab.folder_id = target_folder;
                         let insert_at = self
                             .tabs
                             .iter()
@@ -3945,24 +4257,27 @@ impl App {
                             self.active = new_active;
                         }
                     }
-                    _ => {}
+                    _ => {
+                        if is_normal_fallback {
+                            let mut tab = self.tabs.remove(from_index);
+                            tab.pinned = false;
+                            tab.folder_id = None;
+                            self.tabs.push(tab);
+                        }
+                    }
                 }
             }
             DragSource::Folder(from_folder_id) => {
-                let from_workspace = self
-                    .folders
-                    .iter()
-                    .find(|f| f.id == from_folder_id)
-                    .map(|f| f.workspace_id);
-
                 match hit {
                     Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
                         if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
                             folder.pinned = true;
+                            folder.parent_id = None;
                         }
+                        self.propagate_folder_pinning(from_folder_id, true);
                     }
                     Some(SidebarHit::Folder(target_folder_id)) => {
-                        if target_folder_id == from_folder_id {
+                        if target_folder_id == from_folder_id || self.is_descendant_of(target_folder_id, from_folder_id) {
                             return;
                         }
                         let target_pinned = self
@@ -3971,47 +4286,24 @@ impl App {
                             .find(|f| f.id == target_folder_id)
                             .map(|f| f.pinned);
                         if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
+                            folder.parent_id = Some(target_folder_id);
                             if let Some(target_pinned) = target_pinned {
                                 folder.pinned = target_pinned;
                             }
                         }
-                        if let (Some(workspace_id), Some(target_pinned)) = (from_workspace, target_pinned) {
-                            let folder_indices: Vec<usize> = self
-                                .folders
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, f)| f.workspace_id == workspace_id && f.pinned == target_pinned)
-                                .map(|(i, _)| i)
-                                .collect();
-                            let from_idx_pos = folder_indices.iter().position(|&i| {
-                                self.folders[i].id == from_folder_id
-                            });
-                            let target_idx_pos = folder_indices.iter().position(|&i| {
-                                self.folders[i].id == target_folder_id
-                            });
-                            if let (Some(from_idx_pos), Some(target_idx_pos)) = (from_idx_pos, target_idx_pos) {
-                                let from_global_idx = folder_indices[from_idx_pos];
-                                let folder_to_move = self.folders.remove(from_global_idx);
-                                let new_indices: Vec<usize> = self
-                                    .folders
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, f)| f.workspace_id == workspace_id && f.pinned == target_pinned)
-                                    .map(|(i, _)| i)
-                                    .collect();
-                                let insert_pos = if from_idx_pos < target_idx_pos {
-                                    target_idx_pos - 1
-                                } else {
-                                    target_idx_pos
-                                };
-                                let global_insert = new_indices.get(insert_pos)
-                                    .copied()
-                                    .unwrap_or(self.folders.len());
-                                self.folders.insert(global_insert, folder_to_move);
-                            }
+                        if let Some(target_pinned) = target_pinned {
+                            self.propagate_folder_pinning(from_folder_id, target_pinned);
                         }
                     }
-                    _ => {}
+                    _ => {
+                        if is_normal_fallback {
+                            if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
+                                folder.pinned = false;
+                                folder.parent_id = None;
+                            }
+                            self.propagate_folder_pinning(from_folder_id, false);
+                        }
+                    }
                 }
             }
         }
@@ -4149,9 +4441,42 @@ impl App {
 
             *self.drag_ghost.borrow_mut() = Some(DragGhost {
                 handle: bitmap,
-                width: ghost_width,
-                height: ghost_height,
             });
+
+            CURRENT_DRAG_GHOST_BITMAP = Some(bitmap);
+
+            let mut screen_pt = POINT { x: drag.current_x + 10, y: drag.current_y + 10 };
+            let _ = Gdi::ClientToScreen(self.hwnd, &mut screen_pt);
+
+            let ghost_hwnd = WindowsAndMessaging::CreateWindowExW(
+                WINDOW_EX_STYLE(0x00080000 | 0x00000020 | 0x00000080 | 0x00000008), // WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP | WS_VISIBLE,
+                screen_pt.x,
+                screen_pt.y,
+                ghost_width,
+                ghost_height,
+                Some(self.hwnd),
+                None,
+                Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None).unwrap().0)),
+                None,
+            ).ok();
+
+            if let Some(hwnd) = ghost_hwnd {
+                let _ = WindowsAndMessaging::SetLayeredWindowAttributes(
+                    hwnd,
+                    COLORREF(0),
+                    180,
+                    WindowsAndMessaging::LWA_ALPHA,
+                );
+                OLD_DRAG_GHOST_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+                    hwnd,
+                    GWLP_WNDPROC,
+                    drag_ghost_proc as *const () as isize,
+                ));
+                self.drag_ghost_hwnd.set(Some(hwnd));
+            }
         }
     }
 
@@ -4245,6 +4570,9 @@ impl App {
             return;
         }
         if self.animating_sidebar {
+            return;
+        }
+        if self.drag_state.is_some() {
             return;
         }
         unsafe {
@@ -4371,11 +4699,24 @@ fn main() -> AppResult<()> {
     message_loop()
 }
 
+fn profile_path() -> String {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let mut path = PathBuf::from(appdata);
+        path.push("Aster");
+        let _ = std::fs::create_dir_all(&path);
+        path.push(".aster-profile");
+        path.to_string_lossy().into_owned()
+    } else {
+        ".aster-profile".to_string()
+    }
+}
+
 fn create_environment() -> AppResult<ICoreWebView2Environment> {
     let (tx, rx) = mpsc::channel();
     CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
         Box::new(|handler| unsafe {
-            let user_data = CoTaskMemPWSTR::from(".aster-profile");
+            let path = profile_path();
+            let user_data = CoTaskMemPWSTR::from(path.as_str());
             CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),
                 *user_data.as_ref().as_pcwstr(),
@@ -4582,7 +4923,7 @@ fn create_command_popup(parent: HWND) -> AppResult<HWND> {
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!(""),
-            WINDOW_STYLE(WS_CHILD.0 | WS_CLIPSIBLINGS.0),
+            WINDOW_STYLE(WS_CHILD.0 | WS_CLIPSIBLINGS.0 | 0x00000100 /* SS_NOTIFY */),
             0,
             0,
             1,
@@ -4598,6 +4939,129 @@ fn create_command_popup(parent: HWND) -> AppResult<HWND> {
             command_popup_proc as *const () as isize,
         ));
         Ok(hwnd)
+    }
+}
+
+fn create_overlay_menu(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_CLIPSIBLINGS.0 | 0x00000100 /* SS_NOTIFY */),
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_OVERLAY_MENU_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            overlay_menu_proc as *const () as isize,
+        ));
+        Ok(hwnd)
+    }
+}
+
+unsafe extern "system" fn overlay_menu_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some(menu) = &app.overlay_menu {
+                        app.paint_overlay_menu(hdc, menu);
+                    }
+                });
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_LBUTTONDOWN => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some(menu) = &app.overlay_menu {
+                        let parent_x = x + menu.rect.left;
+                        let parent_y = y + menu.rect.top;
+                        let _ = app.handle_overlay_click(parent_x, parent_y);
+                    }
+                });
+            }
+            LRESULT(0)
+        }
+        WindowsAndMessaging::WM_KILLFOCUS => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    app.overlay_menu = None;
+                    let _ = WindowsAndMessaging::ShowWindow(app.overlay_menu_hwnd, WindowsAndMessaging::SW_HIDE);
+                    app.refresh();
+                });
+            }
+            LRESULT(0)
+        }
+        _ => WindowsAndMessaging::CallWindowProcW(
+            OLD_OVERLAY_MENU_PROC,
+            hwnd,
+            msg,
+            w_param,
+            l_param,
+        ),
+    }
+}
+
+unsafe extern "system" fn drag_ghost_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if let Some(bitmap) = CURRENT_DRAG_GHOST_BITMAP {
+                let mem_dc = CreateCompatibleDC(Some(hdc));
+                let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+                let mut rect = RECT::default();
+                let _ = WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    rect.right,
+                    rect.bottom,
+                    Some(mem_dc),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+                let _ = SelectObject(mem_dc, old);
+                let _ = DeleteDC(mem_dc);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => WindowsAndMessaging::CallWindowProcW(
+            OLD_DRAG_GHOST_PROC,
+            hwnd,
+            msg,
+            w_param,
+            l_param,
+        ),
     }
 }
 
@@ -4704,7 +5168,7 @@ unsafe extern "system" fn command_popup_proc(
                         if point_in_rect(x, y, row) {
                             app.close_command();
                             if let Some(tab_index) = tab_index {
-                                app.switch_to(tab_index);
+                                app.switch_to(tab_index, true);
                             } else {
                                 match app.command_mode {
                                     CommandMode::NewTab => {
@@ -5318,7 +5782,7 @@ unsafe fn draw_icon_glyph(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, co
 
 unsafe fn draw_tab_favicon(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab) {
     if let Some(favicon) = tab.favicon_bitmap.as_ref() {
-        draw_bitmap_fit(hdc, rect, favicon);
+        draw_bitmap_fit(hdc, rect, favicon, false);
         return;
     }
     let host = display_host(&tab.url);
@@ -5335,7 +5799,7 @@ unsafe fn draw_tab_favicon(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab) {
     draw_centered_text(hdc, font, &letter, rect, COLOR_ACCENT);
 }
 
-unsafe fn draw_bitmap_fit(hdc: HDC, rect: RECT, bitmap: &FaviconBitmap) {
+unsafe fn draw_bitmap_fit(hdc: HDC, rect: RECT, bitmap: &FaviconBitmap, dimmed: bool) {
     let target_w = rect.right - rect.left;
     let target_h = rect.bottom - rect.top;
     if target_w <= 0 || target_h <= 0 || bitmap.width <= 0 || bitmap.height <= 0 {
@@ -5354,7 +5818,7 @@ unsafe fn draw_bitmap_fit(hdc: HDC, rect: RECT, bitmap: &FaviconBitmap) {
     let blend = BLENDFUNCTION {
         BlendOp: AC_SRC_OVER as u8,
         BlendFlags: 0,
-        SourceConstantAlpha: 255,
+        SourceConstantAlpha: if dimmed { 90 } else { 255 },
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
     let _ = AlphaBlend(
@@ -5806,6 +6270,47 @@ fn get_window_text(hwnd: HWND) -> String {
     }
 }
 
+fn strip_google_transient_params(url: &str) -> String {
+    if !url.contains("google.com") {
+        return url.to_string();
+    }
+    if let Some(pos) = url.find('?') {
+        let base = &url[..pos];
+        let query = &url[pos + 1..];
+        let mut clean_params = Vec::new();
+        for param in query.split('&') {
+            if param.starts_with("zx=") || param.starts_with("no_sw_cr=") {
+                continue;
+            }
+            clean_params.push(param);
+        }
+        if clean_params.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}?{}", base, clean_params.join("&"))
+        }
+    } else {
+        url.to_string()
+    }
+}
+
+fn normalize_url_for_dedup(url: &str) -> String {
+    let clean = strip_google_transient_params(url);
+    let mut normalized = clean.trim().to_ascii_lowercase();
+    if let Some(rest) = normalized.strip_prefix("https://") {
+        normalized = rest.to_string();
+    } else if let Some(rest) = normalized.strip_prefix("http://") {
+        normalized = rest.to_string();
+    }
+    if let Some(rest) = normalized.strip_prefix("www.") {
+        normalized = rest.to_string();
+    }
+    if normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized
+}
+
 fn normalize_address(raw: &str) -> String {
     let value = raw.trim();
     if value.is_empty() {
@@ -5823,17 +6328,58 @@ fn normalize_address(raw: &str) -> String {
     }
 }
 
+fn percent_decode(input: &str) -> String {
+    let mut decoded = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let mut hex = String::new();
+            if let Some(h1) = chars.next() { hex.push(h1); }
+            if let Some(h2) = chars.next() { hex.push(h2); }
+            if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                decoded.push(val as char);
+            } else {
+                decoded.push('%');
+                decoded.push_str(&hex);
+            }
+        } else if ch == '+' {
+            decoded.push(' ');
+        } else {
+            decoded.push(ch);
+        }
+    }
+    decoded
+}
+
+fn extract_search_query(url: &str) -> Option<String> {
+    if url.contains("google.com/search?") {
+        if let Some(pos) = url.find("q=") {
+            let query_part = &url[pos + 2..];
+            let query_end = query_part.find('&').unwrap_or(query_part.len());
+            let encoded_query = &query_part[..query_end];
+            let decoded = percent_decode(encoded_query);
+            if !decoded.trim().is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
 fn label_for_url(url: &str) -> String {
-    let without_scheme = url
+    let clean = strip_google_transient_params(url);
+    if let Some(query) = extract_search_query(&clean) {
+        return format!("Search: \"{}\"", query);
+    }
+    let without_scheme = clean
         .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    without_scheme
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("New Tab")
-        .to_string()
+        .or_else(|| clean.strip_prefix("http://"))
+        .unwrap_or(&clean);
+    let trimmed = without_scheme.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "New Tab".to_string();
+    }
+    trimmed.to_string()
 }
 
 fn display_host(url: &str) -> String {
@@ -5851,7 +6397,15 @@ fn display_host(url: &str) -> String {
 }
 
 fn state_path() -> PathBuf {
-    PathBuf::from(STATE_FILE)
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let mut path = PathBuf::from(appdata);
+        path.push("Aster");
+        let _ = std::fs::create_dir_all(&path);
+        path.push(STATE_FILE);
+        path
+    } else {
+        PathBuf::from(STATE_FILE)
+    }
 }
 
 fn serialize_history(entries: &[HistoryEntry]) -> String {
@@ -5996,4 +6550,80 @@ unsafe fn SetWindowLong(window: HWND, index: WINDOW_LONG_PTR_INDEX, value: isize
 #[cfg(target_pointer_width = "64")]
 unsafe fn SetWindowLong(window: HWND, index: WINDOW_LONG_PTR_INDEX, value: isize) -> isize {
     WindowsAndMessaging::SetWindowLongPtrW(window, index, value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_frecency() {
+        let now = 10000000;
+        
+        // Recent visit (< 4 hours ago, e.g. 1 hour ago)
+        let score_recent = calculate_frecency(5, now - 3600, now);
+        assert_eq!(score_recent, 5 * 100);
+        
+        // Medium recent visit (12 hours ago)
+        let score_medium = calculate_frecency(10, now - 12 * 3600, now);
+        assert_eq!(score_medium, 10 * 80);
+        
+        // Weekly visit (3 days ago)
+        let score_weekly = calculate_frecency(20, now - 3 * 24 * 3600, now);
+        assert_eq!(score_weekly, 20 * 60);
+
+        // Monthly visit (15 days ago)
+        let score_monthly = calculate_frecency(15, now - 15 * 24 * 3600, now);
+        assert_eq!(score_monthly, 15 * 30);
+
+        // Old visit (40 days ago)
+        let score_old = calculate_frecency(8, now - 40 * 24 * 3600, now);
+        assert_eq!(score_old, 8 * 10);
+    }
+
+    #[test]
+    fn test_percent_decode() {
+        assert_eq!(percent_decode("hello+world"), "hello world");
+        assert_eq!(percent_decode("rust%20win32%2Bgui"), "rust win32+gui");
+    }
+
+    #[test]
+    fn test_extract_search_query() {
+        assert_eq!(
+            extract_search_query("https://www.google.com/search?q=rust+win32+gui&ie=UTF-8"),
+            Some("rust win32 gui".to_string())
+        );
+        assert_eq!(
+            extract_search_query("https://google.com/search?q=cat%20videos"),
+            Some("cat videos".to_string())
+        );
+        assert_eq!(
+            extract_search_query("https://github.com/microsoft/win32"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_url_for_dedup() {
+        assert_eq!(normalize_url_for_dedup("https://google.com/"), "google.com");
+        assert_eq!(normalize_url_for_dedup("http://Google.com"), "google.com");
+        assert_eq!(normalize_url_for_dedup("https://www.google.com/"), "google.com");
+        assert_eq!(normalize_url_for_dedup("  https://www.google.com/search?q=foo/ "), "google.com/search?q=foo");
+    }
+
+    #[test]
+    fn test_strip_google_transient_params() {
+        assert_eq!(
+            strip_google_transient_params("https://www.google.com/?zx=1779122310040"),
+            "https://www.google.com/"
+        );
+        assert_eq!(
+            strip_google_transient_params("https://www.google.com/search?q=cat&zx=123&no_sw_cr=1"),
+            "https://www.google.com/search?q=cat"
+        );
+        assert_eq!(
+            strip_google_transient_params("https://github.com/"),
+            "https://github.com/"
+        );
+    }
 }
