@@ -3446,7 +3446,7 @@ impl App {
         self.hover_target = None;
         self.drop_target = Some(DropTarget::None);
 
-if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
+if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && self.sidebar_target <= HOVER_ZONE as f32 {
             self.sidebar_expand_mode = SidebarMode::Overlay;
             self.set_sidebar_mode(SidebarMode::Overlay);
         }
@@ -3957,7 +3957,7 @@ if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating
             if GetCursorPos(&mut pt).is_ok() {
                 if ScreenToClient(self.hwnd, &mut pt).as_bool() {
                     let sidebar_w = self.sidebar_width() as i32;
-                    if pt.x > sidebar_w + 20 || pt.x < 0 || pt.y < 0 {
+                    if pt.x > sidebar_w + HOVER_ZONE || pt.x < 0 || pt.y < 0 {
                         let _ =
                             WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
                         self.sidebar_expand_mode = SidebarMode::Hidden;
@@ -3983,6 +3983,7 @@ if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating
                         let _ =
                             WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
                         self.sidebar_expand_mode = SidebarMode::Overlay;
+                        self.hovering_sidebar = true;
                         self.set_sidebar_mode(SidebarMode::Overlay);
                     }
                 }
