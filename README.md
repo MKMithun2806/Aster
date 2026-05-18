@@ -15,35 +15,17 @@
 
 ## 🚀 Installation
 
-Aster provides a native Windows `.msi` installer generated via the WiX Toolset.
-
-1. Go to the [Releases](https://github.com/yourusername/aster/releases) page.
-2. Download the latest `Aster.msi` installer.
-3. Run the installer and launch Aster!
-
-## 🛠️ Building from Source
+Aster provides a simple installation script that compiles the browser natively and installs it directly into your Windows roaming profile (`%APPDATA%\Aster`), alongside your Start Menu and Desktop shortcuts.
 
 Ensure you have [Rust](https://rustup.rs/) installed on a Windows machine.
 
-```bash
+```powershell
 # Clone the repository
 git clone https://github.com/yourusername/aster.git
 cd aster
 
-# Build the release executable
-cargo build --release
-
-# The compiled binary will be located at target/release/Aster.exe
-```
-
-### Building the Installer (.msi)
-
-We use `cargo-wix` to build the native Windows installer.
-
-```bash
-cargo install cargo-wix
-cargo wix
-# The installer will be located at target/wix/Aster.msi
+# Run the installation script
+.\install.ps1
 ```
 
 ## 🤝 Contributing
