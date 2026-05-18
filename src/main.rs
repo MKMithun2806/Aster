@@ -288,6 +288,9 @@ enum HoverTarget {
     ModeAuto,
     ModeDark,
     ModeLight,
+    MinButton,
+    MaxButton,
+    CloseButton,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -365,6 +368,7 @@ struct UiBrushes {
     panel: HBRUSH,
     panel_2: HBRUSH,
     edit: HBRUSH,
+    hover: HBRUSH,
 }
 
 impl Drop for UiBrushes {
@@ -374,6 +378,7 @@ impl Drop for UiBrushes {
             let _ = DeleteObject(HGDIOBJ(self.panel.0));
             let _ = DeleteObject(HGDIOBJ(self.panel_2.0));
             let _ = DeleteObject(HGDIOBJ(self.edit.0));
+            let _ = DeleteObject(HGDIOBJ(self.hover.0));
         }
     }
 }
@@ -461,6 +466,7 @@ impl App {
             panel: solid_brush(COLOR_PANEL),
             panel_2: solid_brush(COLOR_PANEL_2),
             edit: solid_brush(0x080808),
+            hover: solid_brush(COLOR_SURFACE_HOVER),
         };
 
         let address_hwnd = create_address_bar(hwnd)?;
@@ -1891,6 +1897,30 @@ impl App {
         }
     }
 
+    fn window_button_rects(&self) -> (RECT, RECT, RECT) {
+        let rect = client_rect(self.hwnd);
+        (
+            RECT {
+                left: rect.right - 138,
+                top: 0,
+                right: rect.right - 92,
+                bottom: TOPBAR_HEIGHT,
+            },
+            RECT {
+                left: rect.right - 92,
+                top: 0,
+                right: rect.right - 46,
+                bottom: TOPBAR_HEIGHT,
+            },
+            RECT {
+                left: rect.right - 46,
+                top: 0,
+                right: rect.right,
+                bottom: TOPBAR_HEIGHT,
+            },
+        )
+    }
+
     fn command_popup_rect(&self) -> RECT {
         let rect = client_rect(self.hwnd);
         let width = (rect.right - rect.left - 420).clamp(520, 800);
@@ -2237,6 +2267,48 @@ impl App {
                 self.hover_target == Some(HoverTarget::Settings),
                 &self.fonts.icon,
             );
+
+            let (min_btn, max_btn, close_btn) = self.window_button_rects();
+
+            // Draw Minimize Button
+            let min_hover = self.hover_target == Some(HoverTarget::MinButton);
+            if min_hover {
+                let _ = FillRect(hdc, &min_btn, self.brushes.hover);
+            }
+            {
+                let cx = (min_btn.left + min_btn.right) / 2;
+                let cy = (min_btn.top + min_btn.bottom) / 2;
+                fill_rect(hdc, RECT { left: cx - 6, top: cy, right: cx + 6, bottom: cy + 1 }, COLOR_TEXT);
+            }
+
+            // Draw Maximize Button
+            let max_hover = self.hover_target == Some(HoverTarget::MaxButton);
+            if max_hover {
+                let _ = FillRect(hdc, &max_btn, self.brushes.hover);
+            }
+            {
+                let cx = (max_btn.left + max_btn.right) / 2;
+                let cy = (max_btn.top + max_btn.bottom) / 2;
+                fill_rect(hdc, RECT { left: cx - 5, top: cy - 5, right: cx + 5, bottom: cy - 4 }, COLOR_TEXT);
+                fill_rect(hdc, RECT { left: cx - 5, top: cy + 4, right: cx + 5, bottom: cy + 5 }, COLOR_TEXT);
+                fill_rect(hdc, RECT { left: cx - 5, top: cy - 4, right: cx - 4, bottom: cy + 4 }, COLOR_TEXT);
+                fill_rect(hdc, RECT { left: cx + 4, top: cy - 4, right: cx + 5, bottom: cy + 4 }, COLOR_TEXT);
+            }
+
+            // Draw Close Button
+            let close_hover = self.hover_target == Some(HoverTarget::CloseButton);
+            if close_hover {
+                fill_rect(hdc, close_btn, 0xE81123);
+            }
+            {
+                let cx = (close_btn.left + close_btn.right) / 2;
+                let cy = (close_btn.top + close_btn.bottom) / 2;
+                let color = if close_hover { 0xffffff } else { COLOR_TEXT };
+                for i in -4..=4 {
+                    fill_rect(hdc, RECT { left: cx + i, top: cy + i, right: cx + i + 1, bottom: cy + i + 1 }, color);
+                    fill_rect(hdc, RECT { left: cx + i, top: cy - i, right: cx + i + 1, bottom: cy - i + 1 }, color);
+                }
+            }
 
             if sidebar_width > 92 {
                 self.paint_workspace_header(hdc);
@@ -3013,6 +3085,30 @@ impl App {
             }
         }
 
+        let (min_btn, max_btn, close_btn) = self.window_button_rects();
+        if point_in_rect(x, y, min_btn) {
+            unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(self.hwnd, WindowsAndMessaging::SW_MINIMIZE);
+            }
+            return;
+        }
+        if point_in_rect(x, y, max_btn) {
+            unsafe {
+                if WindowsAndMessaging::IsZoomed(self.hwnd).as_bool() {
+                    let _ = WindowsAndMessaging::ShowWindow(self.hwnd, WindowsAndMessaging::SW_RESTORE);
+                } else {
+                    let _ = WindowsAndMessaging::ShowWindow(self.hwnd, WindowsAndMessaging::SW_MAXIMIZE);
+                }
+            }
+            return;
+        }
+        if point_in_rect(x, y, close_btn) {
+            unsafe {
+                let _ = WindowsAndMessaging::PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            return;
+        }
+
         if point_in_rect(x, y, self.logo_rect()) {
             self.toggle_sidebar();
             return;
@@ -3493,10 +3589,17 @@ impl App {
         };
         self.hovering_sidebar = in_sidebar_hover_zone;
 
+        let (min_btn, max_btn, close_btn) = self.window_button_rects();
         if point_in_rect(x, y, self.logo_rect()) {
             self.hover_target = Some(HoverTarget::Logo);
         } else if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
             self.hover_target = Some(HoverTarget::NewTab);
+        } else if point_in_rect(x, y, min_btn) {
+            self.hover_target = Some(HoverTarget::MinButton);
+        } else if point_in_rect(x, y, max_btn) {
+            self.hover_target = Some(HoverTarget::MaxButton);
+        } else if point_in_rect(x, y, close_btn) {
+            self.hover_target = Some(HoverTarget::CloseButton);
         } else {
             let (back, forward, reload) = self.top_button_rects();
             if point_in_rect(x, y, back) {
@@ -4402,6 +4505,77 @@ unsafe extern "system" fn command_popup_proc(
 
 extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     match msg {
+        WindowsAndMessaging::WM_NCCALCSIZE => {
+            if w_param.0 != 0 {
+                LRESULT(0)
+            } else {
+                unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
+            }
+        }
+        WindowsAndMessaging::WM_NCHITTEST => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            let mut pt = POINT { x, y };
+            unsafe {
+                let _ = ScreenToClient(hwnd, &mut pt);
+            }
+            let rect = client_rect(hwnd);
+            let is_maximized = unsafe { WindowsAndMessaging::IsZoomed(hwnd).as_bool() };
+            let border_width = if is_maximized { 0 } else { 8 };
+
+            if pt.y < border_width {
+                if pt.x < border_width {
+                    return LRESULT(WindowsAndMessaging::HTTOPLEFT as isize);
+                }
+                if pt.x > rect.right - border_width {
+                    return LRESULT(WindowsAndMessaging::HTTOPRIGHT as isize);
+                }
+                return LRESULT(WindowsAndMessaging::HTTOP as isize);
+            }
+            if pt.y > rect.bottom - border_width {
+                if pt.x < border_width {
+                    return LRESULT(WindowsAndMessaging::HTBOTTOMLEFT as isize);
+                }
+                if pt.x > rect.right - border_width {
+                    return LRESULT(WindowsAndMessaging::HTBOTTOMRIGHT as isize);
+                }
+                return LRESULT(WindowsAndMessaging::HTBOTTOM as isize);
+            }
+            if pt.x < border_width {
+                return LRESULT(WindowsAndMessaging::HTLEFT as isize);
+            }
+            if pt.x > rect.right - border_width {
+                return LRESULT(WindowsAndMessaging::HTRIGHT as isize);
+            }
+
+            if pt.y < TOPBAR_HEIGHT {
+                let mut is_interactive = false;
+                with_app(hwnd, |app| {
+                    let (back, forward, reload) = app.top_button_rects();
+                    let logo = app.logo_rect();
+                    let new_tab = app.new_tab_rect();
+                    let address = app.address_pill_rect();
+                    let (min_btn, max_btn, close_btn) = app.window_button_rects();
+
+                    if point_in_rect(pt.x, pt.y, logo)
+                        || point_in_rect(pt.x, pt.y, new_tab)
+                        || point_in_rect(pt.x, pt.y, back)
+                        || point_in_rect(pt.x, pt.y, forward)
+                        || point_in_rect(pt.x, pt.y, reload)
+                        || point_in_rect(pt.x, pt.y, address)
+                        || point_in_rect(pt.x, pt.y, min_btn)
+                        || point_in_rect(pt.x, pt.y, max_btn)
+                        || point_in_rect(pt.x, pt.y, close_btn)
+                    {
+                        is_interactive = true;
+                    }
+                });
+                if !is_interactive {
+                    return LRESULT(WindowsAndMessaging::HTCAPTION as isize);
+                }
+            }
+            unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
+        }
         WM_NCCREATE => {
             let _ = l_param.0 as *const CREATESTRUCTW;
             LRESULT(1)
