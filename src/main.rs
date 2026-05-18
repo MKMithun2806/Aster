@@ -14,8 +14,8 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Dwm::{
-            DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR,
+            DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
         },
         Graphics::Gdi::{
             self, AlphaBlend, BeginPaint, BitBlt, CreateBitmap, CreateCompatibleBitmap,
@@ -34,7 +34,7 @@ use windows::{
         },
         System::{Com::*, LibraryLoader},
         UI::{
-            Controls::{EM_SETMARGINS, EM_SETSEL},
+            Controls::{EM_SETMARGINS, EM_SETSEL, MARGINS},
             HiDpi,
             Input::KeyboardAndMouse::{
                 GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_F11,
@@ -49,7 +49,7 @@ use windows::{
                 WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
                 WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN,
                 WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW,
-                WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_DLGMODALFRAME, WS_OVERLAPPEDWINDOW,
+                WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
                 WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
@@ -4302,7 +4302,7 @@ fn create_main_window() -> AppResult<HWND> {
     unsafe {
         let hinstance = HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0);
         let hwnd = WindowsAndMessaging::CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            WINDOW_EX_STYLE(0),
             CLASS_NAME,
             APP_NAME,
             WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS,
@@ -4315,6 +4315,30 @@ fn create_main_window() -> AppResult<HWND> {
             Some(hinstance),
             None,
         )?;
+
+        // Extend frame into client area to keep native shadows
+        let margins = MARGINS {
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: 1,
+            cyBottomHeight: 0,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+        // Force OS to update the non-client area frame changes
+        let _ = WindowsAndMessaging::SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            WindowsAndMessaging::SWP_FRAMECHANGED
+                | WindowsAndMessaging::SWP_NOMOVE
+                | WindowsAndMessaging::SWP_NOSIZE
+                | WindowsAndMessaging::SWP_NOZORDER
+                | WindowsAndMessaging::SWP_NOACTIVATE,
+        );
         if let Some(icon) = create_blank_icon(16) {
             let _ = WindowsAndMessaging::SendMessageW(
                 hwnd,
@@ -4507,9 +4531,19 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
     match msg {
         WindowsAndMessaging::WM_NCCALCSIZE => {
             if w_param.0 != 0 {
+                let is_maximized = unsafe { WindowsAndMessaging::IsZoomed(hwnd).as_bool() };
+                if is_maximized {
+                    unsafe {
+                        let params = &mut *(l_param.0 as *mut WindowsAndMessaging::NCCALCSIZE_PARAMS);
+                        params.rgrc[0].top += 8;
+                        params.rgrc[0].left += 8;
+                        params.rgrc[0].right -= 8;
+                        params.rgrc[0].bottom -= 8;
+                    }
+                }
                 LRESULT(0)
             } else {
-                unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
+                LRESULT(0)
             }
         }
         WindowsAndMessaging::WM_NCHITTEST => {
