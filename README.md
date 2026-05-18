@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/aster.ico" width="128" height="128" alt="Aster Logo">
   <h1>Aster Browser</h1>
-  <p><strong>Our Mission:</strong> To create a browser that everyone can use with ease, where <strong>your data is 100% yours</strong>. Aster is built entirely around local storage—no tracking, no telemetry, no data collection. Everything is stored directly on your machine. Period.</p>
+  <p><strong>Our Mission:</strong> To build the best browser possible by taking all the good features and aspects of other browsers and adding our own unique innovations all while ensuring <strong>your data is 100% yours</strong>. Aster browser data is stored locally, no tracking, no telemetry, no data collection. Everything is stored directly on your machine. Period.</p>
 </div>
 
 ---
