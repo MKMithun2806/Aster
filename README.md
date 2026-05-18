@@ -21,7 +21,7 @@ Ensure you have [Rust](https://rustup.rs/) installed on a Windows machine.
 
 ```powershell
 # Clone the repository
-git clone https://github.com/yourusername/aster.git
+git clone https://github.com/ahyanistheEmty/Aster/
 cd aster
 
 # Run the installation script
@@ -30,7 +30,7 @@ cd aster
 
 ## 🤝 Contributing
 
-Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/yourusername/aster/issues).
+Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/ahyanistheEmty/Aster/issues/).
 
 ## 📝 License
 
