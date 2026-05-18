@@ -313,8 +313,6 @@ enum CommandMode {
     NewTab,
     NewWorkspace,
     RenameWorkspace(usize),
-    NewFolder,
-    RenameFolder(usize),
 }
 
 impl SiteMode {
@@ -1530,19 +1528,11 @@ impl App {
                 .find(|workspace| workspace.id == id)
                 .map(|workspace| workspace.name.as_str())
                 .unwrap_or("Space"),
-            CommandMode::NewFolder => "New Folder",
-            CommandMode::RenameFolder(id) => self
-                .folders
-                .iter()
-                .find(|folder| folder.id == id)
-                .map(|folder| folder.name.as_str())
-                .unwrap_or("Folder"),
         };
         set_window_text(self.address_hwnd, initial_text);
         let cue = match mode {
             CommandMode::Navigate | CommandMode::NewTab => "Search or Enter URL...",
             CommandMode::NewWorkspace | CommandMode::RenameWorkspace(_) => "Workspace name...",
-            CommandMode::NewFolder | CommandMode::RenameFolder(_) => "Folder name...",
         };
         set_edit_cue_banner(self.address_hwnd, cue);
         self.layout();
@@ -1657,34 +1647,7 @@ impl App {
                     self.refresh();
                 }
             }
-            CommandMode::NewFolder => {
-                let name = raw.trim();
-                let id = self.next_folder_id;
-                self.next_folder_id += 1;
-                self.folders.push(Folder {
-                    id,
-                    workspace_id: self.active_workspace,
-                    name: if name.is_empty() {
-                        "New Folder".to_string()
-                    } else {
-                        name.to_string()
-                    },
-                    collapsed: false,
-                    pinned: false,
-                });
-                self.save_state();
-                self.refresh();
-            }
-            CommandMode::RenameFolder(id) => {
-                let name = raw.trim();
-                if !name.is_empty() {
-                    if let Some(folder) = self.folders.iter_mut().find(|folder| folder.id == id) {
-                        folder.name = name.to_string();
-                    }
-                    self.save_state();
-                    self.refresh();
-                }
-            }
+
         }
     }
 
@@ -1700,8 +1663,22 @@ impl App {
         });
         self.renaming_folder_id = Some(id);
         self.rename_buffer = "New Folder".to_string();
+        unsafe {
+            let _ = SetFocus(Some(self.hwnd));
+        }
         self.save_state();
         self.refresh();
+    }
+
+    fn rename_folder_inline(&mut self, folder_id: usize) {
+        if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
+            self.renaming_folder_id = Some(folder_id);
+            self.rename_buffer = folder.name.clone();
+            unsafe {
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            self.refresh();
+        }
     }
 
     fn confirm_rename(&mut self) {
@@ -3033,6 +3010,10 @@ impl App {
     }
 
     fn handle_click(&mut self, x: i32, y: i32) {
+        if self.renaming_folder_id.is_some() {
+            self.confirm_rename();
+        }
+
         if self.overlay_menu.is_some() && self.handle_overlay_click(x, y) {
             return;
         }
@@ -3434,7 +3415,7 @@ impl App {
             MENU_NEW_SPACE => self.open_command(CommandMode::NewWorkspace),
             MENU_NEW_FOLDER => self.create_folder_inline(),
             MENU_WORKSPACE_NEW => self.open_command(CommandMode::NewWorkspace),
-            MENU_WORKSPACE_NEW_FOLDER => self.open_command(CommandMode::NewFolder),
+            MENU_WORKSPACE_NEW_FOLDER => self.create_folder_inline(),
             MENU_WORKSPACE_RENAME => {
                 let workspace_id = match hit {
                     SidebarHit::WorkspaceButton(id) => id,
@@ -3447,7 +3428,7 @@ impl App {
                     if self.renaming_folder_id.is_some() {
                         return;
                     }
-                    self.open_command(CommandMode::RenameFolder(folder_id));
+                    self.rename_folder_inline(folder_id);
                 }
             }
             MENU_FOLDER_DELETE => {
@@ -4636,6 +4617,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             LRESULT(1)
         }
         WM_CREATE => LRESULT(0),
+        WindowsAndMessaging::WM_KILLFOCUS => {
+            with_app(hwnd, |app| {
+                if app.renaming_folder_id.is_some() {
+                    app.confirm_rename();
+                }
+            });
+            LRESULT(0)
+        }
         WM_SIZE => {
             with_app(hwnd, |app| {
                 app.layout();
