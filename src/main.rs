@@ -3461,10 +3461,6 @@ impl App {
             }
         }
 
-        if self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
-            self.ensure_hover_detect_timer();
-        }
-
         let old_close = self.hover_close;
         let old_tab = self.hover_tab;
         let old_folder = self.hover_folder;
@@ -3477,7 +3473,7 @@ impl App {
         self.hover_target = None;
         self.drop_target = Some(DropTarget::None);
 
-if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && self.sidebar_target <= HOVER_ZONE as f32 {
+        if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
             self.sidebar_expand_mode = SidebarMode::Overlay;
             self.set_sidebar_mode(SidebarMode::Overlay);
         }
