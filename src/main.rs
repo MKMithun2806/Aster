@@ -613,18 +613,6 @@ impl App {
         })
     }
 
-    fn active_tab_visual_index(&self) -> Option<usize> {
-        let active_idx = self.active_tab_index()?;
-        for (pos, row) in self.sidebar_row_rects().into_iter().enumerate() {
-            if let SidebarRow::Tab(idx) = row.0 {
-                if idx == active_idx {
-                    return Some(pos);
-                }
-            }
-        }
-        None
-    }
-
     fn set_workspace_active_tab(&mut self, workspace_id: usize, tab_id: usize) {
         if let Some((_, active_tab)) = self
             .workspace_active_tabs
@@ -2850,7 +2838,7 @@ impl App {
             if tab.folder_id.is_some() && !tab.pinned {
                 item.left += 14;
             }
-            if self.hover_tab == Some(index) || Some(index) == self.active_tab_visual_index() {
+            if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
                 fill_round_rect(hdc, item, 0x151515, 10);
             }
             let mut text_left = item.left + 40;
@@ -2895,7 +2883,7 @@ impl App {
                     },
                     bottom: item.bottom,
                 },
-                if Some(index) == self.active_tab_visual_index() {
+                if Some(index) == self.active_tab_index() {
                     COLOR_TEXT
                 } else {
                     COLOR_MUTED
@@ -3507,27 +3495,11 @@ if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating
         }
 
         if let Some(SidebarHit::Tab(tab_array_index)) = self.hit_sidebar(x, y) {
-            let mut visual_pos = 0;
-            let mut found = false;
-            for row in self.sidebar_rows() {
-                match row {
-                    SidebarRow::Tab(idx) if idx == tab_array_index => {
-                        found = true;
-                        break;
-                    }
-                    SidebarRow::Tab(_) => {
-                        visual_pos += 1;
-                    }
-                    _ => {}
-                }
-            }
-            if found {
-                self.hover_tab = Some(visual_pos);
-                for (_, rect) in self.sidebar_row_rects() {
-                    if point_in_rect(x, y, rect) && x >= rect.right - 34 {
-                        self.hover_close = Some(visual_pos);
-                        break;
-                    }
+            self.hover_tab = Some(tab_array_index);
+            for (_, rect) in self.sidebar_row_rects() {
+                if point_in_rect(x, y, rect) && x >= rect.right - 34 {
+                    self.hover_close = Some(tab_array_index);
+                    break;
                 }
             }
         } else {
