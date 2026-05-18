@@ -1,36 +1,58 @@
 <div align="center">
   <img src="assets/aster.ico" width="128" height="128" alt="Aster Logo">
   <h1>Aster Browser</h1>
-  <p>A fast, Chromium-based desktop browser built in Rust with native vertical tabs, infinite nesting, and gorgeous aesthetics.</p>
+  <p><strong>Our Mission:</strong> To create a browser that everyone can use with ease, where <strong>your data is 100% yours</strong>. Aster is built entirely around local storage—no tracking, no telemetry, no data collection. Everything is stored directly on your machine. Period.</p>
 </div>
 
-## ✨ Features
+---
 
-- **Blazing Fast**: Built natively in Rust using WebView2. Extremely lightweight with minimal memory overhead.
-- **Vertical Tabs**: Side-docked tabs optimized for modern widescreen monitors.
-- **Infinite Nested Folders**: Organize your workflow with recursive folder trees.
-- **Zen Mode Session Restore**: Tabs wake up gracefully in a sleeping/unloaded state to preserve memory.
-- **Stunning Aesthetics**: Premium indigo accent colors, glassmorphism gradients, and beautifully indented typography.
-- **Fully Portable**: Runs as a standalone executable. State data integrates cleanly with your standard Windows `%APPDATA%` profile.
+## 🛠️ For Developers
 
-## 🚀 Installation
+Aster is a fast, Chromium-based desktop browser natively compiled in Rust via `webview2-com`. It acts as a lightweight standalone application that manages its own tabs, process states, and layout rendering directly through Win32 APIs, ensuring minimal overhead.
 
-Aster provides a simple installation script that compiles the browser natively and installs it directly into your Windows roaming profile (`%APPDATA%\Aster`), alongside your Start Menu and Desktop shortcuts.
+### Project Structure
 
-Ensure you have [Rust](https://rustup.rs/) installed on a Windows machine.
+```text
+Aster/
+├── assets/
+│   └── aster.ico        # Standalone executable icon
+├── src/
+│   ├── main.rs          # Core application logic, Win32 bindings, WebView2 lifecycle
+├── aster.rc             # Resource script for embedding the Windows icon
+├── build.rs             # Build script for rasterizing icons into the PE header
+├── Cargo.toml           # Rust dependencies and binary targets
+└── install.ps1          # Automated interactive installation script
+```
+
+### Building from Source
+
+To compile the standalone Windows executable yourself:
 
 ```powershell
 # Clone the repository
-git clone https://github.com/ahyanistheEmty/Aster/
-cd aster
+git clone https://github.com/ahyanistheEmty/Aster.git
+cd Aster
 
-# Run the installation script
-.\install.ps1
+# Build the release executable
+cargo build --release
+
+# The compiled binary will be located at target/release/Aster.exe
 ```
+
+---
+
+## ✨ Features
+
+- **Workspaces**: Organize your browser into dedicated, isolated contexts for work, personal, and research.
+- **Folders**: Group tabs locally into folders to maintain a clean visual sidebar.
+- **Vertical Tabs**: Side-docked tabs optimized for modern widescreen monitors.
+- **Blazing Fast**: Built natively in Rust. Extremely lightweight with minimal memory overhead.
+
+---
 
 ## 🤝 Contributing
 
-Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/ahyanistheEmty/Aster/issues/).
+Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/ahyanistheEmty/Aster/issues).
 
 ## 📝 License
 
