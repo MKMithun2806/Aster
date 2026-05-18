@@ -6,6 +6,16 @@
 
 ---
 
+## 🚀 Quick Installation
+
+For users who want to install Aster automatically, open PowerShell and run this exact one-liner:
+
+```powershell
+irm https://raw.githubusercontent.com/ahyanistheEmty/Aster/main/install.ps1 | iex
+```
+
+---
+
 ## 🛠️ For Developers
 
 Aster is a fast, Chromium-based desktop browser natively compiled in Rust via `webview2-com`. It acts as a lightweight standalone application that manages its own tabs, process states, and layout rendering directly through Win32 APIs, ensuring minimal overhead.
