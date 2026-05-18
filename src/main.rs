@@ -423,6 +423,7 @@ struct App {
     command_mode: CommandMode,
     renaming_folder_id: Option<usize>,
     rename_buffer: String,
+    rename_selected: bool,
     fullscreen: bool,
     saved_style: isize,
     saved_rect: RECT,
@@ -527,6 +528,7 @@ impl App {
             command_mode: CommandMode::Navigate,
             renaming_folder_id: None,
             rename_buffer: String::new(),
+            rename_selected: false,
             fullscreen: false,
             saved_style: 0,
             saved_rect: RECT::default(),
@@ -1663,6 +1665,7 @@ impl App {
         });
         self.renaming_folder_id = Some(id);
         self.rename_buffer = "New Folder".to_string();
+        self.rename_selected = true;
         unsafe {
             let _ = SetFocus(Some(self.hwnd));
         }
@@ -1674,6 +1677,7 @@ impl App {
         if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
             self.renaming_folder_id = Some(folder_id);
             self.rename_buffer = folder.name.clone();
+            self.rename_selected = true;
             unsafe {
                 let _ = SetFocus(Some(self.hwnd));
             }
@@ -1690,6 +1694,7 @@ impl App {
                 }
             }
             self.rename_buffer.clear();
+            self.rename_selected = false;
             self.save_state();
             self.refresh();
         }
@@ -1703,6 +1708,7 @@ impl App {
                 }
             }
             self.rename_buffer.clear();
+            self.rename_selected = false;
             self.save_state();
             self.refresh();
         }
@@ -2701,7 +2707,11 @@ impl App {
         };
         let is_renaming = self.renaming_folder_id == Some(folder_id);
         let display_name = if is_renaming {
-            format!("{}|", self.rename_buffer)
+            if self.rename_selected {
+                self.rename_buffer.clone()
+            } else {
+                format!("{}|", self.rename_buffer)
+            }
         } else {
             folder.name.clone()
         };
@@ -2748,6 +2758,16 @@ impl App {
                     },
                     COLOR_ACCENT,
                 );
+                if is_renaming && self.rename_selected {
+                    let text_width = measure_text_width(hdc, &self.fonts.body, &self.rename_buffer);
+                    let highlight_rect = RECT {
+                        left: item.left + 56 - 4,
+                        top: item.top + 4,
+                        right: item.left + 56 + text_width + 4,
+                        bottom: item.bottom - 4,
+                    };
+                    fill_round_rect(hdc, highlight_rect, COLOR_ACCENT, 4);
+                }
                 draw_text(
                     hdc,
                     &self.fonts.body,
@@ -2773,6 +2793,16 @@ impl App {
                     },
                     COLOR_MUTED,
                 );
+                if is_renaming && self.rename_selected {
+                    let text_width = measure_text_width(hdc, &self.fonts.body, &self.rename_buffer);
+                    let highlight_rect = RECT {
+                        left: item.left + 56 - 4,
+                        top: item.top + 4,
+                        right: item.left + 56 + text_width + 4,
+                        bottom: item.bottom - 4,
+                    };
+                    fill_round_rect(hdc, highlight_rect, COLOR_ACCENT, 4);
+                }
                 draw_text(
                     hdc,
                     &self.fonts.body,
@@ -3139,6 +3169,10 @@ impl App {
                 SidebarHit::PinnedSection => {}
                 SidebarHit::Folder(folder_id) => {
                     if self.renaming_folder_id == Some(folder_id) {
+                        if self.rename_selected {
+                            self.rename_selected = false;
+                            self.refresh();
+                        }
                         return;
                     }
                     if let Some(folder) = self
@@ -4749,11 +4783,20 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         app.cancel_rename();
                         handled = true;
                     } else if ch == 8 {
-                        app.rename_buffer.pop();
+                        if app.rename_selected {
+                            app.rename_selected = false;
+                            app.rename_buffer.clear();
+                        } else {
+                            app.rename_buffer.pop();
+                        }
                         app.refresh();
                         handled = true;
                     } else if let Some(c) = char::from_u32(ch) {
                         if !c.is_control() {
+                            if app.rename_selected {
+                                app.rename_selected = false;
+                                app.rename_buffer.clear();
+                            }
                             app.rename_buffer.push(c);
                             app.refresh();
                             handled = true;
@@ -4781,6 +4824,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     } else if key == 27 {
                         app.cancel_rename();
                         handled = true;
+                    } else if key == 0x25 || key == 0x26 || key == 0x27 || key == 0x28 || key == 0x24 || key == 0x23 {
+                        if app.rename_selected {
+                            app.rename_selected = false;
+                            app.refresh();
+                        }
                     }
                 }
             });
@@ -5690,6 +5738,18 @@ fn unescape_state(value: &str) -> String {
         }
     }
     out
+}
+
+fn measure_text_width(hdc: HDC, font: &HFONT, text: &str) -> i32 {
+    unsafe {
+        let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+        let wide = to_wide(text);
+        let text_len = wide.len().saturating_sub(1);
+        let mut size = windows::Win32::Foundation::SIZE { cx: 0, cy: 0 };
+        let _ = Gdi::GetTextExtentPoint32W(hdc, &wide[..text_len], &mut size);
+        let _ = SelectObject(hdc, old_font);
+        size.cx
+    }
 }
 
 fn solid_brush(color: u32) -> HBRUSH {
