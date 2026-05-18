@@ -98,7 +98,7 @@ const COLOR_BORDER: u32 = 0x343434;
 const COLOR_TEXT: u32 = 0xf5f5f5;
 const COLOR_MUTED: u32 = 0xa1a1a1;
 const COLOR_ACCENT: u32 = 0xf16f63;
-const COLOR_SELECTION: u32 = 0xd9286d; // Deep Dark Violet-Purple (#6d28d9)
+const COLOR_SELECTION: u32 = 0xf16f63; // Signature Accent Color (#636ff1)
 const ASTER_BACKGROUND_SVG: &str = include_str!("../assets/aster-background.svg");
 
 static mut OLD_ADDRESS_PROC: WNDPROC = None;
