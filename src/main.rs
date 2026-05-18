@@ -98,6 +98,7 @@ const COLOR_BORDER: u32 = 0x343434;
 const COLOR_TEXT: u32 = 0xf5f5f5;
 const COLOR_MUTED: u32 = 0xa1a1a1;
 const COLOR_ACCENT: u32 = 0xf16f63;
+const COLOR_SELECTION: u32 = 0xf65c8b; // Vibrant Violet-Purple (#8b5cf6)
 const ASTER_BACKGROUND_SVG: &str = include_str!("../assets/aster-background.svg");
 
 static mut OLD_ADDRESS_PROC: WNDPROC = None;
@@ -2766,7 +2767,7 @@ impl App {
                         right: item.left + 56 + text_width,
                         bottom: item.bottom - 2,
                     };
-                    fill_rect(hdc, highlight_rect, COLOR_ACCENT);
+                    fill_rect(hdc, highlight_rect, COLOR_SELECTION);
                 }
                 draw_text(
                     hdc,
@@ -2801,7 +2802,7 @@ impl App {
                         right: item.left + 56 + text_width,
                         bottom: item.bottom - 2,
                     };
-                    fill_rect(hdc, highlight_rect, COLOR_ACCENT);
+                    fill_rect(hdc, highlight_rect, COLOR_SELECTION);
                 }
                 draw_text(
                     hdc,
