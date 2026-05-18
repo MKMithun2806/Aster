@@ -2700,6 +2700,11 @@ impl App {
             return;
         };
         let is_renaming = self.renaming_folder_id == Some(folder_id);
+        let display_name = if is_renaming {
+            format!("{}|", self.rename_buffer)
+        } else {
+            folder.name.clone()
+        };
         unsafe {
             let item = RECT {
                 left: rect.left + 2,
@@ -2746,7 +2751,7 @@ impl App {
                 draw_text(
                     hdc,
                     &self.fonts.body,
-                    if is_renaming { &self.rename_buffer } else { &folder.name },
+                    &display_name,
                     RECT {
                         left: item.left + 56,
                         top: item.top,
@@ -2771,7 +2776,7 @@ impl App {
                 draw_text(
                     hdc,
                     &self.fonts.body,
-                    if is_renaming { &self.rename_buffer } else { &folder.name },
+                    &display_name,
                     RECT {
                         left: item.left + 56,
                         top: item.top,
@@ -4747,10 +4752,12 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         app.rename_buffer.pop();
                         app.refresh();
                         handled = true;
-                    } else if ch >= 32 && ch < 127 {
-                        app.rename_buffer.push(ch as u8 as char);
-                        app.refresh();
-                        handled = true;
+                    } else if let Some(c) = char::from_u32(ch) {
+                        if !c.is_control() {
+                            app.rename_buffer.push(c);
+                            app.refresh();
+                            handled = true;
+                        }
                     }
                 }
             });
@@ -4785,6 +4792,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         }
         WM_SETFOCUS => {
             with_app(hwnd, |app| {
+                if app.renaming_folder_id.is_some() {
+                    return;
+                }
                 if let Some(tab) = app.active_tab_index().and_then(|index| app.tabs.get(index)) {
                     unsafe {
                         let _ = tab
