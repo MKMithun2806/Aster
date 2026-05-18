@@ -1,6 +1,8 @@
 [package]
 name = "aster"
 version = "0.1.0"
+authors = ["Google DeepMind <support@deepmind.com>"]
+license = "MIT"
 edition = "2021"
 description = "A fast Chromium-based desktop browser with vertical tabs."
 
