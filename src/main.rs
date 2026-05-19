@@ -39,7 +39,7 @@ use windows::{
             HiDpi,
             Input::KeyboardAndMouse::{
                 GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_F11,
-                VK_F5, VK_MENU, VK_RETURN,
+                VK_F5, VK_MENU, VK_RETURN, VK_SHIFT,
             },
             WindowsAndMessaging::{
                 self, CreateIconIndirect, GetCursorPos, GetTopWindow, GetWindow, CREATESTRUCTW,
@@ -72,6 +72,7 @@ const SIDEBAR_TIMER_ID: usize = 42;
 const HOVER_LEAVE_TIMER_ID: usize = 43;
 const HOVER_DETECT_TIMER_ID: usize = 44;
 const BACKGROUND_TIMER_ID: usize = 45;
+const LOADING_TIMER_ID: usize = 46;
 const STATE_FILE: &str = ".aster-state";
 const MENU_TAB_PIN: usize = 3101;
 const MENU_TAB_UNPIN: usize = 3102;
@@ -218,6 +219,14 @@ struct Tab {
     webview: ICoreWebView2,
     child_hwnd: HWND,
     unloaded: bool,
+    is_loading: bool,
+}
+
+struct ClosedTab {
+    url: String,
+    title: String,
+    workspace_id: usize,
+    folder_id: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -482,6 +491,7 @@ struct App {
     is_deleting: bool,
     last_address_text: String,
     has_typed: bool,
+    closed_tabs: Vec<ClosedTab>,
 }
 
 struct DragGhost {
@@ -579,6 +589,7 @@ impl App {
             drop_target: Some(DropTarget::None),
             background_cache: RefCell::new(None),
             visited_sites: Vec::new(),
+            closed_tabs: Vec::new(),
             command_open: false,
             command_mode: CommandMode::Navigate,
             renaming_folder_id: None,
@@ -659,6 +670,7 @@ impl App {
             webview,
             child_hwnd,
             unloaded: false,
+            is_loading: false,
         });
         if let Some(title) = title {
             if let Some(tab) = self.tabs.get_mut(index) {
@@ -1321,6 +1333,26 @@ impl App {
 
             let hwnd = self.hwnd;
             let mut token = 0;
+            webview.add_NavigationStarting(
+                &NavigationStartingEventHandler::create(Box::new(move |_sender, _args| {
+                    with_app(hwnd, |app| app.set_tab_loading(tab_id, true));
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_NavigationCompleted(
+                &NavigationCompletedEventHandler::create(Box::new(move |_sender, _args| {
+                    with_app(hwnd, |app| app.set_tab_loading(tab_id, false));
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
             webview.add_SourceChanged(
                 &SourceChangedEventHandler::create(Box::new(move |sender, _args| {
                     if let Some(sender) = sender {
@@ -1453,6 +1485,23 @@ impl App {
                 })),
                 &mut token,
             )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_ContainsFullScreenElementChanged(
+                &ContainsFullScreenElementChangedEventHandler::create(Box::new(move |sender, _args| {
+                    if let Some(sender) = sender {
+                        let mut contains = BOOL::from(false);
+                        if sender.ContainsFullScreenElement(&mut contains).is_ok() {
+                            with_app(hwnd, |app| {
+                                app.set_fullscreen_state(contains.as_bool());
+                            });
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
         }
 
         if index_hint == usize::MAX {
@@ -1473,6 +1522,21 @@ impl App {
         }
         self.save_state();
         self.refresh();
+    }
+
+    fn set_tab_loading(&mut self, tab_id: usize, is_loading: bool) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.is_loading = is_loading;
+            unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); };
+        }
+        let any_loading = self.tabs.iter().any(|t| t.is_loading);
+        unsafe {
+            if any_loading {
+                let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), LOADING_TIMER_ID, 16, None);
+            } else {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), LOADING_TIMER_ID);
+            }
+        }
     }
 
     fn update_tab_url(&mut self, tab_id: usize, url: String) {
@@ -1637,6 +1701,36 @@ impl App {
         self.ensure_hover_detect_timer();
     }
 
+    fn switch_tab_above(&mut self) {
+        let tabs = self.active_workspace_tabs();
+        if tabs.len() <= 1 {
+            return;
+        }
+        if let Some(active_idx) = self.active_tab_index() {
+            if let Some(pos) = tabs.iter().position(|&idx| idx == active_idx) {
+                let next_pos = if pos == 0 {
+                    tabs.len() - 1
+                } else {
+                    pos - 1
+                };
+                self.switch_to(tabs[next_pos], true);
+            }
+        }
+    }
+
+    fn switch_tab_below(&mut self) {
+        let tabs = self.active_workspace_tabs();
+        if tabs.len() <= 1 {
+            return;
+        }
+        if let Some(active_idx) = self.active_tab_index() {
+            if let Some(pos) = tabs.iter().position(|&idx| idx == active_idx) {
+                let next_pos = (pos + 1) % tabs.len();
+                self.switch_to(tabs[next_pos], true);
+            }
+        }
+    }
+
     fn ensure_hover_detect_timer(&mut self) {
         if self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
             unsafe {
@@ -1655,6 +1749,20 @@ impl App {
         if self.tabs.is_empty() || index >= self.tabs.len() {
             return;
         }
+
+        if !self.tabs[index].pinned {
+            let tab = &self.tabs[index];
+            self.closed_tabs.push(ClosedTab {
+                url: tab.url.clone(),
+                title: tab.title.clone(),
+                workspace_id: tab.workspace_id,
+                folder_id: tab.folder_id,
+            });
+            if self.closed_tabs.len() > 100 {
+                self.closed_tabs.remove(0);
+            }
+        }
+
         let workspace_id = self.tabs[index].workspace_id;
 
         if self.tabs[index].pinned {
@@ -1740,6 +1848,29 @@ impl App {
         }
         self.tabs[index].pinned = false;
         self.close_tab(index);
+    }
+
+    fn reopen_closed_tab(&mut self) {
+        if let Some(closed) = self.closed_tabs.pop() {
+            let mut target_workspace = closed.workspace_id;
+            if !self.workspaces.iter().any(|w| w.id == target_workspace) {
+                target_workspace = self.active_workspace;
+            }
+            let mut target_folder = closed.folder_id;
+            if let Some(f_id) = target_folder {
+                if !self.folders.iter().any(|f| f.id == f_id) {
+                    target_folder = None;
+                }
+            }
+            let _ = self.create_tab_in_workspace(
+                &closed.url,
+                target_workspace,
+                target_folder,
+                false,
+                true,
+                Some(closed.title),
+            );
+        }
     }
 
     fn navigate_active_from_address(&mut self) {
@@ -2480,7 +2611,7 @@ impl App {
         let rect = client_rect(self.hwnd);
         unsafe {
             let flags = WindowsAndMessaging::SWP_NOZORDER;
-            if self.command_open {
+            if self.command_open && !self.fullscreen {
                 let popup = self.command_popup_rect();
                 let input = self.command_input_rect();
                 let _ = WindowsAndMessaging::SetWindowPos(
@@ -2523,50 +2654,59 @@ impl App {
 
         let sidebar_width = self.sidebar_width();
         let pushed_left = sidebar_width;
-        let bounds = match self.sidebar_mode {
-            SidebarMode::Hidden => {
-                if self.sidebar_target >= SIDEBAR_EXPANDED {
-                    match self.sidebar_expand_mode {
-                        SidebarMode::Overlay => RECT {
+        let bounds = if self.fullscreen {
+            RECT {
+                left: 0,
+                top: 0,
+                right: rect.right,
+                bottom: rect.bottom,
+            }
+        } else {
+            match self.sidebar_mode {
+                SidebarMode::Hidden => {
+                    if self.sidebar_target >= SIDEBAR_EXPANDED {
+                        match self.sidebar_expand_mode {
+                            SidebarMode::Overlay => RECT {
+                                left: 0,
+                                top: TOPBAR_HEIGHT,
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                            SidebarMode::Pushed => RECT {
+                                left: pushed_left,
+                                top: TOPBAR_HEIGHT,
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                            _ => RECT {
+                                left: HOVER_ZONE,
+                                top: TOPBAR_HEIGHT,
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                        }
+                    } else {
+                        RECT {
                             left: 0,
                             top: TOPBAR_HEIGHT,
                             right: rect.right,
                             bottom: rect.bottom,
-                        },
-                        SidebarMode::Pushed => RECT {
-                            left: pushed_left,
-                            top: TOPBAR_HEIGHT,
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        },
-                        _ => RECT {
-                            left: HOVER_ZONE,
-                            top: TOPBAR_HEIGHT,
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        },
-                    }
-                } else {
-                    RECT {
-                        left: 0,
-                        top: TOPBAR_HEIGHT,
-                        right: rect.right,
-                        bottom: rect.bottom,
+                        }
                     }
                 }
+                SidebarMode::Overlay => RECT {
+                    left: 0,
+                    top: TOPBAR_HEIGHT,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                SidebarMode::Pushed => RECT {
+                    left: pushed_left,
+                    top: TOPBAR_HEIGHT,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
             }
-            SidebarMode::Overlay => RECT {
-                left: 0,
-                top: TOPBAR_HEIGHT,
-                right: rect.right,
-                bottom: rect.bottom,
-            },
-            SidebarMode::Pushed => RECT {
-                left: pushed_left,
-                top: TOPBAR_HEIGHT,
-                right: rect.right,
-                bottom: rect.bottom,
-            },
         };
         let last = self.last_bounds_rect.get();
         let size_changed = bounds.left != last.left
@@ -2574,10 +2714,11 @@ impl App {
             || bounds.top != last.top
             || bounds.bottom != last.bottom;
 
-        let needs_clipping = self.sidebar_mode == SidebarMode::Overlay
-            || (self.sidebar_mode == SidebarMode::Hidden
-                && self.sidebar_expand_mode == SidebarMode::Overlay
-                && self.sidebar_target >= SIDEBAR_EXPANDED);
+        let needs_clipping = !self.fullscreen
+            && (self.sidebar_mode == SidebarMode::Overlay
+                || (self.sidebar_mode == SidebarMode::Hidden
+                    && self.sidebar_expand_mode == SidebarMode::Overlay
+                    && self.sidebar_target >= SIDEBAR_EXPANDED));
         let clip_changed = needs_clipping
             && sidebar_width > 0
             && ((sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 || size_changed);
@@ -2626,11 +2767,19 @@ impl App {
 
     fn paint(&self, hdc: HDC) {
         let rect = client_rect(self.hwnd);
+        unsafe {
+            let _ = FillRect(hdc, &rect, self.brushes.black);
+        }
+        if self.fullscreen {
+            let is_unloaded = self.tabs.get(self.active).map(|t| t.unloaded).unwrap_or(false);
+            if self.active_tab_index().is_none() || is_unloaded {
+                self.paint_cached_background(hdc, rect);
+            }
+            return;
+        }
         let sidebar_width = self.sidebar_width();
         let is_overlay = self.sidebar_mode == SidebarMode::Overlay;
         unsafe {
-            let _ = FillRect(hdc, &rect, self.brushes.black);
-
             let topbar = RECT {
                 left: 0,
                 top: 0,
@@ -2724,17 +2873,58 @@ impl App {
             );
 
             let edit_rect = self.address_pill_rect();
-            if self.hover_target == Some(HoverTarget::Address) || self.command_open {
-                fill_rect(
-                    hdc,
-                    RECT {
-                        left: edit_rect.left + 22,
-                        top: edit_rect.bottom - 2,
-                        right: edit_rect.right - 22,
-                        bottom: edit_rect.bottom - 1,
-                    },
-                    COLOR_ACCENT,
-                );
+            let active_is_loading = self.active_tab_index().and_then(|idx| self.tabs.get(idx)).map(|t| t.is_loading).unwrap_or(false);
+            if self.hover_target == Some(HoverTarget::Address) || self.command_open || active_is_loading {
+                let full_left = edit_rect.left + 22;
+                let full_right = edit_rect.right - 22;
+                
+                if active_is_loading {
+                    let time_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let width = full_right - full_left;
+                    if width > 0 {
+                        let block_width = (width as f64 * 0.7) as i32;
+                        let cycle_duration: u128 = 1200;
+                        let t = (time_ms % cycle_duration) as f64 / cycle_duration as f64;
+                        // Smooth ease-in-out: accelerate from left, decelerate to right
+                        let eased = t * t * (3.0 - 2.0 * t);
+                        // Sweep from off-screen left to off-screen right
+                        let start = full_left - block_width;
+                        let end = full_right;
+                        let total_travel = end - start;
+                        let anim_left = start + (eased * total_travel as f64) as i32;
+                        let anim_right = anim_left + block_width;
+                        
+                        let fl = anim_left.max(full_left);
+                        let fr = anim_right.min(full_right);
+                        
+                        if fl < fr {
+                            fill_rect(
+                                hdc,
+                                RECT {
+                                    left: fl,
+                                    top: edit_rect.bottom - 2,
+                                    right: fr,
+                                    bottom: edit_rect.bottom - 1,
+                                },
+                                COLOR_ACCENT,
+                            );
+                        }
+                    }
+                } else {
+                    fill_rect(
+                        hdc,
+                        RECT {
+                            left: full_left,
+                            top: edit_rect.bottom - 2,
+                            right: full_right,
+                            bottom: edit_rect.bottom - 1,
+                        },
+                        COLOR_ACCENT,
+                    );
+                }
             }
             let address_label = self
                 .active_tab_index()
@@ -4778,9 +4968,12 @@ impl App {
         self.refresh();
     }
 
-    fn toggle_fullscreen(&mut self) {
+    fn set_fullscreen_state(&mut self, enable: bool) {
+        if self.fullscreen == enable {
+            return;
+        }
         unsafe {
-            if !self.fullscreen {
+            if enable {
                 let _ = WindowsAndMessaging::GetWindowRect(self.hwnd, &mut self.saved_rect);
                 self.saved_style = WindowsAndMessaging::GetWindowLongPtrW(self.hwnd, GWL_STYLE);
 
@@ -4822,6 +5015,11 @@ impl App {
         }
         self.layout();
         self.refresh();
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        let next = !self.fullscreen;
+        self.set_fullscreen_state(next);
     }
 
     fn refresh(&self) {
@@ -5724,6 +5922,13 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 with_app(hwnd, |app| app.check_hover_detect());
                 return LRESULT(0);
             }
+            if w_param.0 == LOADING_TIMER_ID {
+                with_app(hwnd, |app| unsafe {
+                    let _ = InvalidateRect(Some(app.hwnd), None, false);
+                });
+                return LRESULT(0);
+            }
+
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
         WM_COMMAND => {
@@ -5869,7 +6074,11 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
+        let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
         with_app(hwnd, |app| match key {
+            0x5A if ctrl && shift => {
+                app.reopen_closed_tab();
+            }
             0x4C if ctrl => {
                 app.open_command(CommandMode::Navigate);
             }
@@ -5882,8 +6091,19 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
                     app.close_tab(index);
                 }
             }
+            0x52 if ctrl => {
+                app.reload();
+            }
             0x25 if alt => app.go_back(),
             0x27 if alt => app.go_forward(),
+            0x41 if alt => app.go_back(),
+            0x44 if alt => app.go_forward(),
+            0x57 if alt => {
+                app.switch_tab_above();
+            }
+            0x53 if alt => {
+                app.switch_tab_below();
+            }
             code if code == VK_F5.0 as u32 => app.reload(),
             code if code == VK_F11.0 as u32 => app.toggle_fullscreen(),
             _ => {}
@@ -5895,8 +6115,10 @@ fn is_aster_shortcut(key: u32) -> bool {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
-        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 if ctrl)
-            || matches!(key, 0x25 | 0x27 if alt)
+        let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 | 0x52 if ctrl)
+            || (key == 0x5A && ctrl && shift)
+            || matches!(key, 0x25 | 0x27 | 0x41 | 0x44 | 0x57 | 0x53 if alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
     }
