@@ -64,15 +64,16 @@ const COMMAND_POPUP_ID: i32 = 1002;
 const DEFAULT_URL: &str = "https://www.google.com";
 const SIDEBAR_EXPANDED: f32 = 248.0;
 const SIDEBAR_HIDDEN: f32 = 0.0;
+const TOPBAR_EXPANDED: f32 = 58.0;
+const TOPBAR_HIDDEN: f32 = 0.0;
 const HOVER_ZONE: i32 = 8;
 const TOPBAR_HEIGHT: i32 = 58;
-const SIDEBAR_HEADER_TOP: i32 = TOPBAR_HEIGHT + 14;
-const SIDEBAR_ROWS_TOP: i32 = TOPBAR_HEIGHT + 68;
 const SIDEBAR_TIMER_ID: usize = 42;
 const HOVER_LEAVE_TIMER_ID: usize = 43;
 const HOVER_DETECT_TIMER_ID: usize = 44;
 const BACKGROUND_TIMER_ID: usize = 45;
 const LOADING_TIMER_ID: usize = 46;
+const TOPBAR_TIMER_ID: usize = 47;
 const STATE_FILE: &str = ".aster-state";
 const MENU_TAB_PIN: usize = 3101;
 const MENU_TAB_UNPIN: usize = 3102;
@@ -465,7 +466,14 @@ struct App {
     sidebar_expand_mode: SidebarMode,
     animating_sidebar: bool,
     hovering_sidebar: bool,
+    topbar_height: f32,
+    topbar_target: f32,
+    topbar_mode: SidebarMode,
+    topbar_expand_mode: SidebarMode,
+    animating_topbar: bool,
+    hovering_topbar: bool,
     last_clip_width: Cell<f32>,
+    last_clip_top: Cell<f32>,
     last_bounds_rect: Cell<RECT>,
     site_mode: SiteMode,
     settings_open: bool,
@@ -573,7 +581,14 @@ impl App {
             sidebar_expand_mode: SidebarMode::Hidden,
             animating_sidebar: false,
             hovering_sidebar: false,
+            topbar_height: TOPBAR_HIDDEN,
+            topbar_target: TOPBAR_HIDDEN,
+            topbar_mode: SidebarMode::Hidden,
+            topbar_expand_mode: SidebarMode::Hidden,
+            animating_topbar: false,
+            hovering_topbar: false,
             last_clip_width: Cell::new(0.0),
+            last_clip_top: Cell::new(0.0),
             last_bounds_rect: Cell::new(RECT {
                 left: -1,
                 top: -1,
@@ -937,9 +952,9 @@ impl App {
         let has_pinned = self.folders.iter().any(|f| f.workspace_id == self.active_workspace && f.pinned)
             || self.tabs.iter().any(|t| t.workspace_id == self.active_workspace && t.pinned);
         let mut y = if has_pinned {
-            SIDEBAR_ROWS_TOP
+            self.sidebar_rows_top()
         } else {
-            SIDEBAR_ROWS_TOP + 72
+            self.sidebar_rows_top() + 72
         };
         for row in self.sidebar_rows() {
             let height = match row {
@@ -964,12 +979,32 @@ impl App {
         rects
     }
 
+    fn topbar_pushed_height(&self) -> i32 {
+        if self.topbar_mode == SidebarMode::Pushed || self.topbar_expand_mode == SidebarMode::Pushed {
+            self.topbar_height as i32
+        } else {
+            0
+        }
+    }
+
+    fn topbar_y(&self) -> i32 {
+        (self.topbar_height as i32) - TOPBAR_HEIGHT
+    }
+
+    fn sidebar_header_top(&self) -> i32 {
+        self.topbar_pushed_height() + 14
+    }
+
+    fn sidebar_rows_top(&self) -> i32 {
+        self.topbar_pushed_height() + 68
+    }
+
     fn workspace_header_rect(&self) -> RECT {
         RECT {
             left: 12,
-            top: SIDEBAR_HEADER_TOP,
+            top: self.sidebar_header_top(),
             right: self.sidebar_width() - 12,
-            bottom: SIDEBAR_HEADER_TOP + 38,
+            bottom: self.sidebar_header_top() + 38,
         }
     }
 
@@ -1025,7 +1060,7 @@ impl App {
             )
         }).count();
         if pinned_count == 0 {
-            let y = SIDEBAR_ROWS_TOP;
+            let y = self.sidebar_rows_top();
             let height = 72;
             Some(RECT {
                 left: 10,
@@ -1732,7 +1767,8 @@ impl App {
     }
 
     fn ensure_hover_detect_timer(&mut self) {
-        if self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
+        if (self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar) ||
+           (self.topbar_mode == SidebarMode::Hidden && !self.animating_topbar) {
             unsafe {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
                 let _ = WindowsAndMessaging::SetTimer(
@@ -2325,44 +2361,47 @@ impl App {
 
     fn top_button_rects(&self) -> (RECT, RECT, RECT) {
         let x = self.top_button_x();
+        let y = self.topbar_y();
         (
             RECT {
                 left: x,
-                top: 16,
+                top: y + 16,
                 right: x + 28,
-                bottom: 44,
+                bottom: y + 44,
             },
             RECT {
                 left: x + 38,
-                top: 16,
+                top: y + 16,
                 right: x + 66,
-                bottom: 44,
+                bottom: y + 44,
             },
             RECT {
                 left: x + 76,
-                top: 16,
+                top: y + 16,
                 right: x + 104,
-                bottom: 44,
+                bottom: y + 44,
             },
         )
     }
 
     fn logo_rect(&self) -> RECT {
+        let y = self.topbar_y();
         RECT {
             left: 12,
-            top: 13,
+            top: y + 13,
             right: 42,
-            bottom: 43,
+            bottom: y + 43,
         }
     }
 
     fn new_tab_rect(&self) -> RECT {
         let (_, _, reload) = self.top_button_rects();
+        let y = self.topbar_y();
         RECT {
             left: reload.right + 10,
-            top: 16,
+            top: y + 16,
             right: reload.right + 38,
-            bottom: 44,
+            bottom: y + 44,
         }
     }
 
@@ -2420,34 +2459,36 @@ impl App {
         let rect = client_rect(self.hwnd);
         let width = (rect.right - rect.left - 560).clamp(176, 258);
         let center = (rect.right + rect.left) / 2;
+        let y = self.topbar_y();
         RECT {
             left: center - width / 2,
-            top: 11,
+            top: y + 11,
             right: center + width / 2,
-            bottom: 43,
+            bottom: y + 43,
         }
     }
 
     fn window_button_rects(&self) -> (RECT, RECT, RECT) {
         let rect = client_rect(self.hwnd);
+        let y = self.topbar_y();
         (
             RECT {
                 left: rect.right - 138,
-                top: 0,
+                top: y,
                 right: rect.right - 92,
-                bottom: TOPBAR_HEIGHT,
+                bottom: y + TOPBAR_HEIGHT,
             },
             RECT {
                 left: rect.right - 92,
-                top: 0,
+                top: y,
                 right: rect.right - 46,
-                bottom: TOPBAR_HEIGHT,
+                bottom: y + TOPBAR_HEIGHT,
             },
             RECT {
                 left: rect.right - 46,
-                top: 0,
+                top: y,
                 right: rect.right,
-                bottom: TOPBAR_HEIGHT,
+                bottom: y + TOPBAR_HEIGHT,
             },
         )
     }
@@ -2678,19 +2719,19 @@ impl App {
                         match self.sidebar_expand_mode {
                             SidebarMode::Overlay => RECT {
                                 left: 0,
-                                top: TOPBAR_HEIGHT,
+                                top: self.topbar_pushed_height(),
                                 right: rect.right,
                                 bottom: rect.bottom,
                             },
                             SidebarMode::Pushed => RECT {
                                 left: pushed_left,
-                                top: TOPBAR_HEIGHT,
+                                top: self.topbar_pushed_height(),
                                 right: rect.right,
                                 bottom: rect.bottom,
                             },
                             _ => RECT {
                                 left: HOVER_ZONE,
-                                top: TOPBAR_HEIGHT,
+                                top: self.topbar_pushed_height(),
                                 right: rect.right,
                                 bottom: rect.bottom,
                             },
@@ -2698,7 +2739,7 @@ impl App {
                     } else {
                         RECT {
                             left: 0,
-                            top: TOPBAR_HEIGHT,
+                            top: self.topbar_pushed_height(),
                             right: rect.right,
                             bottom: rect.bottom,
                         }
@@ -2706,13 +2747,13 @@ impl App {
                 }
                 SidebarMode::Overlay => RECT {
                     left: 0,
-                    top: TOPBAR_HEIGHT,
+                    top: self.topbar_pushed_height(),
                     right: rect.right,
                     bottom: rect.bottom,
                 },
                 SidebarMode::Pushed => RECT {
                     left: pushed_left,
-                    top: TOPBAR_HEIGHT,
+                    top: self.topbar_pushed_height(),
                     right: rect.right,
                     bottom: rect.bottom,
                 },
@@ -2728,12 +2769,18 @@ impl App {
             && (self.sidebar_mode == SidebarMode::Overlay
                 || (self.sidebar_mode == SidebarMode::Hidden
                     && self.sidebar_expand_mode == SidebarMode::Overlay
-                    && self.sidebar_target >= SIDEBAR_EXPANDED));
+                    && self.sidebar_target >= SIDEBAR_EXPANDED)
+                || self.topbar_mode == SidebarMode::Overlay
+                || (self.topbar_mode == SidebarMode::Hidden
+                    && self.topbar_expand_mode == SidebarMode::Overlay
+                    && self.topbar_target >= TOPBAR_EXPANDED));
         let clip_changed = needs_clipping
-            && sidebar_width > 0
-            && ((sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0 || size_changed);
-        let was_clipped = self.last_clip_width.get() != 0.0;
-        let should_clear = (!needs_clipping || sidebar_width <= 0) && was_clipped;
+            && (sidebar_width > 0 || self.topbar_height > 0.0)
+            && ((sidebar_width as f32 - self.last_clip_width.get()).abs() > 1.0
+                || (self.topbar_height - self.last_clip_top.get()).abs() > 1.0
+                || size_changed);
+        let was_clipped = self.last_clip_width.get() != 0.0 || self.last_clip_top.get() != 0.0;
+        let should_clear = (!needs_clipping || (sidebar_width <= 0 && self.topbar_height <= 0.0)) && was_clipped;
         for (i, tab) in self.tabs.iter().enumerate() {
             unsafe {
                 let is_active = Some(i) == self.active_tab_index();
@@ -2751,9 +2798,13 @@ impl App {
                 }
                 if clip_changed {
                     let clip_left = sidebar_width;
-                    let clip_top = 0;
+                    let clip_top = if self.topbar_mode == SidebarMode::Overlay || self.topbar_expand_mode == SidebarMode::Overlay {
+                        self.topbar_height as i32
+                    } else {
+                        0
+                    };
                     let clip_right = rect.right;
-                    let clip_bottom = rect.bottom - TOPBAR_HEIGHT;
+                    let clip_bottom = rect.bottom - self.topbar_pushed_height();
                     let region = CreateRectRgn(clip_left, clip_top, clip_right, clip_bottom);
                     let _ = SetWindowRgn(tab.child_hwnd, Some(region), false);
                 } else if should_clear {
@@ -2766,8 +2817,10 @@ impl App {
         }
         if clip_changed {
             self.last_clip_width.set(sidebar_width as f32);
+            self.last_clip_top.set(self.topbar_height);
         } else if should_clear {
             self.last_clip_width.set(0.0);
+            self.last_clip_top.set(0.0);
         }
         if size_changed {
             self.last_bounds_rect.set(bounds);
@@ -2792,18 +2845,18 @@ impl App {
         unsafe {
             let topbar = RECT {
                 left: 0,
-                top: 0,
+                top: self.topbar_y(),
                 right: rect.right,
-                bottom: TOPBAR_HEIGHT,
+                bottom: self.topbar_y() + TOPBAR_HEIGHT,
             };
             let _ = FillRect(hdc, &topbar, self.brushes.panel);
             fill_rect(
                 hdc,
                 RECT {
                     left: 0,
-                    top: TOPBAR_HEIGHT - 1,
+                    top: self.topbar_y() + TOPBAR_HEIGHT - 1,
                     right: rect.right,
-                    bottom: TOPBAR_HEIGHT,
+                    bottom: self.topbar_y() + TOPBAR_HEIGHT,
                 },
                 0x202020,
             );
@@ -2814,7 +2867,7 @@ impl App {
                     hdc,
                     RECT {
                         left: 0,
-                        top: TOPBAR_HEIGHT,
+                        top: self.topbar_pushed_height(),
                         right: rect.right,
                         bottom: rect.bottom,
                     },
@@ -2824,7 +2877,7 @@ impl App {
             if sidebar_width >= 1 {
                 let sidebar = RECT {
                     left: 0,
-                    top: TOPBAR_HEIGHT,
+                    top: self.topbar_pushed_height(),
                     right: sidebar_width,
                     bottom: rect.bottom,
                 };
@@ -2834,7 +2887,7 @@ impl App {
                         hdc,
                         RECT {
                             left: sidebar.right - 1,
-                            top: TOPBAR_HEIGHT,
+                            top: self.topbar_pushed_height(),
                             right: sidebar.right,
                             bottom: rect.bottom,
                         },
@@ -3586,9 +3639,9 @@ impl App {
                         let width = self.sidebar_width() as i32;
                         let line_rect = RECT {
                             left: 14,
-                            top: SIDEBAR_ROWS_TOP - 2,
+                            top: self.sidebar_rows_top() - 2,
                             right: width - 14,
-                            bottom: SIDEBAR_ROWS_TOP,
+                            bottom: self.sidebar_rows_top(),
                         };
                         fill_rect(hdc, line_rect, COLOR_ACCENT);
                     }
@@ -4512,7 +4565,7 @@ impl App {
         let divider_y = self.sidebar_row_rects().iter()
             .find(|(row, _)| matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
             .map(|(_, rect)| rect.top)
-            .unwrap_or(SIDEBAR_ROWS_TOP + 72);
+            .unwrap_or(self.sidebar_rows_top() + 72);
 
         let hit = if hit.is_none() && x >= 0 && (x as f32) < self.sidebar_width {
             if y <= divider_y {
@@ -4644,7 +4697,7 @@ impl App {
         let divider_y = self.sidebar_row_rects().iter()
             .find(|(row, _)| matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
             .map(|(_, rect)| rect.top)
-            .unwrap_or(SIDEBAR_ROWS_TOP + 72);
+            .unwrap_or(self.sidebar_rows_top() + 72);
 
         let hit = if hit.is_none() && x >= 0 && (x as f32) < self.sidebar_width {
             if y <= divider_y {
@@ -4805,18 +4858,27 @@ impl App {
     }
 
     fn toggle_sidebar(&mut self) {
-        if self.sidebar_mode == SidebarMode::Pushed || self.sidebar_expand_mode == SidebarMode::Pushed {
+        if self.sidebar_mode == SidebarMode::Pushed || self.sidebar_expand_mode == SidebarMode::Pushed ||
+           self.topbar_mode == SidebarMode::Pushed || self.topbar_expand_mode == SidebarMode::Pushed {
             self.set_sidebar_mode(SidebarMode::Hidden);
-        } else if self.sidebar_mode == SidebarMode::Overlay || self.sidebar_expand_mode == SidebarMode::Overlay {
+            self.set_topbar_mode(SidebarMode::Hidden);
+        } else if self.sidebar_mode == SidebarMode::Overlay || self.sidebar_expand_mode == SidebarMode::Overlay ||
+                  self.topbar_mode == SidebarMode::Overlay || self.topbar_expand_mode == SidebarMode::Overlay {
             self.sidebar_expand_mode = SidebarMode::Pushed;
+            self.topbar_expand_mode = SidebarMode::Pushed;
             if !self.animating_sidebar {
                 self.sidebar_mode = SidebarMode::Pushed;
+            }
+            if !self.animating_topbar {
+                self.topbar_mode = SidebarMode::Pushed;
             }
             self.layout();
             self.refresh();
         } else {
             self.sidebar_expand_mode = SidebarMode::Pushed;
             self.set_sidebar_mode(SidebarMode::Pushed);
+            self.topbar_expand_mode = SidebarMode::Pushed;
+            self.set_topbar_mode(SidebarMode::Pushed);
         }
     }
 
@@ -4828,10 +4890,25 @@ impl App {
         self.animating_sidebar = true;
         unsafe {
             let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
-            if mode != SidebarMode::Hidden {
+            if mode != SidebarMode::Hidden && self.topbar_mode != SidebarMode::Hidden {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
             }
             let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), SIDEBAR_TIMER_ID, 15, None);
+        }
+    }
+
+    fn set_topbar_mode(&mut self, mode: SidebarMode) {
+        self.topbar_target = match mode {
+            SidebarMode::Hidden => TOPBAR_HIDDEN,
+            SidebarMode::Overlay | SidebarMode::Pushed => TOPBAR_EXPANDED,
+        };
+        self.animating_topbar = true;
+        unsafe {
+            let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
+            if mode != SidebarMode::Hidden && self.sidebar_mode != SidebarMode::Hidden {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
+            }
+            let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), TOPBAR_TIMER_ID, 15, None);
         }
     }
 
@@ -4875,6 +4952,52 @@ impl App {
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
+        self.layout();
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    fn tick_topbar_animation(&mut self) {
+        let distance = self.topbar_target - self.topbar_height;
+        if distance.abs() < 0.75 {
+            self.topbar_height = self.topbar_target;
+            self.animating_topbar = false;
+            unsafe {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), TOPBAR_TIMER_ID);
+            }
+            if self.topbar_height < 0.5 {
+                self.topbar_mode = SidebarMode::Hidden;
+                self.topbar_expand_mode = SidebarMode::Hidden;
+                self.hovering_topbar = false;
+                self.clear_webview_clipping();
+                self.ensure_hover_detect_timer();
+            } else if self.topbar_target >= TOPBAR_EXPANDED {
+                self.topbar_mode = self.topbar_expand_mode;
+                if self.topbar_mode == SidebarMode::Overlay {
+                    self.clear_webview_clipping();
+                    unsafe {
+                        let _ = WindowsAndMessaging::SetTimer(
+                            Some(self.hwnd),
+                            HOVER_LEAVE_TIMER_ID,
+                            100,
+                            None,
+                        );
+                    }
+                }
+            }
+            self.layout();
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+                let _ = Gdi::UpdateWindow(self.hwnd);
+            }
+        } else {
+            self.topbar_height += distance * 0.22;
+            self.layout();
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+        }
     }
 
     fn clear_webview_clipping(&self) {
@@ -4887,13 +5010,13 @@ impl App {
     }
 
     fn check_hover_leave(&mut self) {
-        if self.sidebar_mode != SidebarMode::Overlay {
+        if self.sidebar_mode != SidebarMode::Overlay && self.topbar_mode != SidebarMode::Overlay {
             unsafe {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
             }
             return;
         }
-        if self.animating_sidebar {
+        if self.animating_sidebar || self.animating_topbar {
             return;
         }
         if self.drag_state.is_some() {
@@ -4904,11 +5027,31 @@ impl App {
             if GetCursorPos(&mut pt).is_ok() {
                 if ScreenToClient(self.hwnd, &mut pt).as_bool() {
                     let sidebar_w = self.sidebar_width() as i32;
-                    if pt.x > sidebar_w + HOVER_ZONE || pt.x < 0 || pt.y < 0 || pt.y > 10000 {
-                        let _ =
-                            WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
+                    let topbar_h = self.topbar_height as i32;
+                    let mut over_sidebar = false;
+                    let mut over_topbar = false;
+                    if self.sidebar_mode == SidebarMode::Overlay {
+                        if pt.x <= sidebar_w + HOVER_ZONE && pt.x >= 0 && pt.y >= 0 && pt.y <= 10000 {
+                            over_sidebar = true;
+                        }
+                    }
+                    if self.topbar_mode == SidebarMode::Overlay {
+                        if pt.y <= topbar_h + HOVER_ZONE && pt.y >= 0 && pt.x >= 0 && pt.x <= 10000 {
+                            over_topbar = true;
+                        }
+                    }
+
+                    if !over_sidebar && self.sidebar_mode == SidebarMode::Overlay {
                         self.sidebar_expand_mode = SidebarMode::Hidden;
                         self.set_sidebar_mode(SidebarMode::Hidden);
+                    }
+                    if !over_topbar && self.topbar_mode == SidebarMode::Overlay {
+                        self.topbar_expand_mode = SidebarMode::Hidden;
+                        self.set_topbar_mode(SidebarMode::Hidden);
+                    }
+
+                    if self.sidebar_mode != SidebarMode::Overlay && self.topbar_mode != SidebarMode::Overlay {
+                        let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_LEAVE_TIMER_ID);
                     }
                 }
             }
@@ -4916,7 +5059,8 @@ impl App {
     }
 
     fn check_hover_detect(&mut self) {
-        if self.sidebar_mode != SidebarMode::Hidden || self.animating_sidebar {
+        if (self.sidebar_mode != SidebarMode::Hidden || self.animating_sidebar) &&
+           (self.topbar_mode != SidebarMode::Hidden || self.animating_topbar) {
             unsafe {
                 let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
             }
@@ -4927,11 +5071,22 @@ impl App {
             if GetCursorPos(&mut pt).is_ok() {
                 if ScreenToClient(self.hwnd, &mut pt).as_bool() {
                     if pt.x < HOVER_ZONE && pt.x >= 0 && pt.y >= 0 {
-                        let _ =
-                            WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
-                        self.sidebar_expand_mode = SidebarMode::Overlay;
-                        self.hovering_sidebar = true;
-                        self.set_sidebar_mode(SidebarMode::Overlay);
+                        if self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
+                            self.sidebar_expand_mode = SidebarMode::Overlay;
+                            self.hovering_sidebar = true;
+                            self.set_sidebar_mode(SidebarMode::Overlay);
+                        }
+                    }
+                    if pt.y < HOVER_ZONE && pt.y >= 0 && pt.x >= 0 {
+                        if self.topbar_mode == SidebarMode::Hidden && !self.animating_topbar {
+                            self.topbar_expand_mode = SidebarMode::Overlay;
+                            self.hovering_topbar = true;
+                            self.set_topbar_mode(SidebarMode::Overlay);
+                        }
+                    }
+
+                    if self.sidebar_mode != SidebarMode::Hidden && self.topbar_mode != SidebarMode::Hidden {
+                        let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), HOVER_DETECT_TIMER_ID);
                     }
                 }
             }
@@ -5895,6 +6050,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             }
             if w_param.0 == SIDEBAR_TIMER_ID {
                 with_app(hwnd, |app| app.tick_sidebar_animation());
+                return LRESULT(0);
+            }
+            if w_param.0 == TOPBAR_TIMER_ID {
+                with_app(hwnd, |app| app.tick_topbar_animation());
                 return LRESULT(0);
             }
             if w_param.0 == HOVER_LEAVE_TIMER_ID {
