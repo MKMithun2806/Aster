@@ -937,7 +937,7 @@ impl App {
         let has_pinned = self.folders.iter().any(|f| f.workspace_id == self.active_workspace && f.pinned)
             || self.tabs.iter().any(|t| t.workspace_id == self.active_workspace && t.pinned);
         let mut y = if has_pinned {
-            SIDEBAR_ROWS_TOP + 28
+            SIDEBAR_ROWS_TOP
         } else {
             SIDEBAR_ROWS_TOP + 72
         };
@@ -3031,19 +3031,6 @@ impl App {
                             let _ = DeleteObject(HGDIOBJ(large_pin_font.0));
                         }
                     }
-                } else {
-                    draw_icon_glyph(
-                        hdc,
-                        &self.fonts.toolbar_icon,
-                        glyph(0xE718).as_str(),
-                        RECT {
-                            left: 22,
-                            top: SIDEBAR_ROWS_TOP + 5,
-                            right: 22 + 20,
-                            bottom: SIDEBAR_ROWS_TOP + 5 + 18,
-                        },
-                        COLOR_ACCENT,
-                    );
                 }
                 for (row, row_rect) in self.sidebar_row_rects() {
                     match row {
@@ -3421,13 +3408,25 @@ impl App {
     fn paint_workspace_header(&self, hdc: HDC) {
         unsafe {
             let rect = self.workspace_header_rect();
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.toolbar_icon,
+                glyph(0xE718).as_str(),
+                RECT {
+                    left: 22,
+                    top: rect.top + 4,
+                    right: 22 + 20,
+                    bottom: rect.top + 4 + 18,
+                },
+                COLOR_ACCENT,
+            );
             fill_round_rect(
                 hdc,
                 RECT {
                     left: rect.left + 12,
-                    top: rect.top + 17,
+                    top: rect.top + 28,
                     right: rect.right - 12,
-                    bottom: rect.top + 18,
+                    bottom: rect.top + 29,
                 },
                 0x242424,
                 1,
@@ -3582,6 +3581,15 @@ impl App {
                             top: rect.bottom - 2,
                             right: rect.right - 4,
                             bottom: rect.bottom,
+                        };
+                        fill_rect(hdc, line_rect, COLOR_ACCENT);
+                    } else {
+                        let width = self.sidebar_width() as i32;
+                        let line_rect = RECT {
+                            left: 14,
+                            top: SIDEBAR_ROWS_TOP - 2,
+                            right: width - 14,
+                            bottom: SIDEBAR_ROWS_TOP,
                         };
                         fill_rect(hdc, line_rect, COLOR_ACCENT);
                     }
@@ -4529,10 +4537,14 @@ impl App {
 
                 match hit {
                     Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
-                        if let Some(tab) = self.tabs.get_mut(from_index) {
-                            tab.pinned = true;
-                            tab.pinned_url = Some(tab.url.clone());
-                            tab.folder_id = None;
+                        let tab_id = self.tabs[from_index].id;
+                        let mut tab = self.tabs.remove(from_index);
+                        tab.pinned = true;
+                        tab.pinned_url = Some(tab.url.clone());
+                        tab.folder_id = None;
+                        self.tabs.insert(0, tab);
+                        if let Some(new_active) = self.tabs.iter().position(|t| t.id == tab_id) {
+                            self.active = new_active;
                         }
                     }
                     Some(SidebarHit::Folder(folder_id)) => {
@@ -4585,9 +4597,11 @@ impl App {
             DragSource::Folder(from_folder_id) => {
                 match hit {
                     Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
-                        if let Some(folder) = self.folders.iter_mut().find(|f| f.id == from_folder_id) {
+                        if let Some(pos) = self.folders.iter().position(|f| f.id == from_folder_id) {
+                            let mut folder = self.folders.remove(pos);
                             folder.pinned = true;
                             folder.parent_id = None;
+                            self.folders.insert(0, folder);
                         }
                         self.propagate_folder_pinning(from_folder_id, true);
                     }
@@ -4628,8 +4642,23 @@ impl App {
 
     fn calculate_drop_target(&self, x: i32, y: i32) -> DropTarget {
         let hit = self.hit_sidebar(x, y);
+        let divider_y = self.sidebar_row_rects().iter()
+            .find(|(row, _)| matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
+            .map(|(_, rect)| rect.top)
+            .unwrap_or(SIDEBAR_ROWS_TOP + 72);
+
+        let hit = if hit.is_none() && x >= 0 && (x as f32) < self.sidebar_width {
+            if y <= divider_y {
+                Some(SidebarHit::PinnedSection)
+            } else {
+                None
+            }
+        } else {
+            hit
+        };
+
         match hit {
-            Some(SidebarHit::PinnedSection) => DropTarget::PinnedSection,
+            Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => DropTarget::PinnedSection,
             Some(SidebarHit::Folder(folder_id)) => DropTarget::Folder(folder_id),
             Some(SidebarHit::Tab(index)) => DropTarget::Tab(index),
             _ => DropTarget::None,
