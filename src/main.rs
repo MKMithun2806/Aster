@@ -2575,30 +2575,40 @@ impl App {
         let suggestions = self.command_suggestions();
         if let Some(top) = suggestions.first() {
             let url = &top.2;
-            let clean = clean_all_prefixes(url);
-            let display_url = if clean.to_ascii_lowercase().starts_with(&current_text.to_ascii_lowercase()) {
-                clean.to_string()
-            } else if url.to_ascii_lowercase().starts_with(&current_text.to_ascii_lowercase()) {
-                url.to_string()
+            let display_url = if let Some(query) = extract_search_query(url) {
+                if query.to_ascii_lowercase().starts_with(&current_text.to_ascii_lowercase()) {
+                    Some(query)
+                } else {
+                    None
+                }
             } else {
-                return;
+                let clean = clean_all_prefixes(url);
+                if clean.to_ascii_lowercase().starts_with(&current_text.to_ascii_lowercase()) {
+                    Some(clean.to_string())
+                } else if url.to_ascii_lowercase().starts_with(&current_text.to_ascii_lowercase()) {
+                    Some(url.to_string())
+                } else {
+                    None
+                }
             };
 
-            let remaining = &display_url[current_text.len()..];
-            if !remaining.is_empty() {
-                let start_sel = current_text.len() as u32;
-                let full = format!("{}{}", current_text, remaining);
-                set_window_text(self.address_hwnd, &full);
-                unsafe {
-                    let _ = WindowsAndMessaging::SendMessageW(
-                        self.address_hwnd,
-                        EM_SETSEL,
-                        Some(WPARAM(start_sel as usize)),
-                        Some(LPARAM(-1)),
-                    );
+            if let Some(display_url) = display_url {
+                let remaining = &display_url[current_text.len()..];
+                if !remaining.is_empty() {
+                    let start_sel = current_text.len() as u32;
+                    let full = format!("{}{}", current_text, remaining);
+                    set_window_text(self.address_hwnd, &full);
+                    unsafe {
+                        let _ = WindowsAndMessaging::SendMessageW(
+                            self.address_hwnd,
+                            EM_SETSEL,
+                            Some(WPARAM(start_sel as usize)),
+                            Some(LPARAM(-1)),
+                        );
+                    }
+                    self.command_selected_index = Some(0);
+                    self.last_address_text = full;
                 }
-                self.command_selected_index = Some(0);
-                self.last_address_text = full;
             }
         }
     }
@@ -3148,7 +3158,7 @@ impl App {
             draw_text(
                 hdc,
                 &self.fonts.small,
-                "Mode",
+                "Site theme",
                 RECT {
                     left: row.left + 12,
                     top: row.top,
