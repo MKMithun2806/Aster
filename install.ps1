@@ -1,74 +1,80 @@
-# Aster Browser Automated Installer
-# Automatically clones, builds, and installs Aster to %LOCALAPPDATA%\Programs\Aster
-# Data is saved to %APPDATA%\Aster
+# Aster Browser installer for Windows
+# Clones the repository, builds a release binary, and installs it under Local AppData by default.
 
 $ErrorActionPreference = "Stop"
 
-$tempDir = Join-Path $env:TEMP "AsterInstall_$([guid]::NewGuid().ToString().Substring(0,8))"
-if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir }
+function Assert-Command {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command '$Name' was not found on PATH."
+    }
+}
 
-Write-Host "📥 Cloning Aster from GitHub..." -ForegroundColor Cyan
-git clone "https://github.com/ahyanistheEmty/Aster" $tempDir
+Assert-Command git
+Assert-Command cargo
 
-# Save original location
+$repoUrl = "https://github.com/ahyanistheEmty/Aster.git"
+$tempDir = Join-Path $env:TEMP ("AsterInstall_{0}" -f ([guid]::NewGuid().ToString("N").Substring(0, 8)))
 $originalLocation = Get-Location
 
-# Move into the cloned repo
-Set-Location $tempDir
+try {
+    if (Test-Path $tempDir) {
+        Remove-Item -Recurse -Force $tempDir
+    }
 
-Write-Host "🚀 Building Aster in Release mode..." -ForegroundColor Cyan
-cargo build --release
+    Write-Host "Cloning Aster from GitHub..." -ForegroundColor Cyan
+    git clone --depth 1 $repoUrl $tempDir | Out-Null
 
-# Determine installation directory (Local AppData Programs folder)
-$localAppData = [System.Environment]::GetFolderPath('LocalApplicationData')
-$installDir = Join-Path $localAppData "Programs\Aster"
+    Set-Location $tempDir
 
-Write-Host ""
-Write-Host "=========================================="
-Write-Host " Aster Browser Installation"
-Write-Host "=========================================="
-$userInput = Read-Host "Enter installation path (Press Enter to use default: $installDir)"
+    Write-Host "Building Aster in release mode..." -ForegroundColor Cyan
+    cargo build --release
 
-if (![string]::IsNullOrWhiteSpace($userInput)) {
-    $installDir = $userInput
+    $defaultInstallDir = Join-Path ([System.Environment]::GetFolderPath("LocalApplicationData")) "Programs\Aster"
+    Write-Host ""
+    Write-Host "Aster Browser Installation" -ForegroundColor Cyan
+    Write-Host "Default install path: $defaultInstallDir"
+    $userInput = Read-Host "Enter installation path or press Enter to accept the default"
+    $installDir = if ([string]::IsNullOrWhiteSpace($userInput)) { $defaultInstallDir } else { $userInput }
+
+    if (-not (Test-Path $installDir)) {
+        New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+    }
+
+    $exeSource = Join-Path $tempDir "target\release\Aster.exe"
+    $exeDest = Join-Path $installDir "Aster.exe"
+    Copy-Item -Force $exeSource $exeDest
+
+    $desktopPath = [System.Environment]::GetFolderPath("Desktop")
+    $startMenuPath = [System.Environment]::GetFolderPath("Programs")
+    $wshShell = New-Object -ComObject WScript.Shell
+
+    foreach ($shortcutPath in @(
+        (Join-Path $desktopPath "Aster.lnk"),
+        (Join-Path $startMenuPath "Aster.lnk")
+    )) {
+        if ([string]::IsNullOrWhiteSpace($shortcutPath)) {
+            continue
+        }
+        $shortcutDir = Split-Path -Parent $shortcutPath
+        if (-not (Test-Path $shortcutDir)) {
+            continue
+        }
+        $shortcut = $wshShell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $exeDest
+        $shortcut.WorkingDirectory = $installDir
+        $shortcut.Description = "Aster Browser"
+        $shortcut.Save()
+    }
+
+    Write-Host ""
+    Write-Host "Installation complete." -ForegroundColor Green
+    Write-Host "Binary: $exeDest"
+    Write-Host "State:  %APPDATA%\Aster"
 }
-
-if (!(Test-Path $installDir)) {
-    Write-Host "📁 Creating installation directory at $installDir..."
-    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+finally {
+    Set-Location $originalLocation
+    if (Test-Path $tempDir) {
+        Remove-Item -Recurse -Force $tempDir
+    }
 }
-
-$exeSource = Join-Path $tempDir "target\release\Aster.exe"
-$exeDest = Join-Path $installDir "Aster.exe"
-
-Write-Host "📦 Copying executable to $installDir..."
-Copy-Item -Path $exeSource -Destination $exeDest -Force
-
-Write-Host "🔗 Creating shortcuts..."
-$WshShell = New-Object -comObject WScript.Shell
-
-# Desktop Shortcut
-$desktopPath = [System.Environment]::GetFolderPath('Desktop')
-$desktopShortcut = $WshShell.CreateShortcut((Join-Path $desktopPath "Aster.lnk"))
-$desktopShortcut.TargetPath = $exeDest
-$desktopShortcut.WorkingDirectory = $installDir
-$desktopShortcut.Description = "Aster Browser"
-$desktopShortcut.Save()
-
-# Start Menu Shortcut
-$startMenuPrograms = [System.Environment]::GetFolderPath('Programs')
-$startMenuShortcut = $WshShell.CreateShortcut((Join-Path $startMenuPrograms "Aster.lnk"))
-$startMenuShortcut.TargetPath = $exeDest
-$startMenuShortcut.WorkingDirectory = $installDir
-$startMenuShortcut.Description = "Aster Browser"
-$startMenuShortcut.Save()
-
-Write-Host "🧹 Cleaning up temporary files..."
-Set-Location $originalLocation
-Remove-Item -Recurse -Force $tempDir
-
-Write-Host ""
-Write-Host "✅ Installation Complete!" -ForegroundColor Green
-Write-Host "Aster has been installed to: $installDir"
-Write-Host "Your browsing state & profiles will automatically save to your roaming profile (%APPDATA%\Aster)."
-Write-Host "You can now launch Aster from your Desktop or Start Menu!" -ForegroundColor Green

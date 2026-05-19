@@ -1,3 +1,4 @@
+#[cfg(target_os = "windows")]
 fn draw_icon_dot(pixels: &mut [u8], size: usize, cx: f32, cy: f32, radius: f32) {
     let min_x = (cx - radius).floor() as i32;
     let max_x = (cx + radius).ceil() as i32;
@@ -21,6 +22,7 @@ fn draw_icon_dot(pixels: &mut [u8], size: usize, cx: f32, cy: f32, radius: f32) 
     }
 }
 
+#[cfg(target_os = "windows")]
 fn draw_icon_line(pixels: &mut [u8], size: usize, x1: f32, y1: f32, x2: f32, y2: f32, stroke: f32) {
     let steps = ((x2 - x1).abs().max((y2 - y1).abs()) * 2.0).max(1.0) as i32;
     for step in 0..=steps {
@@ -31,6 +33,7 @@ fn draw_icon_line(pixels: &mut [u8], size: usize, x1: f32, y1: f32, x2: f32, y2:
     }
 }
 
+#[cfg(target_os = "windows")]
 fn generate_ico_file() {
     let size: usize = 64;
     let mut pixels = vec![0u8; size * size * 4];
@@ -63,7 +66,8 @@ fn generate_ico_file() {
         let src_y = size - 1 - y;
         let src_offset = src_y * size * 4;
         let dest_offset = y * size * 4;
-        bmp_pixels[dest_offset..(dest_offset + size * 4)].copy_from_slice(&pixels[src_offset..(src_offset + size * 4)]);
+        bmp_pixels[dest_offset..(dest_offset + size * 4)]
+            .copy_from_slice(&pixels[src_offset..(src_offset + size * 4)]);
     }
 
     let and_mask_size = ((size + 31) / 32) * 4 * size;
@@ -100,7 +104,10 @@ fn generate_ico_file() {
 }
 
 fn main() {
-    println!("cargo:rustc-link-lib=advapi32");
-    generate_ico_file();
-    embed_resource::compile("aster.rc", embed_resource::NONE);
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rustc-link-lib=advapi32");
+        generate_ico_file();
+        embed_resource::compile("aster.rc", embed_resource::NONE);
+    }
 }
