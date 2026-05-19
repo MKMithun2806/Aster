@@ -1675,6 +1675,36 @@ impl App {
         self.ensure_hover_detect_timer();
     }
 
+    fn switch_tab_above(&mut self) {
+        let tabs = self.active_workspace_tabs();
+        if tabs.len() <= 1 {
+            return;
+        }
+        if let Some(active_idx) = self.active_tab_index() {
+            if let Some(pos) = tabs.iter().position(|&idx| idx == active_idx) {
+                let next_pos = if pos == 0 {
+                    tabs.len() - 1
+                } else {
+                    pos - 1
+                };
+                self.switch_to(tabs[next_pos], true);
+            }
+        }
+    }
+
+    fn switch_tab_below(&mut self) {
+        let tabs = self.active_workspace_tabs();
+        if tabs.len() <= 1 {
+            return;
+        }
+        if let Some(active_idx) = self.active_tab_index() {
+            if let Some(pos) = tabs.iter().position(|&idx| idx == active_idx) {
+                let next_pos = (pos + 1) % tabs.len();
+                self.switch_to(tabs[next_pos], true);
+            }
+        }
+    }
+
     fn ensure_hover_detect_timer(&mut self) {
         if self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
             unsafe {
@@ -5964,9 +5994,10 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
             }
             0x53 if ctrl => app.toggle_sidebar(),
             0x57 if ctrl => {
-                if let Some(index) = app.active_tab_index() {
-                    app.close_tab(index);
-                }
+                app.switch_tab_above();
+            }
+            0x51 if ctrl => {
+                app.switch_tab_below();
             }
             0x25 if alt => app.go_back(),
             0x27 if alt => app.go_forward(),
@@ -5981,7 +6012,7 @@ fn is_aster_shortcut(key: u32) -> bool {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
-        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 if ctrl)
+        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 | 0x51 if ctrl)
             || matches!(key, 0x25 | 0x27 if alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
