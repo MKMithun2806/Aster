@@ -2771,6 +2771,10 @@ impl App {
             let _ = FillRect(hdc, &rect, self.brushes.black);
         }
         if self.fullscreen {
+            let is_unloaded = self.tabs.get(self.active).map(|t| t.unloaded).unwrap_or(false);
+            if self.active_tab_index().is_none() || is_unloaded {
+                self.paint_cached_background(hdc, rect);
+            }
             return;
         }
         let sidebar_width = self.sidebar_width();
