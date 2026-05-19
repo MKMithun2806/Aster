@@ -72,6 +72,7 @@ const SIDEBAR_TIMER_ID: usize = 42;
 const HOVER_LEAVE_TIMER_ID: usize = 43;
 const HOVER_DETECT_TIMER_ID: usize = 44;
 const BACKGROUND_TIMER_ID: usize = 45;
+const LOADING_TIMER_ID: usize = 46;
 const STATE_FILE: &str = ".aster-state";
 const MENU_TAB_PIN: usize = 3101;
 const MENU_TAB_UNPIN: usize = 3102;
@@ -218,6 +219,7 @@ struct Tab {
     webview: ICoreWebView2,
     child_hwnd: HWND,
     unloaded: bool,
+    is_loading: bool,
 }
 
 #[derive(Clone)]
@@ -659,6 +661,7 @@ impl App {
             webview,
             child_hwnd,
             unloaded: false,
+            is_loading: false,
         });
         if let Some(title) = title {
             if let Some(tab) = self.tabs.get_mut(index) {
@@ -1321,6 +1324,26 @@ impl App {
 
             let hwnd = self.hwnd;
             let mut token = 0;
+            webview.add_NavigationStarting(
+                &NavigationStartingEventHandler::create(Box::new(move |_sender, _args| {
+                    with_app(hwnd, |app| app.set_tab_loading(tab_id, true));
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_NavigationCompleted(
+                &NavigationCompletedEventHandler::create(Box::new(move |_sender, _args| {
+                    with_app(hwnd, |app| app.set_tab_loading(tab_id, false));
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
             webview.add_SourceChanged(
                 &SourceChangedEventHandler::create(Box::new(move |sender, _args| {
                     if let Some(sender) = sender {
@@ -1473,6 +1496,21 @@ impl App {
         }
         self.save_state();
         self.refresh();
+    }
+
+    fn set_tab_loading(&mut self, tab_id: usize, is_loading: bool) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.is_loading = is_loading;
+            unsafe { let _ = InvalidateRect(Some(self.hwnd), None, false); };
+        }
+        let any_loading = self.tabs.iter().any(|t| t.is_loading);
+        unsafe {
+            if any_loading {
+                let _ = WindowsAndMessaging::SetTimer(Some(self.hwnd), LOADING_TIMER_ID, 16, None);
+            } else {
+                let _ = WindowsAndMessaging::KillTimer(Some(self.hwnd), LOADING_TIMER_ID);
+            }
+        }
     }
 
     fn update_tab_url(&mut self, tab_id: usize, url: String) {
@@ -2724,17 +2762,58 @@ impl App {
             );
 
             let edit_rect = self.address_pill_rect();
-            if self.hover_target == Some(HoverTarget::Address) || self.command_open {
-                fill_rect(
-                    hdc,
-                    RECT {
-                        left: edit_rect.left + 22,
-                        top: edit_rect.bottom - 2,
-                        right: edit_rect.right - 22,
-                        bottom: edit_rect.bottom - 1,
-                    },
-                    COLOR_ACCENT,
-                );
+            let active_is_loading = self.active_tab_index().and_then(|idx| self.tabs.get(idx)).map(|t| t.is_loading).unwrap_or(false);
+            if self.hover_target == Some(HoverTarget::Address) || self.command_open || active_is_loading {
+                let full_left = edit_rect.left + 22;
+                let full_right = edit_rect.right - 22;
+                
+                if active_is_loading {
+                    let time_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let width = full_right - full_left;
+                    if width > 0 {
+                        let block_width = (width as f64 * 0.7) as i32;
+                        let cycle_duration: u128 = 1200;
+                        let t = (time_ms % cycle_duration) as f64 / cycle_duration as f64;
+                        // Smooth ease-in-out: accelerate from left, decelerate to right
+                        let eased = t * t * (3.0 - 2.0 * t);
+                        // Sweep from off-screen left to off-screen right
+                        let start = full_left - block_width;
+                        let end = full_right;
+                        let total_travel = end - start;
+                        let anim_left = start + (eased * total_travel as f64) as i32;
+                        let anim_right = anim_left + block_width;
+                        
+                        let fl = anim_left.max(full_left);
+                        let fr = anim_right.min(full_right);
+                        
+                        if fl < fr {
+                            fill_rect(
+                                hdc,
+                                RECT {
+                                    left: fl,
+                                    top: edit_rect.bottom - 2,
+                                    right: fr,
+                                    bottom: edit_rect.bottom - 1,
+                                },
+                                COLOR_ACCENT,
+                            );
+                        }
+                    }
+                } else {
+                    fill_rect(
+                        hdc,
+                        RECT {
+                            left: full_left,
+                            top: edit_rect.bottom - 2,
+                            right: full_right,
+                            bottom: edit_rect.bottom - 1,
+                        },
+                        COLOR_ACCENT,
+                    );
+                }
             }
             let address_label = self
                 .active_tab_index()
@@ -5724,6 +5803,13 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 with_app(hwnd, |app| app.check_hover_detect());
                 return LRESULT(0);
             }
+            if w_param.0 == LOADING_TIMER_ID {
+                with_app(hwnd, |app| unsafe {
+                    let _ = InvalidateRect(Some(app.hwnd), None, false);
+                });
+                return LRESULT(0);
+            }
+
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
         WM_COMMAND => {
