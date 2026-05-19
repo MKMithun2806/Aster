@@ -5957,10 +5957,13 @@ fn draw_toolbar_icon_button(
     hdc: HDC,
     rect: RECT,
     icon: IconKind,
-    _hovered: bool,
+    hovered: bool,
     icon_font: &HFONT,
 ) {
     unsafe {
+        if hovered {
+            fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 8);
+        }
         draw_icon_glyph(
             hdc,
             icon_font,
@@ -5971,7 +5974,7 @@ fn draw_toolbar_icon_button(
                 right: rect.right - 1,
                 bottom: rect.bottom - 1,
             },
-            COLOR_TEXT,
+            if hovered { COLOR_TEXT } else { COLOR_MUTED },
         );
     }
 }
