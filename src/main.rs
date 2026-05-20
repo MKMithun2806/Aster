@@ -5075,7 +5075,7 @@ impl App {
                             self.set_sidebar_mode(SidebarMode::Overlay);
                         }
                     }
-                    if pt.y < HOVER_ZONE && pt.y >= 0 && pt.x >= 0 {
+                    if pt.y < HOVER_ZONE + 8 && pt.y >= 0 && pt.x >= 0 {
                         if self.topbar_mode == SidebarMode::Hidden && !self.animating_topbar {
                             self.topbar_expand_mode = SidebarMode::Overlay;
                             self.hovering_topbar = true;
