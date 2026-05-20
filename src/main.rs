@@ -798,15 +798,106 @@ impl App {
             .collect()
     }
 
+    fn get_virtual_folder_state(&self, folder_id: usize) -> (Option<usize>, bool) {
+        if let Some(drag) = self.drag_state {
+            if drag.active {
+                if let DragSource::Folder(from_id) = drag.source {
+                    if folder_id == from_id {
+                        let (parent_id, pinned) = match self.drop_target {
+                            Some(DropTarget::PinnedSection) => (None, true),
+                            Some(DropTarget::Folder(target_folder_id)) => {
+                                if target_folder_id == from_id || self.is_descendant_of(target_folder_id, from_id) {
+                                    if let Some(f) = self.folders.iter().find(|f| f.id == folder_id) {
+                                        (f.parent_id, f.pinned)
+                                    } else {
+                                        (None, false)
+                                    }
+                                } else {
+                                    let target_pinned = self.folders.iter().find(|f| f.id == target_folder_id).map(|f| f.pinned).unwrap_or(false);
+                                    (Some(target_folder_id), target_pinned)
+                                }
+                            }
+                            Some(DropTarget::Tab(target_tab_index)) => {
+                                let is_tab_pinned = self.tabs.get(target_tab_index).map(|t| t.pinned).unwrap_or(false);
+                                (None, is_tab_pinned)
+                            }
+                            _ => (None, false),
+                        };
+                        return (parent_id, pinned);
+                    }
+                }
+            }
+        }
+        if let Some(f) = self.folders.iter().find(|f| f.id == folder_id) {
+            (f.parent_id, f.pinned)
+        } else {
+            (None, false)
+        }
+    }
+
+    #[allow(dead_code)]
+    fn get_virtual_tab_pinned(&self, tab_index: usize) -> bool {
+        if let Some(tab) = self.tabs.get(tab_index) {
+            if let Some(fid) = tab.folder_id {
+                let (_, folder_pinned) = self.get_virtual_folder_state(fid);
+                return folder_pinned;
+            }
+            return tab.pinned;
+        }
+        false
+    }
+
+    fn is_tab_in_folder_subtree(&self, tab_index: usize, folder_id: usize) -> bool {
+        if let Some(tab) = self.tabs.get(tab_index) {
+            if let Some(fid) = tab.folder_id {
+                if fid == folder_id || self.is_descendant_of(fid, folder_id) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn get_folder_subtree_rows(&self, folder_id: usize) -> Vec<SidebarRow> {
+        let mut subtree = Vec::new();
+        subtree.push(SidebarRow::Folder(folder_id));
+        if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
+            if !folder.collapsed {
+                self.add_folder_rows_recursive(folder_id, &mut subtree);
+            }
+        }
+        subtree
+    }
+
+    fn is_preview_item(&self, row: SidebarRow) -> bool {
+        if let Some(drag) = self.drag_state {
+            if drag.active {
+                if let DragSource::Folder(from_folder_id) = drag.source {
+                    match row {
+                        SidebarRow::Folder(fid) => {
+                            return fid == from_folder_id || self.is_descendant_of(fid, from_folder_id);
+                        }
+                        SidebarRow::Tab(idx) => {
+                            return self.is_tab_in_folder_subtree(idx, from_folder_id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn folder_depth(&self, folder_id: usize) -> usize {
         let mut depth = 0;
         let mut current_id = folder_id;
         let mut visited = std::collections::HashSet::new();
-        while let Some(folder) = self.folders.iter().find(|f| f.id == current_id) {
+        while let Some(_folder) = self.folders.iter().find(|f| f.id == current_id) {
             if !visited.insert(current_id) {
                 break;
             }
-            if let Some(parent) = folder.parent_id {
+            let (parent_id, _) = self.get_virtual_folder_state(current_id);
+            if let Some(parent) = parent_id {
                 depth += 1;
                 current_id = parent;
             } else {
@@ -938,6 +1029,57 @@ impl App {
             .collect();
         unpinned_rows.extend(loose_tabs.into_iter().map(SidebarRow::Tab));
         rows.extend(unpinned_rows);
+
+        // If dragging a folder, modify rows list to show ghost preview at target position
+        if let Some(drag) = self.drag_state {
+            if drag.active {
+                if let DragSource::Folder(from_folder_id) = drag.source {
+                    // 1. Filter out the dragged folder and its descendants
+                    let subtree_rows = self.get_folder_subtree_rows(from_folder_id);
+                    let mut base_rows: Vec<SidebarRow> = rows
+                        .into_iter()
+                        .filter(|row| match *row {
+                            SidebarRow::Folder(fid) => fid != from_folder_id && !self.is_descendant_of(fid, from_folder_id),
+                            SidebarRow::Tab(idx) => !self.is_tab_in_folder_subtree(idx, from_folder_id),
+                            SidebarRow::Label(_) => true,
+                        })
+                        .collect();
+
+                    // 2. Find insertion index
+                    let insert_index = match self.drop_target {
+                        Some(DropTarget::PinnedSection) => {
+                            // Top of pinned section (index 0)
+                            0
+                        }
+                        Some(DropTarget::Folder(target_folder_id)) => {
+                            // Inside target folder: put it right after the folder header row
+                            base_rows.iter().position(|r| matches!(r, SidebarRow::Folder(fid) if *fid == target_folder_id))
+                                .map(|pos| pos + 1)
+                                .unwrap_or(0)
+                        }
+                        Some(DropTarget::Tab(target_tab_index)) => {
+                            // After the hovered tab
+                            base_rows.iter().position(|r| matches!(r, SidebarRow::Tab(idx) if *idx == target_tab_index))
+                                .map(|pos| pos + 1)
+                                .unwrap_or(0)
+                        }
+                        _ => {
+                            // Unpinned section fallback: after the divider (SidebarLabel::Tabs)
+                            base_rows.iter().position(|r| matches!(r, SidebarRow::Label(SidebarLabel::Tabs)))
+                                .map(|pos| pos + 1)
+                                .unwrap_or(base_rows.len())
+                        }
+                    };
+
+                    // 3. Insert the subtree at the computed index
+                    let insert_index = insert_index.min(base_rows.len());
+                    for (i, item) in subtree_rows.into_iter().enumerate() {
+                        base_rows.insert(insert_index + i, item);
+                    }
+                    rows = base_rows;
+                }
+            }
+        }
 
         rows
     }
@@ -3372,7 +3514,7 @@ impl App {
                 };
                 let mut favicon_drawn = false;
                 if let Some(index) = tab_index.and_then(|index| self.tabs.get(index)) {
-                    draw_tab_favicon(hdc, &self.fonts.small, favicon, index);
+                    draw_tab_favicon(hdc, &self.fonts.small, favicon, index, false);
                     favicon_drawn = true;
                 } else {
                     let host = display_host(&url);
@@ -3380,7 +3522,7 @@ impl App {
                         if let Some(matching_tab) = self.tabs.iter().find(|t| {
                             t.favicon_bitmap.is_some() && display_host(&t.url) == host
                         }) {
-                            draw_tab_favicon(hdc, &self.fonts.small, favicon, matching_tab);
+                            draw_tab_favicon(hdc, &self.fonts.small, favicon, matching_tab, false);
                             favicon_drawn = true;
                         }
                     }
@@ -3505,6 +3647,7 @@ impl App {
         let Some(folder) = self.folders.iter().find(|folder| folder.id == folder_id) else {
             return;
         };
+        let is_ghost = self.is_preview_item(SidebarRow::Folder(folder_id));
         let is_renaming = self.renaming_folder_id == Some(folder_id);
         let display_name = if is_renaming {
             if self.rename_selected {
@@ -3524,7 +3667,11 @@ impl App {
                 right: rect.right - 2,
                 bottom: rect.bottom - 2,
             };
-            if is_renaming {
+            let icon_color = if is_ghost { 0x555555 } else { COLOR_MUTED };
+            if is_ghost {
+                fill_round_rect(hdc, item, 0x0f0f0f, 8);
+                draw_outline(hdc, item, 0x333333, 8);
+            } else if is_renaming {
                 fill_round_rect(hdc, item, 0x242424, 8);
             } else if self.hover_folder == Some(folder_id) {
                 fill_round_rect(hdc, item, 0x151515, 8);
@@ -3545,7 +3692,7 @@ impl App {
                     right: item.left + icon_left + 18,
                     bottom: item.bottom,
                 },
-                COLOR_MUTED,
+                icon_color,
             );
             draw_icon_glyph(
                 hdc,
@@ -3557,7 +3704,7 @@ impl App {
                     right: item.left + 50,
                     bottom: item.bottom,
                 },
-                COLOR_MUTED,
+                icon_color,
             );
             if !is_renaming {
                 draw_text(
@@ -3570,7 +3717,7 @@ impl App {
                         right: item.right - 8,
                         bottom: item.bottom,
                     },
-                    COLOR_MUTED,
+                    icon_color,
                 );
             }
         }
@@ -3685,11 +3832,15 @@ impl App {
     fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab, item: RECT) {
         unsafe {
             let mut item = item;
+            let is_ghost = self.is_preview_item(SidebarRow::Tab(index));
             let depth = self.tab_depth(index);
             if depth > 0 {
                 item.left += (depth * 16) as i32;
             }
-            if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
+            if is_ghost {
+                fill_round_rect(hdc, item, 0x0f0f0f, 10);
+                draw_outline(hdc, item, 0x333333, 10);
+            } else if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
                 fill_round_rect(hdc, item, 0x151515, 10);
             }
             let text_left = item.left + 40;
@@ -3700,7 +3851,14 @@ impl App {
                 right: favicon_left + 18,
                 bottom: item.top + 29,
             };
-            draw_tab_favicon(hdc, &self.fonts.small, favicon, tab);
+            draw_tab_favicon(hdc, &self.fonts.small, favicon, tab, is_ghost);
+            let text_color = if is_ghost {
+                0x555555
+            } else if Some(index) == self.active_tab_index() {
+                COLOR_TEXT
+            } else {
+                COLOR_MUTED
+            };
             draw_text(
                 hdc,
                 &self.fonts.body,
@@ -3715,53 +3873,51 @@ impl App {
                     },
                     bottom: item.bottom,
                 },
-                if Some(index) == self.active_tab_index() {
-                    COLOR_TEXT
-                } else {
-                    COLOR_MUTED
-                },
+                text_color,
             );
-            if tab.audio_playing || tab.muted {
-                let audio_icon = if tab.muted {
-                    glyph(0xE74F)
-                } else {
-                    glyph(0xE767)
-                };
-                draw_icon_glyph(
-                    hdc,
-                    &self.fonts.toolbar_icon,
-                    audio_icon.as_str(),
-                    self.tab_audio_rect(item),
-                    if tab.muted { COLOR_MUTED } else { COLOR_TEXT },
-                );
-            }
-            if self.hover_tab == Some(index) {
-                let close_color = if self.hover_close == Some(index) {
-                    COLOR_TEXT
-                } else {
-                    COLOR_MUTED
-                };
-                let close_glyph = if tab.pinned {
-                    if tab.unloaded {
-                        glyph(0xE711)
+            if !is_ghost {
+                if tab.audio_playing || tab.muted {
+                    let audio_icon = if tab.muted {
+                        glyph(0xE74F)
                     } else {
-                        glyph(0xE108)
-                    }
-                } else {
-                    glyph(0xE711)
-                };
-                draw_icon_glyph(
-                    hdc,
-                    &self.fonts.icon,
-                    close_glyph.as_str(),
-                    RECT {
-                        left: item.right - 30,
-                        top: item.top,
-                        right: item.right - 8,
-                        bottom: item.bottom,
-                    },
-                    close_color,
-                );
+                        glyph(0xE767)
+                    };
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.toolbar_icon,
+                        audio_icon.as_str(),
+                        self.tab_audio_rect(item),
+                        if tab.muted { COLOR_MUTED } else { COLOR_TEXT },
+                    );
+                }
+                if self.hover_tab == Some(index) {
+                    let close_color = if self.hover_close == Some(index) {
+                        COLOR_TEXT
+                    } else {
+                        COLOR_MUTED
+                    };
+                    let close_glyph = if tab.pinned {
+                        if tab.unloaded {
+                            glyph(0xE711)
+                        } else {
+                            glyph(0xE108)
+                        }
+                    } else {
+                        glyph(0xE711)
+                    };
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.icon,
+                        close_glyph.as_str(),
+                        RECT {
+                            left: item.right - 30,
+                            top: item.top,
+                            right: item.right - 8,
+                            bottom: item.bottom,
+                        },
+                        close_color,
+                    );
+                }
             }
         }
     }
@@ -4763,7 +4919,7 @@ impl App {
                             right: favicon_left + 18,
                             bottom: 29,
                         };
-                        draw_tab_favicon(mem_dc, &self.fonts.small, favicon, tab);
+                        draw_tab_favicon(mem_dc, &self.fonts.small, favicon, tab, false);
                         draw_text(
                             mem_dc,
                             &self.fonts.body,
@@ -6482,9 +6638,9 @@ unsafe fn draw_icon_glyph(hdc: HDC, font: &HFONT, text: &str, mut rect: RECT, co
     let _ = SelectObject(hdc, old_font);
 }
 
-unsafe fn draw_tab_favicon(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab) {
+unsafe fn draw_tab_favicon(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab, dimmed: bool) {
     if let Some(favicon) = tab.favicon_bitmap.as_ref() {
-        draw_bitmap_fit(hdc, rect, favicon, false);
+        draw_bitmap_fit(hdc, rect, favicon, dimmed);
         return;
     }
     let host = display_host(&tab.url);
@@ -6498,7 +6654,8 @@ unsafe fn draw_tab_favicon(hdc: HDC, font: &HFONT, rect: RECT, tab: &Tab) {
         .find(|ch| ch.is_ascii_alphanumeric())
         .map(|ch| ch.to_ascii_uppercase().to_string())
         .unwrap_or_else(|| "A".to_string());
-    draw_centered_text(hdc, font, &letter, rect, COLOR_ACCENT);
+    let color = if dimmed { 0x555555 } else { COLOR_ACCENT };
+    draw_centered_text(hdc, font, &letter, rect, color);
 }
 
 unsafe fn draw_bitmap_fit(hdc: HDC, rect: RECT, bitmap: &FaviconBitmap, dimmed: bool) {
