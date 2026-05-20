@@ -4584,7 +4584,6 @@ impl App {
                 if from_index >= self.tabs.len() {
                     return;
                 }
-                let dragged_pinned = self.tabs[from_index].pinned;
                 let dragged_workspace = self.tabs[from_index].workspace_id;
 
                 match hit {
@@ -4614,9 +4613,6 @@ impl App {
                         if target_index == from_index {
                             return;
                         }
-                        if !dragged_pinned && self.tabs[target_index].pinned {
-                            return;
-                        }
                         let target_id = self.tabs[target_index].id;
                         let target_folder = self.tabs[target_index].folder_id;
                         let target_pinned = self.tabs[target_index].pinned;
@@ -4630,7 +4626,7 @@ impl App {
                             .iter()
                             .position(|candidate| candidate.id == target_id)
                             .unwrap_or_else(|| target_index.min(self.tabs.len()));
-                        self.tabs.insert(insert_at, tab);
+                        self.tabs.insert((insert_at + 1).min(self.tabs.len()), tab);
                         if let Some(new_active) = self.tabs.iter().position(|tab| tab.id == tab_id) {
                             self.active = new_active;
                         }
@@ -5075,7 +5071,7 @@ impl App {
                             self.set_sidebar_mode(SidebarMode::Overlay);
                         }
                     }
-                    if pt.y < HOVER_ZONE && pt.y >= 0 && pt.x >= 0 {
+                    if pt.y < HOVER_ZONE + 8 && pt.y >= 0 && pt.x >= 0 {
                         if self.topbar_mode == SidebarMode::Hidden && !self.animating_topbar {
                             self.topbar_expand_mode = SidebarMode::Overlay;
                             self.hovering_topbar = true;
@@ -6780,7 +6776,7 @@ fn render_aster_background_bitmap(width: i32, height: i32) -> Option<BackgroundB
     }
 
     let dot_step = (48.0 * scale).round().max(28.0) as i32;
-    let dot_radius = (0.9 * scale).max(0.7);
+    let dot_radius = (0.9 * scale).max(0.8);
     let mut y = (24.0 * scale) as i32;
     while y < height {
         let mut x = (24.0 * scale) as i32;
