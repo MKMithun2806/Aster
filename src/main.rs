@@ -872,15 +872,25 @@ impl App {
     fn is_preview_item(&self, row: SidebarRow) -> bool {
         if let Some(drag) = self.drag_state {
             if drag.active {
-                if let DragSource::Folder(from_folder_id) = drag.source {
-                    match row {
-                        SidebarRow::Folder(fid) => {
-                            return fid == from_folder_id || self.is_descendant_of(fid, from_folder_id);
+                match drag.source {
+                    DragSource::Folder(from_folder_id) => {
+                        match row {
+                            SidebarRow::Folder(fid) => {
+                                return fid == from_folder_id || self.is_descendant_of(fid, from_folder_id);
+                            }
+                            SidebarRow::Tab(idx) => {
+                                return self.is_tab_in_folder_subtree(idx, from_folder_id);
+                            }
+                            _ => {}
                         }
-                        SidebarRow::Tab(idx) => {
-                            return self.is_tab_in_folder_subtree(idx, from_folder_id);
+                    }
+                    DragSource::Tab(from_tab_index) => {
+                        match row {
+                            SidebarRow::Tab(idx) => {
+                                return idx == from_tab_index;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -908,6 +918,26 @@ impl App {
     }
 
     fn tab_depth(&self, index: usize) -> usize {
+        if let Some(drag) = self.drag_state {
+            if drag.active {
+                if let DragSource::Tab(from_index) = drag.source {
+                    if from_index == index {
+                        match self.drop_target {
+                            Some(DropTarget::PinnedSection) => return 0,
+                            Some(DropTarget::Folder(folder_id)) => {
+                                return self.folder_depth(folder_id) + 1;
+                            }
+                            Some(DropTarget::Tab(target_tab_index)) => {
+                                if target_tab_index != index {
+                                    return self.tab_depth(target_tab_index);
+                                }
+                            }
+                            _ => return 0,
+                        }
+                    }
+                }
+            }
+        }
         if let Some(tab) = self.tabs.get(index) {
             if let Some(folder_id) = tab.folder_id {
                 return self.folder_depth(folder_id) + 1;
@@ -1030,53 +1060,96 @@ impl App {
         unpinned_rows.extend(loose_tabs.into_iter().map(SidebarRow::Tab));
         rows.extend(unpinned_rows);
 
-        // If dragging a folder, modify rows list to show ghost preview at target position
+        // If dragging a folder or a tab, modify rows list to show ghost preview at target position
         if let Some(drag) = self.drag_state {
             if drag.active {
-                if let DragSource::Folder(from_folder_id) = drag.source {
-                    // 1. Filter out the dragged folder and its descendants
-                    let subtree_rows = self.get_folder_subtree_rows(from_folder_id);
-                    let mut base_rows: Vec<SidebarRow> = rows
-                        .into_iter()
-                        .filter(|row| match *row {
-                            SidebarRow::Folder(fid) => fid != from_folder_id && !self.is_descendant_of(fid, from_folder_id),
-                            SidebarRow::Tab(idx) => !self.is_tab_in_folder_subtree(idx, from_folder_id),
-                            SidebarRow::Label(_) => true,
-                        })
-                        .collect();
+                match drag.source {
+                    DragSource::Folder(from_folder_id) => {
+                        // 1. Filter out the dragged folder and its descendants
+                        let subtree_rows = self.get_folder_subtree_rows(from_folder_id);
+                        let mut base_rows: Vec<SidebarRow> = rows
+                            .into_iter()
+                            .filter(|row| match *row {
+                                SidebarRow::Folder(fid) => fid != from_folder_id && !self.is_descendant_of(fid, from_folder_id),
+                                SidebarRow::Tab(idx) => !self.is_tab_in_folder_subtree(idx, from_folder_id),
+                                SidebarRow::Label(_) => true,
+                            })
+                            .collect();
 
-                    // 2. Find insertion index
-                    let insert_index = match self.drop_target {
-                        Some(DropTarget::PinnedSection) => {
-                            // Top of pinned section (index 0)
-                            0
-                        }
-                        Some(DropTarget::Folder(target_folder_id)) => {
-                            // Inside target folder: put it right after the folder header row
-                            base_rows.iter().position(|r| matches!(r, SidebarRow::Folder(fid) if *fid == target_folder_id))
-                                .map(|pos| pos + 1)
-                                .unwrap_or(0)
-                        }
-                        Some(DropTarget::Tab(target_tab_index)) => {
-                            // After the hovered tab
-                            base_rows.iter().position(|r| matches!(r, SidebarRow::Tab(idx) if *idx == target_tab_index))
-                                .map(|pos| pos + 1)
-                                .unwrap_or(0)
-                        }
-                        _ => {
-                            // Unpinned section fallback: after the divider (SidebarLabel::Tabs)
-                            base_rows.iter().position(|r| matches!(r, SidebarRow::Label(SidebarLabel::Tabs)))
-                                .map(|pos| pos + 1)
-                                .unwrap_or(base_rows.len())
-                        }
-                    };
+                        // 2. Find insertion index
+                        let insert_index = match self.drop_target {
+                            Some(DropTarget::PinnedSection) => {
+                                // Top of pinned section (index 0)
+                                0
+                            }
+                            Some(DropTarget::Folder(target_folder_id)) => {
+                                // Inside target folder: put it right after the folder header row
+                                base_rows.iter().position(|r| matches!(r, SidebarRow::Folder(fid) if *fid == target_folder_id))
+                                    .map(|pos| pos + 1)
+                                    .unwrap_or(0)
+                            }
+                            Some(DropTarget::Tab(target_tab_index)) => {
+                                // After the hovered tab
+                                base_rows.iter().position(|r| matches!(r, SidebarRow::Tab(idx) if *idx == target_tab_index))
+                                    .map(|pos| pos + 1)
+                                    .unwrap_or(0)
+                            }
+                            _ => {
+                                // Unpinned section fallback: after the divider (SidebarLabel::Tabs)
+                                base_rows.iter().position(|r| matches!(r, SidebarRow::Label(SidebarLabel::Tabs)))
+                                    .map(|pos| pos + 1)
+                                    .unwrap_or(base_rows.len())
+                            }
+                        };
 
-                    // 3. Insert the subtree at the computed index
-                    let insert_index = insert_index.min(base_rows.len());
-                    for (i, item) in subtree_rows.into_iter().enumerate() {
-                        base_rows.insert(insert_index + i, item);
+                        // 3. Insert the subtree at the computed index
+                        let insert_index = insert_index.min(base_rows.len());
+                        for (i, item) in subtree_rows.into_iter().enumerate() {
+                            base_rows.insert(insert_index + i, item);
+                        }
+                        rows = base_rows;
                     }
-                    rows = base_rows;
+                    DragSource::Tab(from_tab_index) => {
+                        // 1. Filter out the dragged tab
+                        let mut base_rows: Vec<SidebarRow> = rows
+                            .into_iter()
+                            .filter(|row| match *row {
+                                SidebarRow::Tab(idx) => idx != from_tab_index,
+                                _ => true,
+                            })
+                            .collect();
+
+                        // 2. Find insertion index
+                        let insert_index = match self.drop_target {
+                            Some(DropTarget::PinnedSection) => {
+                                // Top of pinned section (index 0)
+                                0
+                            }
+                            Some(DropTarget::Folder(target_folder_id)) => {
+                                // Inside target folder: put it right after the folder header row
+                                base_rows.iter().position(|r| matches!(r, SidebarRow::Folder(fid) if *fid == target_folder_id))
+                                    .map(|pos| pos + 1)
+                                    .unwrap_or(0)
+                            }
+                            Some(DropTarget::Tab(target_tab_index)) => {
+                                // After the hovered tab
+                                base_rows.iter().position(|r| matches!(r, SidebarRow::Tab(idx) if *idx == target_tab_index))
+                                    .map(|pos| pos + 1)
+                                    .unwrap_or(0)
+                            }
+                            _ => {
+                                // Unpinned section fallback: after the divider (SidebarLabel::Tabs)
+                                base_rows.iter().position(|r| matches!(r, SidebarRow::Label(SidebarLabel::Tabs)))
+                                    .map(|pos| pos + 1)
+                                    .unwrap_or(base_rows.len())
+                            }
+                        };
+
+                        // 3. Insert the tab at the computed index
+                        let insert_index = insert_index.min(base_rows.len());
+                        base_rows.insert(insert_index, SidebarRow::Tab(from_tab_index));
+                        rows = base_rows;
+                    }
                 }
             }
         }
@@ -4549,6 +4622,7 @@ impl App {
         let old_target = self.hover_target;
         let old_mode_menu = self.mode_menu_open;
         let old_hovering = self.hovering_sidebar;
+        let old_drop_target = self.drop_target;
         self.hover_close = None;
         self.hover_tab = None;
         self.hover_folder = None;
@@ -4644,7 +4718,8 @@ impl App {
                 || old_folder != self.hover_folder
                 || old_target != self.hover_target
                 || old_mode_menu != self.mode_menu_open
-                || old_hovering != self.hovering_sidebar)
+                || old_hovering != self.hovering_sidebar
+                || old_drop_target != self.drop_target)
         {
             self.refresh();
         }
