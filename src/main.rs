@@ -8142,7 +8142,7 @@ fn render_download_popup_pixels(
 ) -> Vec<u8> {
     let mut pixels = vec![0u8; (size * size * 4) as usize];
     let center = size as f32 / 2.0;
-    let radius = size as f32 * 0.43;
+    let radius = size as f32 * 0.5;
 
     draw_aa_filled_circle(&mut pixels, size, center, center, radius, COLOR_PANEL_2, 1.0);
     draw_aa_ring(&mut pixels, size, center, center, radius - 0.7, 1.35, 0x565656, 1.0);
