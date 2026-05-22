@@ -2147,7 +2147,7 @@ impl App {
             if point_in_rect(x, y, open) {
                 return Some(DownloadAction::ShowInFolder(download.id));
             }
-            if point_in_rect(x, y, pause) {
+            if download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS && point_in_rect(x, y, pause) {
                 return Some(DownloadAction::TogglePause(download.id));
             }
             top += 58;
@@ -4200,6 +4200,7 @@ impl App {
                     right: row.right - 28,
                     bottom: row.top + 26,
                 };
+                let show_pause = download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
                 let pause = RECT {
                     left: row.right - 78,
                     top: row.top + 4,
@@ -4214,7 +4215,7 @@ impl App {
                     RECT {
                         left: row.left + 2,
                         top: row.top,
-                        right: pause.left - 8,
+                        right: if show_pause { pause.left - 8 } else { open.left - 8 },
                         bottom: row.top + 24,
                     },
                     COLOR_TEXT,
@@ -4268,18 +4269,20 @@ impl App {
                     COLOR_MUTED,
                 );
 
-                let pause_icon = if download.paused {
-                    glyph(0xE768)
-                } else {
-                    glyph(0xE769)
-                };
-                draw_icon_glyph(
-                    hdc,
-                    &self.fonts.icon,
-                    pause_icon.as_str(),
-                    pause,
-                    COLOR_MUTED,
-                );
+                if show_pause {
+                    let pause_icon = if download.paused {
+                        glyph(0xE768)
+                    } else {
+                        glyph(0xE769)
+                    };
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.icon,
+                        pause_icon.as_str(),
+                        pause,
+                        COLOR_MUTED,
+                    );
+                }
 
                 draw_icon_glyph(
                     hdc,
