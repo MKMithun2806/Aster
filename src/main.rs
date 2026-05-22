@@ -348,6 +348,9 @@ enum HoverTarget {
     ModeLight,
     DownloadIndicator(usize),
     DownloadOverflow,
+    DownloadCancel(usize),
+    DownloadPause(usize),
+    DownloadOpen(usize),
     MinButton,
     MaxButton,
     CloseButton,
@@ -4281,15 +4284,23 @@ impl App {
                 } else {
                     glyph(0xE711)
                 };
+                let cancel_hover = self.hover_target == Some(HoverTarget::DownloadCancel(download.id));
+                if cancel_hover {
+                    fill_round_rect(hdc, cancel, COLOR_SURFACE_HOVER, 6);
+                }
                 draw_icon_glyph(
                     hdc,
                     &self.fonts.icon,
                     cancel_glyph.as_str(),
                     cancel,
-                    COLOR_MUTED,
+                    if cancel_hover { COLOR_TEXT } else { COLOR_MUTED },
                 );
 
                 if show_pause {
+                    let pause_hover = self.hover_target == Some(HoverTarget::DownloadPause(download.id));
+                    if pause_hover {
+                        fill_round_rect(hdc, pause, COLOR_SURFACE_HOVER, 6);
+                    }
                     let pause_icon = if download.paused {
                         glyph(0xE768)
                     } else {
@@ -4300,16 +4311,20 @@ impl App {
                         &self.fonts.icon,
                         pause_icon.as_str(),
                         pause,
-                        COLOR_MUTED,
+                        if pause_hover { COLOR_TEXT } else { COLOR_MUTED },
                     );
                 }
 
+                let open_hover = self.hover_target == Some(HoverTarget::DownloadOpen(download.id));
+                if open_hover {
+                    fill_round_rect(hdc, open, COLOR_SURFACE_HOVER, 6);
+                }
                 draw_icon_glyph(
                     hdc,
                     &self.fonts.icon,
                     glyph(0xE838).as_str(),
                     open,
-                    COLOR_MUTED,
+                    if open_hover { COLOR_TEXT } else { COLOR_MUTED },
                 );
 
                 if index + 1 < rows.len() {
@@ -5527,53 +5542,100 @@ impl App {
         self.hovering_sidebar = in_sidebar_hover_zone;
 
         let (min_btn, max_btn, close_btn) = self.window_button_rects();
-        if point_in_rect(x, y, self.logo_rect()) {
-            self.hover_target = Some(HoverTarget::Logo);
-        } else if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
-            self.hover_target = Some(HoverTarget::NewTab);
-        } else if point_in_rect(x, y, min_btn) {
-            self.hover_target = Some(HoverTarget::MinButton);
-        } else if point_in_rect(x, y, max_btn) {
-            self.hover_target = Some(HoverTarget::MaxButton);
-        } else if point_in_rect(x, y, close_btn) {
-            self.hover_target = Some(HoverTarget::CloseButton);
-        } else {
-            let (back, forward, reload) = self.top_button_rects();
-            if point_in_rect(x, y, back) {
-                self.hover_target = Some(HoverTarget::Back);
-            } else if point_in_rect(x, y, forward) {
-                self.hover_target = Some(HoverTarget::Forward);
-            } else if point_in_rect(x, y, reload) {
-                self.hover_target = Some(HoverTarget::Reload);
-            } else if point_in_rect(x, y, self.address_pill_rect()) {
-                self.hover_target = Some(HoverTarget::Address);
-            } else if point_in_rect(x, y, self.settings_rect()) {
-                self.hover_target = Some(HoverTarget::Settings);
-            } else if let Some((target, _)) = self
-                .download_indicator_rects()
-                .into_iter()
-                .find(|(_, rect)| point_in_rect(x, y, *rect))
-            {
-                self.hover_target = match target {
-                    Some(id) => Some(HoverTarget::DownloadIndicator(id)),
-                    None => Some(HoverTarget::DownloadOverflow),
-                };
-            } else if self.settings_open && point_in_rect(x, y, self.mode_row_rect()) {
-                self.hover_target = Some(HoverTarget::ModeRow);
-                self.mode_menu_open = true;
-            } else if self.settings_open
-                && self.mode_menu_open
-                && point_in_rect(x, y, self.mode_options_rect())
-            {
-                let options = self.mode_options_rect();
-                let local_y = y - options.top - 8;
-                if local_y >= 0 {
-                    self.hover_target = match local_y / 34 {
-                        0 => Some(HoverTarget::ModeAuto),
-                        1 => Some(HoverTarget::ModeDark),
-                        2 => Some(HoverTarget::ModeLight),
-                        _ => None,
+
+        if self.download_panel.is_some() {
+            if let Some(panel) = self.download_panel_rect() {
+                let mut top = panel.top + 9;
+                for download in self.download_panel_rows() {
+                    let row = RECT {
+                        left: panel.left + 12,
+                        top,
+                        right: panel.right - 12,
+                        bottom: top + 50,
                     };
+                    let cancel = RECT {
+                        left: row.right - 22,
+                        top: row.top + 4,
+                        right: row.right,
+                        bottom: row.top + 26,
+                    };
+                    let open = RECT {
+                        left: row.right - 50,
+                        top: row.top + 4,
+                        right: row.right - 28,
+                        bottom: row.top + 26,
+                    };
+                    let show_pause = download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+                    let pause = RECT {
+                        left: row.right - 78,
+                        top: row.top + 4,
+                        right: row.right - 56,
+                        bottom: row.top + 26,
+                    };
+                    if point_in_rect(x, y, cancel) {
+                        self.hover_target = Some(HoverTarget::DownloadCancel(download.id));
+                        break;
+                    } else if point_in_rect(x, y, open) {
+                        self.hover_target = Some(HoverTarget::DownloadOpen(download.id));
+                        break;
+                    } else if show_pause && point_in_rect(x, y, pause) {
+                        self.hover_target = Some(HoverTarget::DownloadPause(download.id));
+                        break;
+                    }
+                    top += 58;
+                }
+            }
+        }
+
+        if self.hover_target.is_none() {
+            if point_in_rect(x, y, self.logo_rect()) {
+                self.hover_target = Some(HoverTarget::Logo);
+            } else if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
+                self.hover_target = Some(HoverTarget::NewTab);
+            } else if point_in_rect(x, y, min_btn) {
+                self.hover_target = Some(HoverTarget::MinButton);
+            } else if point_in_rect(x, y, max_btn) {
+                self.hover_target = Some(HoverTarget::MaxButton);
+            } else if point_in_rect(x, y, close_btn) {
+                self.hover_target = Some(HoverTarget::CloseButton);
+            } else {
+                let (back, forward, reload) = self.top_button_rects();
+                if point_in_rect(x, y, back) {
+                    self.hover_target = Some(HoverTarget::Back);
+                } else if point_in_rect(x, y, forward) {
+                    self.hover_target = Some(HoverTarget::Forward);
+                } else if point_in_rect(x, y, reload) {
+                    self.hover_target = Some(HoverTarget::Reload);
+                } else if point_in_rect(x, y, self.address_pill_rect()) {
+                    self.hover_target = Some(HoverTarget::Address);
+                } else if point_in_rect(x, y, self.settings_rect()) {
+                    self.hover_target = Some(HoverTarget::Settings);
+                } else if let Some((target, _)) = self
+                    .download_indicator_rects()
+                    .into_iter()
+                    .find(|(_, rect)| point_in_rect(x, y, *rect))
+                {
+                    self.hover_target = match target {
+                        Some(id) => Some(HoverTarget::DownloadIndicator(id)),
+                        None => Some(HoverTarget::DownloadOverflow),
+                    };
+                } else if self.settings_open && point_in_rect(x, y, self.mode_row_rect()) {
+                    self.hover_target = Some(HoverTarget::ModeRow);
+                    self.mode_menu_open = true;
+                } else if self.settings_open
+                    && self.mode_menu_open
+                    && point_in_rect(x, y, self.mode_options_rect())
+                {
+                    let options = self.mode_options_rect();
+                    let local_y = y - options.top - 8;
+                    if local_y >= 0 {
+                        self.hover_target = match local_y / 34 {
+                            0 => Some(HoverTarget::ModeAuto),
+                            1 => Some(HoverTarget::ModeDark),
+                            2 => Some(HoverTarget::ModeLight),
+                            _ => None,
+                        };
+                    }
                 }
             }
         }
