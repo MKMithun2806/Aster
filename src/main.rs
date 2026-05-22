@@ -2089,12 +2089,11 @@ impl App {
             Some(DownloadPanelMode::All) => self.downloads.len(),
             None => 0,
         };
-        let width = if rows > 1 { 336 } else { 248 };
-        let height = 18 + rows as i32 * 66;
+        let height = 18 + rows as i32 * 58;
         Some(RECT {
             left: 12,
             top: (settings.top - height - 12).max(self.topbar_pushed_height() + 70),
-            right: (12 + width).max(self.sidebar_width() - 12),
+            right: self.sidebar_width() - 12,
             bottom: settings.top - 12,
         })
     }
@@ -2122,25 +2121,25 @@ impl App {
                 left: panel.left + 12,
                 top,
                 right: panel.right - 12,
-                bottom: top + 58,
+                bottom: top + 50,
             };
             let cancel = RECT {
-                left: row.right - 30,
-                top: row.top + 8,
-                right: row.right - 8,
-                bottom: row.top + 30,
+                left: row.right - 22,
+                top: row.top + 4,
+                right: row.right,
+                bottom: row.top + 26,
             };
             let open = RECT {
-                left: row.right - 58,
-                top: row.bottom - 24,
-                right: row.right - 8,
-                bottom: row.bottom - 4,
+                left: row.right - 50,
+                top: row.top + 4,
+                right: row.right - 28,
+                bottom: row.top + 26,
             };
             let pause = RECT {
-                left: row.left + 8,
-                top: row.bottom - 24,
-                right: row.left + 78,
-                bottom: row.bottom - 4,
+                left: row.right - 78,
+                top: row.top + 4,
+                right: row.right - 56,
+                bottom: row.top + 26,
             };
             if point_in_rect(x, y, cancel) {
                 return Some(DownloadAction::Cancel(download.id));
@@ -2151,7 +2150,7 @@ impl App {
             if point_in_rect(x, y, pause) {
                 return Some(DownloadAction::TogglePause(download.id));
             }
-            top += 66;
+            top += 58;
         }
         None
     }
@@ -4129,7 +4128,7 @@ impl App {
                         }
                     }
                     None => {
-                        let extra = self.downloads.len();
+                        let extra = self.downloads.len().saturating_sub(3);
                         self.paint_download_overflow(hdc, rect, extra);
                     }
                 }
@@ -4187,7 +4186,25 @@ impl App {
                     left: panel.left + 12,
                     top,
                     right: panel.right - 12,
-                    bottom: top + 58,
+                    bottom: top + 50,
+                };
+                let cancel = RECT {
+                    left: row.right - 22,
+                    top: row.top + 4,
+                    right: row.right,
+                    bottom: row.top + 26,
+                };
+                let open = RECT {
+                    left: row.right - 50,
+                    top: row.top + 4,
+                    right: row.right - 28,
+                    bottom: row.top + 26,
+                };
+                let pause = RECT {
+                    left: row.right - 78,
+                    top: row.top + 4,
+                    right: row.right - 56,
+                    bottom: row.top + 26,
                 };
 
                 draw_text(
@@ -4195,10 +4212,10 @@ impl App {
                     &self.fonts.body,
                     &download.file_name,
                     RECT {
-                        left: row.left + 10,
-                        top: row.top + 6,
-                        right: row.right - 42,
-                        bottom: row.top + 28,
+                        left: row.left + 2,
+                        top: row.top,
+                        right: pause.left - 8,
+                        bottom: row.top + 24,
                     },
                     COLOR_TEXT,
                 );
@@ -4218,18 +4235,18 @@ impl App {
                     &self.fonts.small,
                     &format!("{}  {}", size_label, state_label),
                     RECT {
-                        left: row.left + 10,
-                        top: row.top + 28,
-                        right: row.right - 10,
-                        bottom: row.top + 48,
+                        left: row.left + 2,
+                        top: row.top + 22,
+                        right: row.right - 2,
+                        bottom: row.top + 42,
                     },
                     COLOR_MUTED,
                 );
 
                 let progress_track = RECT {
-                    left: row.left + 10,
+                    left: row.left + 2,
                     top: row.bottom - 3,
-                    right: row.right - 10,
+                    right: row.right - 2,
                     bottom: row.bottom - 1,
                 };
                 fill_rect(hdc, progress_track, 0x262626);
@@ -4243,12 +4260,6 @@ impl App {
                 };
                 fill_rect(hdc, filled, COLOR_ACCENT);
 
-                let cancel = RECT {
-                    left: row.right - 30,
-                    top: row.top + 8,
-                    right: row.right - 8,
-                    bottom: row.top + 30,
-                };
                 draw_icon_glyph(
                     hdc,
                     &self.fonts.small,
@@ -4257,13 +4268,6 @@ impl App {
                     COLOR_MUTED,
                 );
 
-                let pause = RECT {
-                    left: row.left + 8,
-                    top: row.bottom - 24,
-                    right: row.left + 78,
-                    bottom: row.bottom - 4,
-                };
-                fill_round_rect(hdc, pause, 0x181818, 7);
                 let pause_icon = if download.paused {
                     glyph(0xE768)
                 } else {
@@ -4273,34 +4277,10 @@ impl App {
                     hdc,
                     &self.fonts.small,
                     pause_icon.as_str(),
-                    RECT {
-                        left: pause.left + 2,
-                        top: pause.top,
-                        right: pause.left + 24,
-                        bottom: pause.bottom,
-                    },
+                    pause,
                     COLOR_MUTED,
                 );
-                draw_text(
-                    hdc,
-                    &self.fonts.small,
-                    if download.paused { "Resume" } else { "Pause" },
-                    RECT {
-                        left: pause.left + 24,
-                        top: pause.top,
-                        right: pause.right - 6,
-                        bottom: pause.bottom,
-                    },
-                    COLOR_TEXT,
-                );
 
-                let open = RECT {
-                    left: row.right - 58,
-                    top: row.bottom - 24,
-                    right: row.right - 8,
-                    bottom: row.bottom - 4,
-                };
-                fill_round_rect(hdc, open, 0x181818, 7);
                 draw_icon_glyph(
                     hdc,
                     &self.fonts.small,
@@ -4321,7 +4301,7 @@ impl App {
                         0x242424,
                     );
                 }
-                top += 66;
+                top += 58;
             }
         }
     }
@@ -7632,7 +7612,7 @@ fn render_download_indicator_pixels(
         center,
         center,
         radius - 0.7,
-        2.1,
+        1.8,
         progress.clamp(0.0, 1.0),
         COLOR_ACCENT,
         1.0,
@@ -7690,14 +7670,14 @@ fn render_download_indicator_pixels(
     }
 
     if tick_alpha > 0.02 {
-        let stroke = size as f32 * 0.08;
+        let stroke = size as f32 * 0.058;
         draw_aa_line(
             &mut pixels,
             size,
-            size as f32 * 0.30,
-            size as f32 * 0.52,
-            size as f32 * 0.44,
-            size as f32 * 0.66,
+            size as f32 * 0.33,
+            size as f32 * 0.53,
+            size as f32 * 0.45,
+            size as f32 * 0.64,
             stroke,
             COLOR_MUTED,
             tick_alpha,
@@ -7705,10 +7685,10 @@ fn render_download_indicator_pixels(
         draw_aa_line(
             &mut pixels,
             size,
-            size as f32 * 0.44,
-            size as f32 * 0.66,
-            size as f32 * 0.72,
-            size as f32 * 0.34,
+            size as f32 * 0.45,
+            size as f32 * 0.64,
+            size as f32 * 0.69,
+            size as f32 * 0.38,
             stroke,
             COLOR_MUTED,
             tick_alpha,
