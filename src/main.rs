@@ -1953,7 +1953,7 @@ impl App {
                     let _ = WindowsAndMessaging::SetWindowPos(
                         self.download_popup_hwnd,
                         Some(HWND_TOP),
-                        62,
+                        93,
                         rect.bottom - 52,
                         32,
                         32,
@@ -2073,7 +2073,7 @@ impl App {
                             let _ = WindowsAndMessaging::SetWindowPos(
                                 self.download_popup_hwnd,
                                 Some(HWND_TOP),
-                                (62.0 + toast.slide_x) as i32,
+                                (93.0 + toast.slide_x) as i32,
                                 rect.bottom - 52,
                                 32,
                                 32,
@@ -3660,7 +3660,7 @@ impl App {
                     let _ = WindowsAndMessaging::SetWindowPos(
                         self.download_popup_hwnd,
                         Some(HWND_TOP),
-                        (62.0 + toast.slide_x) as i32,
+                        (93.0 + toast.slide_x) as i32,
                         rect.bottom - 52,
                         32,
                         32,
