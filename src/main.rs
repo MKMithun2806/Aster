@@ -7902,6 +7902,9 @@ unsafe fn draw_download_popup(
     elapsed_ms: u64,
 ) {
     let display_size = (rect.right - rect.left).min(rect.bottom - rect.top).max(1);
+    let bg_brush = solid_brush(COLOR_PANEL_2);
+    let _ = FillRect(hdc, &rect, bg_brush);
+    let _ = DeleteObject(HGDIOBJ(bg_brush.0));
     let render_size = display_size * 3;
     let pixels = render_download_popup_pixels(render_size, elapsed_ms);
     if let Some(bitmap) = create_bgra_bitmap(render_size, render_size, &pixels) {
