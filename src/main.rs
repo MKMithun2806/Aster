@@ -7296,7 +7296,7 @@ unsafe extern "system" fn download_popup_proc(
                         let elapsed = toast.start_time.elapsed().as_millis();
                         if elapsed < 3000 || toast.fading {
                             let rect = client_rect(hwnd);
-                            draw_download_toast_gdi(hdc, rect, elapsed as u64, 1.0);
+                            draw_download_popup_gdi(hdc, rect, elapsed as u64);
                         }
                     }
                 });
@@ -7916,6 +7916,70 @@ unsafe fn draw_download_indicator(
             let _ = AlphaBlend(
                 hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend,
             );
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteDC(mem_dc);
+        }
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+    }
+}
+
+unsafe fn draw_download_popup_gdi(
+    hdc: HDC,
+    rect: RECT,
+    elapsed_ms: u64,
+) {
+    let size = (rect.right - rect.left).min(rect.bottom - rect.top);
+    if size <= 0 { return; }
+    let radius = size / 2;
+
+    fill_round_rect(hdc, rect, COLOR_PANEL_2, radius);
+
+    let cx = rect.left + radius;
+    let cy = rect.top + radius;
+    let ring_r = (size as f32 * 0.38) as i32;
+    let ring_w = 3i32;
+
+    let t = (elapsed_ms % 1200) as f32 / 1200.0;
+    let rotation = t * std::f32::consts::TAU;
+
+    let sweep_start = rotation;
+    let sweep_end = sweep_start + std::f32::consts::TAU * 0.75;
+    let steps = 36;
+    for i in 0..steps {
+        let angle = sweep_start + (i as f32 / steps as f32) * (sweep_end - sweep_start);
+        let x = cx + (ring_r as f32 * angle.cos()) as i32;
+        let y = cy + (ring_r as f32 * angle.sin()) as i32;
+        fill_round_rect(
+            hdc,
+            RECT {
+                left: x - ring_w / 2,
+                top: y - ring_w / 2,
+                right: x + ring_w / 2 + 1,
+                bottom: y + ring_w / 2 + 1,
+            },
+            0xf16f63,
+            ring_w / 2,
+        );
+    }
+
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+    let center = size as f32 / 2.0;
+    let stroke = size as f32 * 0.065;
+    draw_aa_line(&mut pixels, size, center, size as f32 * 0.27, center, size as f32 * 0.62, stroke, COLOR_MUTED, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.36, size as f32 * 0.50, center, size as f32 * 0.64, stroke, COLOR_MUTED, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.64, size as f32 * 0.50, center, size as f32 * 0.64, stroke, COLOR_MUTED, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.34, size as f32 * 0.72, size as f32 * 0.66, size as f32 * 0.72, stroke, COLOR_MUTED, 0.75);
+    if let Some(bitmap) = create_bgra_bitmap(size, size, &pixels) {
+        let mem_dc = CreateCompatibleDC(Some(hdc));
+        if !mem_dc.is_invalid() {
+            let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = AlphaBlend(hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend);
             let _ = SelectObject(mem_dc, old);
             let _ = DeleteDC(mem_dc);
         }
