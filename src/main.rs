@@ -2056,7 +2056,7 @@ impl App {
                 let elapsed = toast.start_time.elapsed().as_millis();
                 if elapsed >= 200 {
                     let slide_elapsed = elapsed - 200;
-                    let slide_duration: u128 = 320;
+                    let slide_duration: u128 = 400;
                     if slide_elapsed >= slide_duration {
                         if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
                             unsafe {
