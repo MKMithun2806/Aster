@@ -2067,7 +2067,7 @@ impl App {
                     } else {
                         let t = slide_elapsed as f32 / slide_duration as f32;
                         let ease = 1.0 - (1.0 - t) * (1.0 - t);
-                        toast.slide_x = -94.0 * ease;
+                        toast.slide_x = -125.0 * ease;
                         let rect = client_rect(self.hwnd);
                         unsafe {
                             let _ = WindowsAndMessaging::SetWindowPos(
