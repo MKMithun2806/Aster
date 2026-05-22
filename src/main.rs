@@ -62,6 +62,7 @@ const APP_NAME: PCWSTR = w!("Aster");
 const CLASS_NAME: PCWSTR = w!("AsterWindow");
 const ADDRESS_ID: i32 = 1001;
 const COMMAND_POPUP_ID: i32 = 1002;
+const DOWNLOAD_POPUP_ID: i32 = 1003;
 const DEFAULT_URL: &str = "https://www.google.com";
 const SIDEBAR_EXPANDED: f32 = 248.0;
 const SIDEBAR_HIDDEN: f32 = 0.0;
@@ -113,6 +114,7 @@ static mut OLD_ADDRESS_PROC: WNDPROC = None;
 static mut OLD_COMMAND_POPUP_PROC: WNDPROC = None;
 static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
 static mut OLD_OVERLAY_MENU_PROC: WNDPROC = None;
+static mut OLD_DOWNLOAD_POPUP_PROC: WNDPROC = None;
 static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
 static mut CURRENT_DRAG_GHOST_BITMAP: Option<HBITMAP> = None;
 
@@ -392,6 +394,11 @@ struct DownloadSnapshot {
     state: COREWEBVIEW2_DOWNLOAD_STATE,
 }
 
+struct DownloadToastState {
+    start_time: std::time::Instant,
+    fading: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarMode {
     Hidden,
@@ -547,9 +554,11 @@ struct App {
     closed_tabs: Vec<ClosedTab>,
     downloads: Vec<DownloadItem>,
     next_download_id: usize,
+    download_toast: Option<DownloadToastState>,
     download_panel: Option<DownloadPanelMode>,
     download_panel_reveal: f32,
     download_panel_reveal_target: f32,
+    download_popup_hwnd: HWND,
 }
 
 struct DragGhost {
@@ -592,6 +601,7 @@ impl App {
         let address_hwnd = create_address_bar(hwnd)?;
         let command_hwnd = create_command_popup(hwnd)?;
         let overlay_menu_hwnd = create_overlay_menu(hwnd)?;
+        let download_popup_hwnd = create_download_popup(hwnd)?;
         unsafe {
             let _ = WindowsAndMessaging::SendMessageW(
                 address_hwnd,
@@ -675,9 +685,11 @@ impl App {
             has_typed: false,
             downloads: Vec::new(),
             next_download_id: 1,
+            download_toast: None,
             download_panel: None,
             download_panel_reveal: 0.0,
             download_panel_reveal_target: 0.0,
+            download_popup_hwnd,
         };
         app.load_state()?;
         unsafe {
@@ -1928,6 +1940,26 @@ impl App {
             completed_at: None,
             operation: Some(operation),
         });
+        if self.sidebar_width() <= 92 {
+            self.download_toast = Some(DownloadToastState {
+                start_time: std::time::Instant::now(),
+                fading: false,
+            });
+            if self.sidebar_width() < 1 && self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let rect = client_rect(self.hwnd);
+                unsafe {
+                    let _ = WindowsAndMessaging::SetWindowPos(
+                        self.download_popup_hwnd,
+                        Some(HWND_TOP),
+                        62,
+                        rect.bottom - 52,
+                        32,
+                        32,
+                        WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
         self.ensure_download_timer();
         self.refresh();
         id
@@ -2007,6 +2039,28 @@ impl App {
         self.refresh();
     }
 
+    fn tick_download_toast(&mut self) {
+        if let Some(toast) = &self.download_toast {
+            if toast.fading {
+                if self.sidebar_width >= SIDEBAR_EXPANDED {
+                    if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
+                        unsafe {
+                            let _ = WindowsAndMessaging::ShowWindow(self.download_popup_hwnd, WindowsAndMessaging::SW_HIDE);
+                        }
+                    }
+                    self.download_toast = None;
+                }
+            } else if toast.start_time.elapsed().as_millis() >= 3000 {
+                if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
+                    unsafe {
+                        let _ = WindowsAndMessaging::ShowWindow(self.download_popup_hwnd, WindowsAndMessaging::SW_HIDE);
+                    }
+                }
+                self.download_toast = None;
+            }
+        }
+    }
+
     fn tick_download_panel_animation(&mut self) {
         if self.download_panel.is_none() {
             return;
@@ -2027,6 +2081,7 @@ impl App {
         let panel_animating = self.download_panel.is_some()
             && (self.download_panel_reveal - self.download_panel_reveal_target).abs() > 0.005;
         let needs_timer = panel_animating
+            || self.download_toast.is_some()
             || self.downloads.iter().any(|download| {
                 download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS
                     || download
@@ -3574,6 +3629,19 @@ impl App {
                 let _ = tab.controller.SetIsVisible(is_active && !tab.unloaded);
             }
         }
+        unsafe {
+            if self.download_popup_hwnd != HWND(std::ptr::null_mut()) && self.download_toast.is_some() && self.sidebar_width < 1.0 {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.download_popup_hwnd,
+                    Some(HWND_TOP),
+                    62,
+                    rect.bottom - 52,
+                    32,
+                    32,
+                    WindowsAndMessaging::SWP_NOACTIVATE,
+                );
+            }
+        }
         if clip_changed {
             self.last_clip_width.set(sidebar_width as f32);
             self.last_clip_top.set(self.topbar_height);
@@ -3983,6 +4051,10 @@ impl App {
                     }
                 }
             }
+
+            if sidebar_width <= 92 {
+                self.paint_download_toast(hdc, rect);
+            }
         }
     }
 
@@ -4204,6 +4276,32 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    fn paint_download_toast(&self, hdc: HDC, window_rect: RECT) {
+        let Some(toast) = &self.download_toast else { return };
+        if self.sidebar_width() > 92 { return; }
+        let elapsed = toast.start_time.elapsed().as_millis();
+        if elapsed >= 3000 && !toast.fading { return; }
+        let rect = RECT {
+            left: 62,
+            top: window_rect.bottom - 52,
+            right: 94,
+            bottom: window_rect.bottom - 20,
+        };
+        if self.sidebar_width() < 1 {
+            return;
+        }
+        let alpha = if toast.fading {
+            let fade_progress = (self.sidebar_width / SIDEBAR_EXPANDED).clamp(0.0, 1.0);
+            (1.0 - fade_progress).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if alpha <= 0.02 { return; }
+        unsafe {
+            draw_download_toast_gdi(hdc, rect, elapsed as u64, alpha);
         }
     }
 
@@ -6154,6 +6252,11 @@ impl App {
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        if mode != SidebarMode::Hidden {
+            if let Some(toast) = &mut self.download_toast {
+                toast.fading = true;
+            }
+        }
         self.sidebar_target = match mode {
             SidebarMode::Hidden => SIDEBAR_HIDDEN,
             SidebarMode::Overlay | SidebarMode::Pushed => SIDEBAR_EXPANDED,
@@ -6755,6 +6858,31 @@ fn create_overlay_menu(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+fn create_download_popup(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            Some(HMENU(DOWNLOAD_POPUP_ID as usize as *mut _)),
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_DOWNLOAD_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            download_popup_proc as *const () as isize,
+        ));
+        Ok(hwnd)
+    }
+}
+
 unsafe extern "system" fn overlay_menu_proc(
     hwnd: HWND,
     msg: u32,
@@ -7125,6 +7253,41 @@ unsafe extern "system" fn command_popup_proc(
     }
 }
 
+unsafe extern "system" fn download_popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some(toast) = &app.download_toast {
+                        let elapsed = toast.start_time.elapsed().as_millis();
+                        if elapsed < 3000 || toast.fading {
+                            let rect = client_rect(hwnd);
+                            draw_download_popup(hdc, rect, elapsed as u64);
+                        }
+                    }
+                });
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => WindowsAndMessaging::CallWindowProcW(
+            OLD_DOWNLOAD_POPUP_PROC,
+            hwnd,
+            msg,
+            w_param,
+            l_param,
+        ),
+    }
+}
+
 extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     match msg {
         WindowsAndMessaging::WM_GETMINMAXINFO => {
@@ -7388,10 +7551,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             }
             if w_param.0 == DOWNLOAD_TIMER_ID {
                 with_app(hwnd, |app| {
+                    app.tick_download_toast();
                     app.tick_download_panel_animation();
                     app.poll_downloads();
                     unsafe {
                         let _ = InvalidateRect(Some(app.hwnd), None, false);
+                        if app.download_popup_hwnd != HWND(std::ptr::null_mut()) {
+                            let _ = InvalidateRect(Some(app.download_popup_hwnd), None, false);
+                        }
                     }
                 });
                 return LRESULT(0);
@@ -7729,6 +7896,88 @@ unsafe fn draw_download_indicator(
     }
 }
 
+unsafe fn draw_download_popup(
+    hdc: HDC,
+    rect: RECT,
+    elapsed_ms: u64,
+) {
+    let size = (rect.right - rect.left).min(rect.bottom - rect.top).max(1);
+    let pixels = render_download_popup_pixels(size, elapsed_ms);
+    if let Some(bitmap) = create_bgra_bitmap(size, size, &pixels) {
+        let mem_dc = CreateCompatibleDC(Some(hdc));
+        if !mem_dc.is_invalid() {
+            let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = AlphaBlend(
+                hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend,
+            );
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteDC(mem_dc);
+        }
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+    }
+}
+
+unsafe fn draw_download_toast_gdi(
+    hdc: HDC,
+    rect: RECT,
+    _elapsed_ms: u64,
+    _alpha: f32,
+) {
+    let size = (rect.right - rect.left).min(rect.bottom - rect.top);
+    if size <= 0 { return; }
+    let radius = size / 2;
+
+    fill_round_rect(hdc, rect, COLOR_PANEL_2, radius);
+
+    let cx = rect.left + radius;
+    let cy = rect.top + radius;
+    let ring_r = (size as f32 * 0.38) as i32;
+    let ring_w = 3i32;
+
+    let t = (_elapsed_ms % 1200) as f32 / 1200.0;
+    let rotation = t * std::f32::consts::TAU;
+
+    let sweep_start = rotation;
+    let sweep_end = sweep_start + std::f32::consts::TAU * 0.75;
+    let steps = 36;
+    for i in 0..steps {
+        let angle = sweep_start + (i as f32 / steps as f32) * (sweep_end - sweep_start);
+        let x = cx + (ring_r as f32 * angle.cos()) as i32;
+        let y = cy + (ring_r as f32 * angle.sin()) as i32;
+        fill_round_rect(
+            hdc,
+            RECT {
+                left: x - ring_w / 2,
+                top: y - ring_w / 2,
+                right: x + ring_w / 2 + 1,
+                bottom: y + ring_w / 2 + 1,
+            },
+            0xf16f63,
+            ring_w / 2,
+        );
+    }
+
+    let half_i = (size as f32 * 0.06) as i32;
+    let rt = rect.top;
+    let arrow_top = rt + (size as f32 * 0.28) as i32;
+    let arrow_mid = rt + (size as f32 * 0.50) as i32;
+    let arrow_bot = rt + (size as f32 * 0.62) as i32;
+    let arrow_wid = (size as f32 * 0.16) as i32;
+    let arrow_base = rt + (size as f32 * 0.72) as i32;
+    let arrow_color = COLOR_MUTED;
+
+    fill_rect(hdc, RECT { left: cx - half_i, top: arrow_top, right: cx + half_i + 1, bottom: arrow_bot }, arrow_color);
+    fill_rect(hdc, RECT { left: cx - arrow_wid - half_i, top: arrow_mid - half_i, right: cx + half_i + 1, bottom: arrow_mid + half_i + 1 }, arrow_color);
+    fill_rect(hdc, RECT { left: cx - half_i, top: arrow_mid - half_i, right: cx + arrow_wid + half_i + 1, bottom: arrow_mid + half_i + 1 }, arrow_color);
+    fill_rect(hdc, RECT { left: cx - arrow_wid, top: arrow_base - half_i, right: cx + arrow_wid + 1, bottom: arrow_base + half_i + 1 }, arrow_color);
+}
+
 fn render_download_indicator_pixels(
     size: i32,
     progress: f32,
@@ -7764,6 +8013,7 @@ fn render_download_indicator_pixels(
         progress.clamp(0.0, 1.0),
         COLOR_ACCENT,
         1.0,
+        0.0,
     );
 
     let download_alpha = (1.0 - morph).clamp(0.0, 1.0);
@@ -7845,6 +8095,31 @@ fn render_download_indicator_pixels(
     pixels
 }
 
+fn render_download_popup_pixels(
+    size: i32,
+    elapsed_ms: u64,
+) -> Vec<u8> {
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+    let center = size as f32 / 2.0;
+    let radius = size as f32 * 0.43;
+
+    draw_aa_filled_circle(&mut pixels, size, center, center, radius, COLOR_PANEL_2, 1.0);
+    draw_aa_ring(&mut pixels, size, center, center, radius - 0.7, 1.35, 0x565656, 1.0);
+
+    let t = (elapsed_ms % 1200) as f32 / 1200.0;
+    let rotation = t * std::f32::consts::TAU;
+    draw_aa_arc(&mut pixels, size, center, center, radius - 0.7, 1.8, 0.75, COLOR_ACCENT, 1.0, rotation);
+
+    let color = COLOR_MUTED;
+    let stroke = size as f32 * 0.065;
+    draw_aa_line(&mut pixels, size, center, size as f32 * 0.27, center, size as f32 * 0.62, stroke, color, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.36, size as f32 * 0.50, center, size as f32 * 0.64, stroke, color, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.64, size as f32 * 0.50, center, size as f32 * 0.64, stroke, color, 1.0);
+    draw_aa_line(&mut pixels, size, size as f32 * 0.34, size as f32 * 0.72, size as f32 * 0.66, size as f32 * 0.72, stroke, color, 0.75);
+
+    pixels
+}
+
 fn draw_aa_filled_circle(
     pixels: &mut [u8],
     size: i32,
@@ -7901,6 +8176,7 @@ fn draw_aa_arc(
     progress: f32,
     color: u32,
     alpha: f32,
+    rotation: f32,
 ) {
     if progress <= 0.0 {
         return;
@@ -7915,7 +8191,7 @@ fn draw_aa_arc(
         for x in 0..size {
             let dx = x as f32 + 0.5 - cx;
             let dy = y as f32 + 0.5 - cy;
-            let mut angle = dy.atan2(dx) + std::f32::consts::FRAC_PI_2;
+            let mut angle = dy.atan2(dx) + std::f32::consts::FRAC_PI_2 - rotation;
             if angle < 0.0 {
                 angle += std::f32::consts::TAU;
             }
@@ -7930,9 +8206,10 @@ fn draw_aa_arc(
         }
     }
 
-    let start_x = cx;
-    let start_y = cy - radius;
-    let end_angle = -std::f32::consts::FRAC_PI_2 + sweep;
+    let start_angle = -std::f32::consts::FRAC_PI_2 + rotation;
+    let start_x = cx + radius * start_angle.cos();
+    let start_y = cy + radius * start_angle.sin();
+    let end_angle = -std::f32::consts::FRAC_PI_2 + sweep + rotation;
     let end_x = cx + radius * end_angle.cos();
     let end_y = cy + radius * end_angle.sin();
     draw_aa_dot(pixels, size, start_x, start_y, half, color, alpha);
