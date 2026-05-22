@@ -397,6 +397,7 @@ struct DownloadSnapshot {
 struct DownloadToastState {
     start_time: std::time::Instant,
     fading: bool,
+    slide_x: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1944,6 +1945,7 @@ impl App {
             self.download_toast = Some(DownloadToastState {
                 start_time: std::time::Instant::now(),
                 fading: false,
+                slide_x: 0.0,
             });
             if self.sidebar_width() < 1 && self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
                 let rect = client_rect(self.hwnd);
@@ -2040,7 +2042,7 @@ impl App {
     }
 
     fn tick_download_toast(&mut self) {
-        if let Some(toast) = &self.download_toast {
+        if let Some(toast) = &mut self.download_toast {
             if toast.fading {
                 if self.sidebar_width >= SIDEBAR_EXPANDED {
                     if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
@@ -2050,13 +2052,36 @@ impl App {
                     }
                     self.download_toast = None;
                 }
-            } else if toast.start_time.elapsed().as_millis() >= 3000 {
-                if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
-                    unsafe {
-                        let _ = WindowsAndMessaging::ShowWindow(self.download_popup_hwnd, WindowsAndMessaging::SW_HIDE);
+            } else {
+                let elapsed = toast.start_time.elapsed().as_millis();
+                if elapsed >= 700 {
+                    let slide_elapsed = elapsed - 700;
+                    let slide_duration: u128 = 400;
+                    if slide_elapsed >= slide_duration {
+                        if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
+                            unsafe {
+                                let _ = WindowsAndMessaging::ShowWindow(self.download_popup_hwnd, WindowsAndMessaging::SW_HIDE);
+                            }
+                        }
+                        self.download_toast = None;
+                    } else {
+                        let t = slide_elapsed as f32 / slide_duration as f32;
+                        let ease = 1.0 - (1.0 - t) * (1.0 - t);
+                        toast.slide_x = -94.0 * ease;
+                        let rect = client_rect(self.hwnd);
+                        unsafe {
+                            let _ = WindowsAndMessaging::SetWindowPos(
+                                self.download_popup_hwnd,
+                                Some(HWND_TOP),
+                                (62.0 + toast.slide_x) as i32,
+                                rect.bottom - 52,
+                                32,
+                                32,
+                                WindowsAndMessaging::SWP_NOACTIVATE,
+                            );
+                        }
                     }
                 }
-                self.download_toast = None;
             }
         }
     }
@@ -3630,16 +3655,18 @@ impl App {
             }
         }
         unsafe {
-            if self.download_popup_hwnd != HWND(std::ptr::null_mut()) && self.download_toast.is_some() && self.sidebar_width < 1.0 {
-                let _ = WindowsAndMessaging::SetWindowPos(
-                    self.download_popup_hwnd,
-                    Some(HWND_TOP),
-                    62,
-                    rect.bottom - 52,
-                    32,
-                    32,
-                    WindowsAndMessaging::SWP_NOACTIVATE,
-                );
+            if self.download_popup_hwnd != HWND(std::ptr::null_mut()) && self.sidebar_width < 1.0 {
+                if let Some(toast) = &self.download_toast {
+                    let _ = WindowsAndMessaging::SetWindowPos(
+                        self.download_popup_hwnd,
+                        Some(HWND_TOP),
+                        (62.0 + toast.slide_x) as i32,
+                        rect.bottom - 52,
+                        32,
+                        32,
+                        WindowsAndMessaging::SWP_NOACTIVATE,
+                    );
+                }
             }
         }
         if clip_changed {
