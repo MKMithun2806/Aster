@@ -2284,7 +2284,9 @@ impl App {
                 bottom: row.top + 26,
             };
             if point_in_rect(x, y, cancel) {
-                if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+                if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
+                    || download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
+                {
                     return Some(DownloadAction::Delete(download.id));
                 }
                 return Some(DownloadAction::Cancel(download.id));
@@ -2318,15 +2320,46 @@ impl App {
                 }
             }
             DownloadAction::Cancel(id) => {
-                if let Some(download) = self.downloads.iter_mut().find(|item| item.id == id) {
+                if let Some(download) = self.downloads.iter().find(|item| item.id == id) {
                     if let Some(operation) = download.operation.as_ref() {
-                        unsafe {
-                            let _ = operation.Cancel();
-                        }
+                        unsafe { let _ = operation.Cancel(); }
                     }
-                    download.state = COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED;
-                    download.paused = false;
-                    download.cancelled_at = Some(std::time::Instant::now());
+                }
+                let removed_index = self.downloads.iter().position(|item| item.id == id);
+                let old_count = self.downloads.len();
+                let mut cached = None;
+                if let Some(download) = self.downloads.iter().find(|item| item.id == id) {
+                    if !download.file_path.is_empty() {
+                        let _ = fs::remove_file(&download.file_path);
+                    }
+                    cached = Some((
+                        self.download_progress(download),
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
+                        download.completed_at,
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                        download.cancelled_at,
+                    ));
+                }
+                self.downloads.retain(|item| item.id != id);
+                if self.download_panel == Some(DownloadPanelMode::Single(id)) || self.downloads.is_empty() {
+                    self.download_panel = None;
+                }
+                if let (Some(idx), Some((prog, compl, compl_at, cancelled, cancelled_at))) = (removed_index, cached) {
+                    if old_count >= 1 && old_count <= 4 {
+                        self.download_removal_anim = Some(DownloadRemovalAnim {
+                            start_time: std::time::Instant::now(),
+                            duration: 180,
+                            removed_id: id,
+                            removed_index: idx,
+                            old_count,
+                            removed_progress: prog,
+                            removed_completed: compl,
+                            removed_completed_at: compl_at,
+                            removed_cancelled: cancelled,
+                            removed_cancelled_at: cancelled_at,
+                        });
+                        self.ensure_download_timer();
+                    }
                 }
             }
             DownloadAction::ShowInFolder(id) => {
@@ -4630,7 +4663,9 @@ impl App {
                 };
                 fill_rect(hdc, filled, COLOR_ACCENT);
 
-                let cancel_glyph = if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+                let cancel_glyph = if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
+                    || download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
+                {
                     glyph(0xE74D)
                 } else {
                     glyph(0xE711)
@@ -8321,7 +8356,7 @@ fn render_download_indicator_pixels(
     if icon_alpha > 0.02 {
         if cancelled {
             let stroke = size as f32 * 0.065;
-            let x_color = 0xFF3333;
+            let x_color = 0x3333FF;
             draw_aa_line(
                 &mut pixels,
                 size,
