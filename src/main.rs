@@ -4565,13 +4565,16 @@ impl App {
 
                 let state_label = download_state_label(download);
                 let size_label = if download.total_bytes > 0 {
-                    format!(
-                        "{} of {}",
-                        format_bytes(download.received_bytes),
-                        format_bytes(download.total_bytes)
-                    )
+                    let (recv_val, recv_unit) = format_bytes_split(download.received_bytes);
+                    let (total_val, total_unit) = format_bytes_split(download.total_bytes);
+                    if recv_unit == total_unit {
+                        format!("{}/{}{}", recv_val, total_val, recv_unit)
+                    } else {
+                        format!("{}{}/{}{}", recv_val, recv_unit, total_val, total_unit)
+                    }
                 } else {
-                    format!("{} received", format_bytes(download.received_bytes))
+                    let (val, unit) = format_bytes_split(download.received_bytes);
+                    format!("{}{}", val, unit)
                 };
                 draw_text(
                     hdc,
@@ -9068,7 +9071,7 @@ fn download_file_name(file_path: &str, uri: &str) -> String {
         .unwrap_or_else(|| "download".to_string())
 }
 
-fn format_bytes(bytes: i64) -> String {
+fn format_bytes_split(bytes: i64) -> (String, String) {
     let bytes = bytes.max(0) as f64;
     let units = ["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes;
@@ -9077,11 +9080,12 @@ fn format_bytes(bytes: i64) -> String {
         size /= 1024.0;
         unit += 1;
     }
-    if unit == 0 {
-        format!("{} {}", size.round() as i64, units[unit])
+    let val = if unit == 0 {
+        format!("{}", size.round() as i64)
     } else {
-        format!("{:.1} {}", size, units[unit])
-    }
+        format!("{:.1}", size)
+    };
+    (val, units[unit].to_string())
 }
 
 fn download_state_label(download: &DownloadItem) -> &'static str {
