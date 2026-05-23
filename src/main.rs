@@ -383,6 +383,7 @@ struct DownloadItem {
     state: COREWEBVIEW2_DOWNLOAD_STATE,
     paused: bool,
     completed_at: Option<std::time::Instant>,
+    cancelled_at: Option<std::time::Instant>,
     operation: Option<ICoreWebView2DownloadOperation>,
 }
 
@@ -409,6 +410,8 @@ struct DownloadRemovalAnim {
     removed_progress: f32,
     removed_completed: bool,
     removed_completed_at: Option<std::time::Instant>,
+    removed_cancelled: bool,
+    removed_cancelled_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1952,6 +1955,7 @@ impl App {
             state: snapshot.state,
             paused: false,
             completed_at: None,
+            cancelled_at: None,
             operation: Some(operation),
         });
         if self.sidebar_width() <= 92 {
@@ -2051,6 +2055,9 @@ impl App {
             }
             if snapshot.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
                 download.paused = false;
+                if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                    download.cancelled_at = Some(std::time::Instant::now());
+                }
             }
             download.state = snapshot.state;
         }
@@ -2319,6 +2326,7 @@ impl App {
                     }
                     download.state = COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED;
                     download.paused = false;
+                    download.cancelled_at = Some(std::time::Instant::now());
                 }
             }
             DownloadAction::ShowInFolder(id) => {
@@ -2338,13 +2346,15 @@ impl App {
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                        download.cancelled_at,
                     ));
                 }
                 self.downloads.retain(|item| item.id != id);
                 if self.download_panel == Some(DownloadPanelMode::Single(id)) || self.downloads.is_empty() {
                     self.download_panel = None;
                 }
-                if let (Some(idx), Some((prog, compl, compl_at))) = (removed_index, cached) {
+                if let (Some(idx), Some((prog, compl, compl_at, cancelled, cancelled_at))) = (removed_index, cached) {
                     if old_count >= 1 && old_count <= 4 {
                         self.download_removal_anim = Some(DownloadRemovalAnim {
                             start_time: std::time::Instant::now(),
@@ -2355,6 +2365,8 @@ impl App {
                             removed_progress: prog,
                             removed_completed: compl,
                             removed_completed_at: compl_at,
+                            removed_cancelled: cancelled,
+                            removed_cancelled_at: cancelled_at,
                         });
                         self.ensure_download_timer();
                     }
@@ -4347,6 +4359,8 @@ impl App {
                                 self.download_progress(download),
                                 download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                                 download.completed_at,
+                                download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                                download.cancelled_at,
                                 self.hover_target == Some(HoverTarget::DownloadIndicator(id)),
                             );
                         }
@@ -4386,6 +4400,8 @@ impl App {
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                        download.cancelled_at,
                         self.hover_target == Some(HoverTarget::DownloadIndicator(download.id)),
                     );
                 }
@@ -4397,6 +4413,8 @@ impl App {
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                        download.cancelled_at,
                         self.hover_target == Some(HoverTarget::DownloadIndicator(download.id)),
                     );
                 }
@@ -4418,6 +4436,8 @@ impl App {
                         self.download_progress(download),
                         download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED,
                         download.completed_at,
+                        download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+                        download.cancelled_at,
                         self.hover_target == Some(HoverTarget::DownloadIndicator(download.id)),
                     );
                 }
@@ -4437,6 +4457,8 @@ impl App {
             anim.removed_progress,
             anim.removed_completed,
             anim.removed_completed_at,
+            anim.removed_cancelled,
+            anim.removed_cancelled_at,
             self.hover_target == Some(HoverTarget::DownloadIndicator(anim.removed_id)),
         );
         let src_alpha = (fade_alpha * 255.0) as u8;
@@ -4494,6 +4516,8 @@ impl App {
                     hdc,
                     circle,
                     1.0,
+                    false,
+                    None,
                     false,
                     None,
                     self.hover_target == Some(HoverTarget::DownloadOverflow),
@@ -8045,14 +8069,24 @@ unsafe fn draw_download_indicator(
     progress: f32,
     completed: bool,
     completed_at: Option<std::time::Instant>,
+    cancelled: bool,
+    cancelled_at: Option<std::time::Instant>,
     hovered: bool,
 ) {
     let size = (rect.right - rect.left).min(rect.bottom - rect.top).max(1);
 
-    let morph = completed_at
-        .map(|at| (at.elapsed().as_millis() as f32 / 420.0).clamp(0.0, 1.0))
-        .unwrap_or(if completed { 1.0 } else { 0.0 });
-    let pixels = render_download_indicator_pixels(size, progress, morph, hovered);
+    let (morph, is_cancelled) = if cancelled {
+        let m = cancelled_at
+            .map(|at| (at.elapsed().as_millis() as f32 / 420.0).clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        (m, true)
+    } else {
+        let m = completed_at
+            .map(|at| (at.elapsed().as_millis() as f32 / 420.0).clamp(0.0, 1.0))
+            .unwrap_or(if completed { 1.0 } else { 0.0 });
+        (m, false)
+    };
+    let pixels = render_download_indicator_pixels(size, progress, morph, is_cancelled, hovered);
     if let Some(bitmap) = create_bgra_bitmap(size, size, &pixels) {
         let mem_dc = CreateCompatibleDC(Some(hdc));
         if !mem_dc.is_invalid() {
@@ -8196,6 +8230,7 @@ fn render_download_indicator_pixels(
     size: i32,
     progress: f32,
     morph: f32,
+    cancelled: bool,
     hovered: bool,
 ) -> Vec<u8> {
     let mut pixels = vec![0u8; (size * size * 4) as usize];
@@ -8217,21 +8252,23 @@ fn render_download_indicator_pixels(
         0x565656,
         1.0,
     );
-    draw_aa_arc(
-        &mut pixels,
-        size,
-        center,
-        center,
-        radius - 0.7,
-        1.8,
-        progress.clamp(0.0, 1.0),
-        COLOR_ACCENT,
-        1.0,
-        0.0,
-    );
+    if !cancelled {
+        draw_aa_arc(
+            &mut pixels,
+            size,
+            center,
+            center,
+            radius - 0.7,
+            1.8,
+            progress.clamp(0.0, 1.0),
+            COLOR_ACCENT,
+            1.0,
+            0.0,
+        );
+    }
 
     let download_alpha = (1.0 - morph).clamp(0.0, 1.0);
-    let tick_alpha = morph.clamp(0.0, 1.0);
+    let icon_alpha = morph.clamp(0.0, 1.0);
     if download_alpha > 0.02 {
         let color = COLOR_MUTED;
         let stroke = size as f32 * 0.065;
@@ -8281,30 +8318,57 @@ fn render_download_indicator_pixels(
         );
     }
 
-    if tick_alpha > 0.02 {
-        let stroke = size as f32 * 0.058;
-        draw_aa_line(
-            &mut pixels,
-            size,
-            size as f32 * 0.33,
-            size as f32 * 0.53,
-            size as f32 * 0.45,
-            size as f32 * 0.64,
-            stroke,
-            COLOR_MUTED,
-            tick_alpha,
-        );
-        draw_aa_line(
-            &mut pixels,
-            size,
-            size as f32 * 0.45,
-            size as f32 * 0.64,
-            size as f32 * 0.69,
-            size as f32 * 0.38,
-            stroke,
-            COLOR_MUTED,
-            tick_alpha,
-        );
+    if icon_alpha > 0.02 {
+        if cancelled {
+            let stroke = size as f32 * 0.065;
+            let x_color = 0xFF3333;
+            draw_aa_line(
+                &mut pixels,
+                size,
+                size as f32 * 0.30,
+                size as f32 * 0.30,
+                size as f32 * 0.70,
+                size as f32 * 0.70,
+                stroke,
+                x_color,
+                icon_alpha,
+            );
+            draw_aa_line(
+                &mut pixels,
+                size,
+                size as f32 * 0.70,
+                size as f32 * 0.30,
+                size as f32 * 0.30,
+                size as f32 * 0.70,
+                stroke,
+                x_color,
+                icon_alpha,
+            );
+        } else {
+            let stroke = size as f32 * 0.058;
+            draw_aa_line(
+                &mut pixels,
+                size,
+                size as f32 * 0.33,
+                size as f32 * 0.53,
+                size as f32 * 0.45,
+                size as f32 * 0.64,
+                stroke,
+                COLOR_MUTED,
+                icon_alpha,
+            );
+            draw_aa_line(
+                &mut pixels,
+                size,
+                size as f32 * 0.45,
+                size as f32 * 0.64,
+                size as f32 * 0.69,
+                size as f32 * 0.38,
+                stroke,
+                COLOR_MUTED,
+                icon_alpha,
+            );
+        }
     }
     pixels
 }
@@ -9095,7 +9159,7 @@ fn download_state_label(download: &DownloadItem) -> &'static str {
     if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
         "Complete"
     } else if download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
-        "Stopped"
+        "Cancelled"
     } else {
         "Downloading"
     }
