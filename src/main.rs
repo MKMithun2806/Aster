@@ -2283,16 +2283,16 @@ impl App {
                 right: row.right - 56,
                 bottom: row.top + 26,
             };
-            if point_in_rect(x, y, cancel) {
-                if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
-                    || download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
-                {
-                    return Some(DownloadAction::Delete(download.id));
+            if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                if point_in_rect(x, y, cancel) {
+                    if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+                        return Some(DownloadAction::Delete(download.id));
+                    }
+                    return Some(DownloadAction::Cancel(download.id));
                 }
-                return Some(DownloadAction::Cancel(download.id));
-            }
-            if point_in_rect(x, y, open) {
-                return Some(DownloadAction::ShowInFolder(download.id));
+                if point_in_rect(x, y, open) {
+                    return Some(DownloadAction::ShowInFolder(download.id));
+                }
             }
             if download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS && point_in_rect(x, y, pause) {
                 return Some(DownloadAction::TogglePause(download.id));
@@ -2323,6 +2323,9 @@ impl App {
                 if let Some(download) = self.downloads.iter_mut().find(|item| item.id == id) {
                     if let Some(operation) = download.operation.as_ref() {
                         unsafe { let _ = operation.Cancel(); }
+                    }
+                    if !download.file_path.is_empty() {
+                        let _ = fs::remove_file(&download.file_path);
                     }
                     download.state = COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED;
                     download.paused = false;
@@ -4630,24 +4633,24 @@ impl App {
                 };
                 fill_rect(hdc, filled, COLOR_ACCENT);
 
-                let cancel_glyph = if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
-                    || download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
-                {
-                    glyph(0xE74D)
-                } else {
-                    glyph(0xE711)
-                };
-                let cancel_hover = self.hover_target == Some(HoverTarget::DownloadCancel(download.id));
-                if cancel_hover {
-                    fill_round_rect(hdc, cancel, COLOR_SURFACE_HOVER, 6);
+                if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                    let cancel_glyph = if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+                        glyph(0xE74D)
+                    } else {
+                        glyph(0xE711)
+                    };
+                    let cancel_hover = self.hover_target == Some(HoverTarget::DownloadCancel(download.id));
+                    if cancel_hover {
+                        fill_round_rect(hdc, cancel, COLOR_SURFACE_HOVER, 6);
+                    }
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.icon,
+                        cancel_glyph.as_str(),
+                        cancel,
+                        if cancel_hover { COLOR_TEXT } else { COLOR_MUTED },
+                    );
                 }
-                draw_icon_glyph(
-                    hdc,
-                    &self.fonts.icon,
-                    cancel_glyph.as_str(),
-                    cancel,
-                    if cancel_hover { COLOR_TEXT } else { COLOR_MUTED },
-                );
 
                 if show_pause {
                     let pause_hover = self.hover_target == Some(HoverTarget::DownloadPause(download.id));
@@ -4668,17 +4671,19 @@ impl App {
                     );
                 }
 
-                let open_hover = self.hover_target == Some(HoverTarget::DownloadOpen(download.id));
-                if open_hover {
-                    fill_round_rect(hdc, open, COLOR_SURFACE_HOVER, 6);
+                if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                    let open_hover = self.hover_target == Some(HoverTarget::DownloadOpen(download.id));
+                    if open_hover {
+                        fill_round_rect(hdc, open, COLOR_SURFACE_HOVER, 6);
+                    }
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.icon,
+                        glyph(0xE838).as_str(),
+                        open,
+                        if open_hover { COLOR_TEXT } else { COLOR_MUTED },
+                    );
                 }
-                draw_icon_glyph(
-                    hdc,
-                    &self.fonts.icon,
-                    glyph(0xE838).as_str(),
-                    open,
-                    if open_hover { COLOR_TEXT } else { COLOR_MUTED },
-                );
 
                 if index + 1 < rows.len() {
                     fill_rect(
@@ -5934,13 +5939,16 @@ impl App {
                         right: row.right - 56,
                         bottom: row.top + 26,
                     };
-                    if point_in_rect(x, y, cancel) {
-                        self.hover_target = Some(HoverTarget::DownloadCancel(download.id));
-                        break;
-                    } else if point_in_rect(x, y, open) {
-                        self.hover_target = Some(HoverTarget::DownloadOpen(download.id));
-                        break;
-                    } else if show_pause && point_in_rect(x, y, pause) {
+                    if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
+                        if point_in_rect(x, y, cancel) {
+                            self.hover_target = Some(HoverTarget::DownloadCancel(download.id));
+                            break;
+                        } else if point_in_rect(x, y, open) {
+                            self.hover_target = Some(HoverTarget::DownloadOpen(download.id));
+                            break;
+                        }
+                    }
+                    if show_pause && point_in_rect(x, y, pause) {
                         self.hover_target = Some(HoverTarget::DownloadPause(download.id));
                         break;
                     }
@@ -8238,12 +8246,18 @@ fn render_download_indicator_pixels(
     let mut pixels = vec![0u8; (size * size * 4) as usize];
     let center = size as f32 / 2.0;
     let radius = size as f32 * 0.43;
+    let x_color = 0x3333FF;
     let bg = if hovered {
         mix_color(COLOR_PANEL_2, COLOR_SURFACE_HOVER, 0.76)
     } else {
         COLOR_PANEL_2
     };
-    draw_aa_filled_circle(&mut pixels, size, center, center, radius, bg, 1.0);
+    let circle_bg = if cancelled {
+        mix_color(bg, x_color, 0.15)
+    } else {
+        bg
+    };
+    draw_aa_filled_circle(&mut pixels, size, center, center, radius, circle_bg, 1.0);
     draw_aa_ring(
         &mut pixels,
         size,
@@ -8251,7 +8265,7 @@ fn render_download_indicator_pixels(
         center,
         radius - 0.7,
         1.35,
-        0x565656,
+        if cancelled { x_color } else { 0x565656 },
         1.0,
     );
     if !cancelled {
@@ -8323,14 +8337,13 @@ fn render_download_indicator_pixels(
     if icon_alpha > 0.02 {
         if cancelled {
             let stroke = size as f32 * 0.065;
-            let x_color = 0x3333FF;
             draw_aa_line(
                 &mut pixels,
                 size,
-                size as f32 * 0.30,
-                size as f32 * 0.30,
-                size as f32 * 0.70,
-                size as f32 * 0.70,
+                size as f32 * 0.33,
+                size as f32 * 0.33,
+                size as f32 * 0.67,
+                size as f32 * 0.67,
                 stroke,
                 x_color,
                 icon_alpha,
@@ -8338,10 +8351,10 @@ fn render_download_indicator_pixels(
             draw_aa_line(
                 &mut pixels,
                 size,
-                size as f32 * 0.70,
-                size as f32 * 0.30,
-                size as f32 * 0.30,
-                size as f32 * 0.70,
+                size as f32 * 0.67,
+                size as f32 * 0.33,
+                size as f32 * 0.33,
+                size as f32 * 0.67,
                 stroke,
                 x_color,
                 icon_alpha,
