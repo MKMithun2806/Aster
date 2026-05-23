@@ -2,6 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     fs, mem,
     path::{Path, PathBuf},
     process::Command,
@@ -600,6 +601,7 @@ struct App {
     download_removal_anim: Option<DownloadRemovalAnim>,
     download_collapse_anim: Option<DownloadCollapseAnim>,
     paint_cache: RefCell<Option<PaintCache>>,
+    dl_panel_cache: RefCell<Option<PaintCache>>,
 }
 
 struct DragGhost {
@@ -734,6 +736,7 @@ impl App {
             download_removal_anim: None,
             download_collapse_anim: None,
             paint_cache: RefCell::new(None),
+            dl_panel_cache: RefCell::new(None),
         };
         app.load_state()?;
         unsafe {
@@ -4164,10 +4167,26 @@ impl App {
                         let pw = panel.right - panel.left;
                         let ph = panel.bottom - panel.top;
                         if pw > 0 && ph > 0 {
-                            let mem_dc = CreateCompatibleDC(Some(hdc));
+                            let mem_dc = {
+                                let mut cache = self.dl_panel_cache.borrow_mut();
+                                let cached = cache.get_or_insert_with(|| {
+                                    let dc = CreateCompatibleDC(Some(hdc));
+                                    let bitmap = CreateCompatibleBitmap(hdc, pw, ph);
+                                    let old = SelectObject(dc, HGDIOBJ(bitmap.0));
+                                    PaintCache { bitmap, dc, width: pw, height: ph, old_bitmap: old }
+                                });
+                                if cached.width != pw || cached.height != ph {
+                                    let _ = SelectObject(cached.dc, cached.old_bitmap);
+                                    let _ = DeleteObject(HGDIOBJ(cached.bitmap.0));
+                                    let _ = DeleteDC(cached.dc);
+                                    let dc = CreateCompatibleDC(Some(hdc));
+                                    let bitmap = CreateCompatibleBitmap(hdc, pw, ph);
+                                    let old = SelectObject(dc, HGDIOBJ(bitmap.0));
+                                    *cached = PaintCache { bitmap, dc, width: pw, height: ph, old_bitmap: old };
+                                }
+                                cached.dc
+                            };
                             if !mem_dc.is_invalid() {
-                                let bitmap = CreateCompatibleBitmap(hdc, pw, ph);
-                                let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
                                 fill_rect(mem_dc, RECT { left: panel.left, top: panel.top, right: panel.right, bottom: panel.bottom }, 0x151515);
                                 let _ = SetViewportOrgEx(mem_dc, -panel.left, -panel.top, None);
                                 self.paint_download_panel(mem_dc);
@@ -4180,9 +4199,6 @@ impl App {
                                     AlphaFormat: 0,
                                 };
                                 let _ = AlphaBlend(hdc, panel.left, panel.top, pw, ph, mem_dc, 0, 0, pw, ph, blend);
-                                let _ = SelectObject(mem_dc, old);
-                                let _ = DeleteObject(HGDIOBJ(bitmap.0));
-                                let _ = DeleteDC(mem_dc);
                             }
                         }
                     }
@@ -8719,27 +8735,31 @@ where
 }
 
 unsafe fn fill_round_rect(hdc: HDC, rect: RECT, color: u32, radius: i32) {
-    let brush = solid_brush(color);
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    let _ = RoundRect(
-        hdc,
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-        radius,
-        radius,
-    );
-    let _ = SelectObject(hdc, old_pen);
-    let _ = SelectObject(hdc, old_brush);
-    let _ = DeleteObject(HGDIOBJ(brush.0));
+    BRUSH_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        let brush = *c.brushes.entry(color).or_insert_with(|| solid_brush(color));
+        let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius,
+            radius,
+        );
+        let _ = SelectObject(hdc, old_pen);
+        let _ = SelectObject(hdc, old_brush);
+    });
 }
 
 unsafe fn fill_rect(hdc: HDC, rect: RECT, color: u32) {
-    let brush = solid_brush(color);
-    let _ = FillRect(hdc, &rect, brush);
-    let _ = DeleteObject(HGDIOBJ(brush.0));
+    BRUSH_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        let brush = *c.brushes.entry(color).or_insert_with(|| solid_brush(color));
+        let _ = FillRect(hdc, &rect, brush);
+    });
 }
 
 unsafe fn draw_outline(hdc: HDC, rect: RECT, color: u32, radius: i32) {
@@ -9618,6 +9638,26 @@ fn measure_text_width(hdc: HDC, font: &HFONT, text: &str) -> i32 {
 
 fn solid_brush(color: u32) -> HBRUSH {
     unsafe { CreateSolidBrush(COLORREF(color)) }
+}
+
+struct BrushCache {
+    brushes: HashMap<u32, HBRUSH>,
+}
+
+impl Drop for BrushCache {
+    fn drop(&mut self) {
+        unsafe {
+            for (_, b) in self.brushes.drain() {
+                let _ = DeleteObject(HGDIOBJ(b.0));
+            }
+        }
+    }
+}
+
+thread_local! {
+    static BRUSH_CACHE: RefCell<BrushCache> = RefCell::new(BrushCache {
+        brushes: HashMap::new(),
+    });
 }
 
 fn to_wide(text: &str) -> Vec<u16> {
