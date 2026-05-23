@@ -2168,6 +2168,10 @@ impl App {
                         .completed_at
                         .map(|at| at.elapsed().as_millis() < 900)
                         .unwrap_or(false)
+                    || download
+                        .cancelled_at
+                        .map(|at| at.elapsed().as_millis() < 420)
+                        .unwrap_or(false)
             });
         unsafe {
             if needs_timer {
@@ -2304,16 +2308,16 @@ impl App {
                 right: row.right - 56,
                 bottom: row.top + 26,
             };
-            if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
-                if point_in_rect(x, y, cancel) {
-                    if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
-                        return Some(DownloadAction::Delete(download.id));
-                    }
-                    return Some(DownloadAction::Cancel(download.id));
+            if point_in_rect(x, y, cancel) {
+                if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED
+                    || download.state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED
+                {
+                    return Some(DownloadAction::Delete(download.id));
                 }
-                if point_in_rect(x, y, open) {
-                    return Some(DownloadAction::ShowInFolder(download.id));
-                }
+                return Some(DownloadAction::Cancel(download.id));
+            }
+            if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED && point_in_rect(x, y, open) {
+                return Some(DownloadAction::ShowInFolder(download.id));
             }
             if download.state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS && point_in_rect(x, y, pause) {
                 return Some(DownloadAction::TogglePause(download.id));
@@ -4692,24 +4696,22 @@ impl App {
                 };
                 fill_rect(hdc, filled, COLOR_ACCENT);
 
-                if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
-                    let cancel_glyph = if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
-                        glyph(0xE74D)
-                    } else {
-                        glyph(0xE711)
-                    };
-                    let cancel_hover = self.hover_target == Some(HoverTarget::DownloadCancel(download.id));
-                    if cancel_hover {
-                        fill_round_rect(hdc, cancel, COLOR_SURFACE_HOVER, 6);
-                    }
-                    draw_icon_glyph(
-                        hdc,
-                        &self.fonts.icon,
-                        cancel_glyph.as_str(),
-                        cancel,
-                        if cancel_hover { COLOR_TEXT } else { COLOR_MUTED },
-                    );
+                let cancel_glyph = if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
+                    glyph(0xE74D)
+                } else {
+                    glyph(0xE711)
+                };
+                let cancel_hover = self.hover_target == Some(HoverTarget::DownloadCancel(download.id));
+                if cancel_hover {
+                    fill_round_rect(hdc, cancel, COLOR_SURFACE_HOVER, 6);
                 }
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.icon,
+                    cancel_glyph.as_str(),
+                    cancel,
+                    if cancel_hover { COLOR_TEXT } else { COLOR_MUTED },
+                );
 
                 if show_pause {
                     let pause_hover = self.hover_target == Some(HoverTarget::DownloadPause(download.id));
@@ -5998,14 +6000,13 @@ impl App {
                         right: row.right - 56,
                         bottom: row.top + 26,
                     };
-                    if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED {
-                        if point_in_rect(x, y, cancel) {
-                            self.hover_target = Some(HoverTarget::DownloadCancel(download.id));
-                            break;
-                        } else if point_in_rect(x, y, open) {
-                            self.hover_target = Some(HoverTarget::DownloadOpen(download.id));
-                            break;
-                        }
+                    if point_in_rect(x, y, cancel) {
+                        self.hover_target = Some(HoverTarget::DownloadCancel(download.id));
+                        break;
+                    }
+                    if download.state != COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED && point_in_rect(x, y, open) {
+                        self.hover_target = Some(HoverTarget::DownloadOpen(download.id));
+                        break;
                     }
                     if show_pause && point_in_rect(x, y, pause) {
                         self.hover_target = Some(HoverTarget::DownloadPause(download.id));
