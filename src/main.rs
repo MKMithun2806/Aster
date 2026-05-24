@@ -4360,9 +4360,10 @@ impl App {
     fn settings_menu_rect(&self) -> RECT {
         let settings = self.settings_rect();
         let bottom = settings.top - 8;
+        let height = if self.mode_menu_open { 224 } else { 108 };
         RECT {
             left: 12,
-            top: bottom - 108,
+            top: bottom - height,
             right: 196,
             bottom,
         }
@@ -4380,21 +4381,35 @@ impl App {
 
     fn settings_page_row_rect(&self) -> RECT {
         let row = self.mode_row_rect();
+        let top = if self.mode_menu_open {
+            self.mode_options_rect().bottom + 8
+        } else {
+            row.bottom + 8
+        };
         RECT {
             left: row.left,
-            top: row.bottom + 8,
+            top,
             right: row.right,
-            bottom: row.bottom + 44,
+            bottom: top + 36,
         }
     }
 
     fn mode_options_rect(&self) -> RECT {
         let row = self.mode_row_rect();
-        RECT {
-            left: row.right + 8,
-            top: row.top - 6,
-            right: row.right + 132,
-            bottom: row.top + 108,
+        if self.mode_menu_open {
+            RECT {
+                left: row.left,
+                top: row.bottom + 8,
+                right: row.right,
+                bottom: row.bottom + 8 + 114,
+            }
+        } else {
+            RECT {
+                left: row.right + 8,
+                top: row.top - 6,
+                right: row.right + 132,
+                bottom: row.top + 108,
+            }
         }
     }
 
@@ -5071,7 +5086,6 @@ impl App {
                 hdc,
                 self.settings_rect(),
                 self.hover_target == Some(HoverTarget::Settings),
-                &self.fonts.icon,
             );
 
             let (min_btn, max_btn, close_btn) = self.window_button_rects();
@@ -9922,12 +9936,35 @@ fn draw_logo(hdc: HDC, rect: RECT, hovered: bool) {
     }
 }
 
-fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool, icon_font: &HFONT) {
+fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool) {
     unsafe {
         if hovered {
             fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 10);
         }
-        draw_icon_glyph(hdc, icon_font, glyph(0xE712).as_str(), rect, COLOR_MUTED);
+        let cx = (rect.left + rect.right) / 2;
+        let cy = (rect.top + rect.bottom) / 2;
+        let r = 2;
+        let spacing = 6;
+        BRUSH_CACHE.with(|cache| {
+            let mut c = cache.borrow_mut();
+            let brush = *c.brushes.entry(COLOR_MUTED).or_insert_with(|| solid_brush(COLOR_MUTED));
+            let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+            let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+            let size = r * 2;
+            for dy in [-spacing, 0, spacing] {
+                let _ = RoundRect(
+                    hdc,
+                    cx - r,
+                    cy + dy - r,
+                    cx - r + size,
+                    cy + dy - r + size,
+                    size,
+                    size,
+                );
+            }
+            let _ = SelectObject(hdc, old_pen);
+            let _ = SelectObject(hdc, old_brush);
+        });
     }
 }
 
