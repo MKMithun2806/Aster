@@ -63,6 +63,7 @@ const CLASS_NAME: PCWSTR = w!("AsterWindow");
 const ADDRESS_ID: i32 = 1001;
 const COMMAND_POPUP_ID: i32 = 1002;
 const DOWNLOAD_POPUP_ID: i32 = 1003;
+const FIND_ID: i32 = 1004;
 const DEFAULT_URL: &str = "https://www.google.com";
 const SIDEBAR_EXPANDED: f32 = 248.0;
 const SIDEBAR_HIDDEN: f32 = 0.0;
@@ -99,7 +100,10 @@ const MENU_NEW_SPACE: usize = 3503;
 const MENU_NEW_FOLDER: usize = 3504;
 const MENU_FOLDER_PIN: usize = 3505;
 const MENU_FOLDER_UNPIN: usize = 3506;
+const MENU_TAB_DUPLICATE: usize = 3508;
 const MENU_HISTORY_BASE: usize = 3600;
+const MENU_REOPEN_CLOSED: usize = 3700;
+const MENU_RECENTLY_CLOSED_BASE: usize = 3710;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
 
@@ -116,6 +120,7 @@ const COLOR_SELECTION: u32 = 0xf16f63; // Signature Accent Color (#636ff1)
 const ASTER_BACKGROUND_SVG: &str = include_str!("../assets/aster-background.svg");
 
 static mut OLD_ADDRESS_PROC: WNDPROC = None;
+static mut OLD_FIND_PROC: WNDPROC = None;
 static mut OLD_COMMAND_POPUP_PROC: WNDPROC = None;
 static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
 static mut OLD_OVERLAY_MENU_PROC: WNDPROC = None;
@@ -260,6 +265,24 @@ struct ClosedTab {
     folder_id: Option<usize>,
 }
 
+struct BookmarkFolder {
+    id: usize,
+    parent_id: Option<usize>,
+    name: String,
+    sidebar_order: u64,
+}
+
+#[derive(Clone)]
+struct Bookmark {
+    id: usize,
+    folder_id: Option<usize>,
+    title: String,
+    url: String,
+    tags: Vec<String>,
+    created_at: u64,
+    sidebar_order: u64,
+}
+
 #[derive(Clone)]
 struct HistoryEntry {
     title: String,
@@ -366,6 +389,7 @@ enum HoverTarget {
     Logo,
     NewTab,
     Address,
+    Bookmark,
     Back,
     Forward,
     Reload,
@@ -379,6 +403,9 @@ enum HoverTarget {
     DownloadCancel(usize),
     DownloadPause(usize),
     DownloadOpen(usize),
+    FindPrev,
+    FindNext,
+    FindClose,
     MinButton,
     MaxButton,
     CloseButton,
@@ -535,17 +562,22 @@ impl Drop for UiBrushes {
 struct App {
     hwnd: HWND,
     address_hwnd: HWND,
+    find_hwnd: HWND,
     command_hwnd: HWND,
     overlay_menu_hwnd: HWND,
     environment: ICoreWebView2Environment,
     workspaces: Vec<Workspace>,
     folders: Vec<Folder>,
+    bookmark_folders: Vec<BookmarkFolder>,
+    bookmarks: Vec<Bookmark>,
     tabs: Vec<Tab>,
     active_workspace: usize,
     active: usize,
     next_id: usize,
     next_workspace_id: usize,
     next_folder_id: usize,
+    next_bookmark_id: usize,
+    next_bookmark_folder_id: usize,
     next_sidebar_order: u64,
     workspace_active_tabs: Vec<(usize, usize)>,
     sidebar_scroll_offset: usize,
@@ -594,6 +626,10 @@ struct App {
     saved_rect: RECT,
     command_selected_index: Option<usize>,
     command_scroll_offset: usize,
+    find_open: bool,
+    find_query: String,
+    find_match_count: usize,
+    find_current_match: usize,
     is_deleting: bool,
     last_address_text: String,
     has_typed: bool,
@@ -650,6 +686,7 @@ impl App {
         };
 
         let address_hwnd = create_address_bar(hwnd)?;
+        let find_hwnd = create_find_edit(hwnd)?;
         let command_hwnd = create_command_popup(hwnd)?;
         let overlay_menu_hwnd = create_overlay_menu(hwnd)?;
         let download_popup_hwnd = create_download_popup(hwnd)?;
@@ -660,10 +697,17 @@ impl App {
                 Some(WPARAM(fonts.url.0 as usize)),
                 Some(LPARAM(1)),
             );
+            let _ = WindowsAndMessaging::SendMessageW(
+                find_hwnd,
+                WM_SETFONT,
+                Some(WPARAM(fonts.url.0 as usize)),
+                Some(LPARAM(1)),
+            );
         }
         let mut app = Self {
             hwnd,
             address_hwnd,
+            find_hwnd,
             command_hwnd,
             overlay_menu_hwnd,
             environment,
@@ -672,12 +716,16 @@ impl App {
                 name: "Space 1".to_string(),
             }],
             folders: Vec::new(),
+            bookmark_folders: Vec::new(),
+            bookmarks: Vec::new(),
             tabs: Vec::new(),
             active_workspace: 1,
             active: 0,
             next_id: 1,
             next_workspace_id: 2,
             next_folder_id: 1,
+            next_bookmark_id: 1,
+            next_bookmark_folder_id: 1,
             next_sidebar_order: 1024,
             workspace_active_tabs: Vec::new(),
             sidebar_scroll_offset: 0,
@@ -732,6 +780,10 @@ impl App {
             saved_rect: RECT::default(),
             command_selected_index: None,
             command_scroll_offset: 0,
+            find_open: false,
+            find_query: String::new(),
+            find_match_count: 0,
+            find_current_match: 0,
             is_deleting: false,
             last_address_text: String::new(),
             has_typed: false,
@@ -748,6 +800,7 @@ impl App {
             dl_panel_cache: RefCell::new(None),
         };
         app.load_state()?;
+        app.ensure_default_bookmark_folder();
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
         }
@@ -762,6 +815,247 @@ impl App {
         let order = self.next_sidebar_order;
         self.next_sidebar_order = self.next_sidebar_order.saturating_add(1024);
         order
+    }
+
+    fn ensure_default_bookmark_folder(&mut self) {
+        if self.bookmark_folders.is_empty() {
+            self.bookmark_folders.push(BookmarkFolder {
+                id: 1,
+                parent_id: None,
+                name: "Favorites".to_string(),
+                sidebar_order: 1024,
+            });
+            self.next_bookmark_folder_id = 2;
+        }
+    }
+
+    fn active_page_snapshot(&self) -> Option<(String, String)> {
+        self.active_tab_index().and_then(|index| {
+            self.tabs.get(index).and_then(|tab| {
+                if tab.url.trim().is_empty() || tab.url == "about:blank" {
+                    None
+                } else {
+                    Some((tab.title.clone(), tab.url.clone()))
+                }
+            })
+        })
+    }
+
+    fn bookmark_index_for_url(&self, url: &str) -> Option<usize> {
+        let normalized = normalize_url_for_dedup(url);
+        self.bookmarks
+            .iter()
+            .position(|bookmark| normalize_url_for_dedup(&bookmark.url) == normalized)
+    }
+
+    fn is_active_bookmarked(&self) -> bool {
+        self.active_page_snapshot()
+            .and_then(|(_, url)| self.bookmark_index_for_url(&url))
+            .is_some()
+    }
+
+    fn toggle_active_bookmark(&mut self) {
+        let Some((title, url)) = self.active_page_snapshot() else {
+            return;
+        };
+        if let Some(index) = self.bookmark_index_for_url(&url) {
+            self.bookmarks.remove(index);
+        } else {
+            self.ensure_default_bookmark_folder();
+            let folder_id = self.bookmark_folders.first().map(|folder| folder.id);
+            let id = self.next_bookmark_id;
+            self.next_bookmark_id += 1;
+            let order = self.allocate_sidebar_order();
+            let host_tag = display_host(&url);
+            let tags = if host_tag.is_empty() {
+                Vec::new()
+            } else {
+                vec![host_tag]
+            };
+            self.bookmarks.push(Bookmark {
+                id,
+                folder_id,
+                title: if title.trim().is_empty() {
+                    label_for_url(&url)
+                } else {
+                    title
+                },
+                url,
+                tags,
+                created_at: current_timestamp(),
+                sidebar_order: order,
+            });
+        }
+        self.save_state();
+        self.refresh();
+    }
+
+    fn bookmark_button_rect(&self) -> RECT {
+        let pill = self.address_pill_rect();
+        RECT {
+            left: pill.right - 34,
+            top: pill.top + 3,
+            right: pill.right - 6,
+            bottom: pill.bottom - 3,
+        }
+    }
+
+    fn find_bar_rect(&self) -> RECT {
+        let rect = client_rect(self.hwnd);
+        let y = self.topbar_y() + 8;
+        let right = (rect.right - 150).max(360);
+        RECT {
+            left: (right - 360).max(160),
+            top: y,
+            right,
+            bottom: y + 42,
+        }
+    }
+
+    fn find_input_rect(&self) -> RECT {
+        let bar = self.find_bar_rect();
+        RECT {
+            left: bar.left + 14,
+            top: bar.top + 10,
+            right: bar.right - 128,
+            bottom: bar.bottom - 10,
+        }
+    }
+
+    fn find_prev_rect(&self) -> RECT {
+        let bar = self.find_bar_rect();
+        RECT {
+            left: bar.right - 114,
+            top: bar.top + 7,
+            right: bar.right - 88,
+            bottom: bar.bottom - 7,
+        }
+    }
+
+    fn find_next_rect(&self) -> RECT {
+        let prev = self.find_prev_rect();
+        RECT {
+            left: prev.right + 4,
+            top: prev.top,
+            right: prev.right + 30,
+            bottom: prev.bottom,
+        }
+    }
+
+    fn find_close_rect(&self) -> RECT {
+        let next = self.find_next_rect();
+        RECT {
+            left: next.right + 8,
+            top: next.top,
+            right: next.right + 34,
+            bottom: next.bottom,
+        }
+    }
+
+    fn open_find_bar(&mut self) {
+        self.find_open = true;
+        if self.topbar_mode == SidebarMode::Hidden {
+            self.topbar_mode = SidebarMode::Overlay;
+            self.topbar_expand_mode = SidebarMode::Overlay;
+            self.topbar_height = TOPBAR_EXPANDED;
+            self.topbar_target = TOPBAR_EXPANDED;
+            self.animating_topbar = false;
+        }
+        set_window_text(self.find_hwnd, &self.find_query);
+        self.layout();
+        unsafe {
+            let _ = SetFocus(Some(self.find_hwnd));
+            let _ = WindowsAndMessaging::SendMessageW(
+                self.find_hwnd,
+                EM_SETSEL,
+                Some(WPARAM(0)),
+                Some(LPARAM(-1)),
+            );
+        }
+        self.run_find_script(0);
+        self.refresh();
+    }
+
+    fn close_find_bar(&mut self) {
+        self.find_open = false;
+        self.find_query.clear();
+        self.find_match_count = 0;
+        self.find_current_match = 0;
+        self.run_find_script(0);
+        self.layout();
+        self.refresh();
+    }
+
+    fn run_find_script(&mut self, delta: i32) {
+        if !self.find_open && self.find_query.is_empty() {
+            self.execute_find_script("", 0);
+            return;
+        }
+        let query = self.find_query.clone();
+        self.execute_find_script(&query, delta);
+    }
+
+    fn execute_find_script(&self, query: &str, delta: i32) {
+        let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        else {
+            return;
+        };
+        let script = build_find_script(query, delta);
+        let hwnd = self.hwnd;
+        unsafe {
+            let js = CoTaskMemPWSTR::from(script.as_str());
+            let _ = tab.webview.ExecuteScript(
+                *js.as_ref().as_pcwstr(),
+                &ExecuteScriptCompletedHandler::create(Box::new(move |error_code, result| {
+                    if error_code.is_ok() {
+                        let raw = result.to_string();
+                        let count = parse_json_usize_field(&raw, "count").unwrap_or(0);
+                        let index = parse_json_usize_field(&raw, "index").unwrap_or(0);
+                        with_app(hwnd, |app| {
+                            app.find_match_count = count;
+                            app.find_current_match = if count == 0 { 0 } else { index + 1 };
+                            app.refresh();
+                        });
+                    }
+                    Ok(())
+                })),
+            );
+        }
+    }
+
+    fn active_zoom_percent(&self) -> i32 {
+        self.active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| {
+                let mut factor = 1.0;
+                unsafe { tab.controller.ZoomFactor(&mut factor).ok()? };
+                Some((factor * 100.0).round() as i32)
+            })
+            .unwrap_or(100)
+    }
+
+    fn set_active_zoom(&mut self, factor: f64) {
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
+            let factor = factor.clamp(0.25, 5.0);
+            unsafe {
+                let _ = tab.controller.SetZoomFactor(factor);
+            }
+            self.refresh();
+        }
+    }
+
+    fn adjust_active_zoom(&mut self, delta: f64) {
+        let current = self.active_zoom_percent() as f64 / 100.0;
+        self.set_active_zoom(current + delta);
+    }
+
+    fn reset_active_zoom(&mut self) {
+        self.set_active_zoom(1.0);
     }
 
     fn create_tab_in_workspace(
@@ -841,6 +1135,33 @@ impl App {
         }
         self.save_state();
         Ok(())
+    }
+
+    fn duplicate_tab(&mut self, index: usize, activate: bool) -> Option<usize> {
+        let snapshot = self.tabs.get(index).map(|tab| {
+            (
+                tab.workspace_id,
+                tab.folder_id,
+                tab.pinned,
+                tab.title.clone(),
+                tab.pinned_url.clone().unwrap_or_else(|| tab.url.clone()),
+                tab.history.clone(),
+                tab.history_cursor,
+            )
+        })?;
+        let (workspace_id, folder_id, pinned, title, url, history, history_cursor) = snapshot;
+        if self
+            .create_tab_in_workspace(&url, workspace_id, folder_id, pinned, activate, Some(title))
+            .is_err()
+        {
+            return None;
+        }
+        let new_index = self.tabs.len().checked_sub(1)?;
+        if let Some(tab) = self.tabs.get_mut(new_index) {
+            tab.history = history;
+            tab.history_cursor = history_cursor.min(tab.history.len().saturating_sub(1));
+        }
+        Some(new_index)
     }
 
     fn active_tab_index(&self) -> Option<usize> {
@@ -1608,6 +1929,8 @@ impl App {
         self.loading_state = true;
         self.workspaces.clear();
         self.folders.clear();
+        self.bookmark_folders.clear();
+        self.bookmarks.clear();
         self.tabs.clear();
         self.workspace_active_tabs.clear();
         self.visited_sites.clear();
@@ -1647,6 +1970,52 @@ impl App {
                             name: parts[3].clone(),
                             collapsed: parts.get(4).map(|value| value == "1").unwrap_or(false),
                             pinned: parts.get(5).map(|value| value == "1").unwrap_or(false),
+                            sidebar_order: parts
+                                .get(7)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .unwrap_or(fallback_sidebar_order),
+                        });
+                    }
+                }
+                "bookmark_folder" if parts.len() >= 4 => {
+                    if let Ok(id) = parts[1].parse::<usize>() {
+                        let parent_id = if parts[2].is_empty() {
+                            None
+                        } else {
+                            parts[2].parse::<usize>().ok()
+                        };
+                        self.bookmark_folders.push(BookmarkFolder {
+                            id,
+                            parent_id,
+                            name: parts[3].clone(),
+                            sidebar_order: parts
+                                .get(4)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .unwrap_or(fallback_sidebar_order),
+                        });
+                    }
+                }
+                "bookmark" if parts.len() >= 5 => {
+                    if let Ok(id) = parts[1].parse::<usize>() {
+                        let folder_id = if parts[2].is_empty() {
+                            None
+                        } else {
+                            parts[2].parse::<usize>().ok()
+                        };
+                        let tags = parts
+                            .get(5)
+                            .map(|raw| parse_tag_list(raw))
+                            .unwrap_or_default();
+                        self.bookmarks.push(Bookmark {
+                            id,
+                            folder_id,
+                            title: parts[3].clone(),
+                            url: parts[4].clone(),
+                            tags,
+                            created_at: parts
+                                .get(6)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .unwrap_or_else(current_timestamp),
                             sidebar_order: parts
                                 .get(7)
                                 .and_then(|value| value.parse::<u64>().ok())
@@ -1728,6 +2097,21 @@ impl App {
             .folders
             .iter()
             .map(|folder| folder.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.ensure_default_bookmark_folder();
+        self.next_bookmark_folder_id = self
+            .bookmark_folders
+            .iter()
+            .map(|folder| folder.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.next_bookmark_id = self
+            .bookmarks
+            .iter()
+            .map(|bookmark| bookmark.id)
             .max()
             .unwrap_or(0)
             + 1;
@@ -1820,6 +2204,33 @@ impl App {
                     .map(|id| id.to_string())
                     .unwrap_or_default(),
                 folder.sidebar_order
+            ));
+        }
+        for folder in &self.bookmark_folders {
+            lines.push(format!(
+                "bookmark_folder\t{}\t{}\t{}\t{}",
+                folder.id,
+                folder
+                    .parent_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                escape_state(&folder.name),
+                folder.sidebar_order
+            ));
+        }
+        for bookmark in &self.bookmarks {
+            lines.push(format!(
+                "bookmark\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                bookmark.id,
+                bookmark
+                    .folder_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                escape_state(&bookmark.title),
+                escape_state(&bookmark.url),
+                serialize_tag_list(&bookmark.tags),
+                bookmark.created_at,
+                bookmark.sidebar_order
             ));
         }
         for tab in &self.tabs {
@@ -1917,7 +2328,12 @@ impl App {
             let mut token = 0;
             webview.add_NavigationCompleted(
                 &NavigationCompletedEventHandler::create(Box::new(move |_sender, _args| {
-                    with_app(hwnd, |app| app.set_tab_loading(tab_id, false));
+                    with_app(hwnd, |app| {
+                        app.set_tab_loading(tab_id, false);
+                        if app.find_open {
+                            app.run_find_script(0);
+                        }
+                    });
                     Ok(())
                 })),
                 &mut token,
@@ -3003,6 +3419,31 @@ impl App {
         }
     }
 
+    fn reopen_closed_tab_at(&mut self, recent_index: usize) {
+        let Some(index) = self.closed_tabs.len().checked_sub(1 + recent_index) else {
+            return;
+        };
+        let closed = self.closed_tabs.remove(index);
+        let mut target_workspace = closed.workspace_id;
+        if !self.workspaces.iter().any(|w| w.id == target_workspace) {
+            target_workspace = self.active_workspace;
+        }
+        let mut target_folder = closed.folder_id;
+        if let Some(f_id) = target_folder {
+            if !self.folders.iter().any(|f| f.id == f_id) {
+                target_folder = None;
+            }
+        }
+        let _ = self.create_tab_in_workspace(
+            &closed.url,
+            target_workspace,
+            target_folder,
+            false,
+            true,
+            Some(closed.title),
+        );
+    }
+
     fn navigate_active_from_address(&mut self) {
         if self.command_open {
             self.submit_command();
@@ -3653,7 +4094,33 @@ impl App {
             }
         }
 
-        // 2. Get visited history sites matching query, sorted by frecency score descending
+        // 2. Get bookmarks matching query
+        for bookmark in &self.bookmarks {
+            let matches_query = query.is_empty()
+                || bookmark.url.to_ascii_lowercase().contains(&query)
+                || bookmark.title.to_ascii_lowercase().contains(&query)
+                || bookmark
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_ascii_lowercase().contains(&query));
+            if !matches_query {
+                continue;
+            }
+            let norm_bookmark = normalize_url_for_dedup(&bookmark.url);
+            if rows
+                .iter()
+                .any(|row| normalize_url_for_dedup(&row.2) == norm_bookmark)
+            {
+                continue;
+            }
+            rows.push((
+                None,
+                format!("Bookmark: {}", bookmark.title),
+                bookmark.url.clone(),
+            ));
+        }
+
+        // 3. Get visited history sites matching query, sorted by frecency score descending
         let mut matched_history: Vec<&VisitedSite> = self
             .visited_sites
             .iter()
@@ -3689,7 +4156,7 @@ impl App {
             rows.push((None, label_for_url(&site.url), site.url.clone()));
         }
 
-        // 3. If there is a query, sort the results to prioritize prefix matches
+        // 4. If there is a query, sort the results to prioritize prefix matches
         if !query.is_empty() {
             rows.sort_by_key(|row| {
                 let url = &row.2;
@@ -3823,6 +4290,23 @@ impl App {
                     self.command_hwnd,
                     WindowsAndMessaging::SW_HIDE,
                 );
+            }
+            if self.find_open && !self.fullscreen {
+                let input = self.find_input_rect();
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.find_hwnd,
+                    Some(HWND_TOP),
+                    input.left,
+                    input.top,
+                    (input.right - input.left).max(80),
+                    input.bottom - input.top,
+                    flags,
+                );
+                let _ =
+                    WindowsAndMessaging::ShowWindow(self.find_hwnd, WindowsAndMessaging::SW_SHOW);
+            } else {
+                let _ =
+                    WindowsAndMessaging::ShowWindow(self.find_hwnd, WindowsAndMessaging::SW_HIDE);
             }
         }
 
@@ -4161,10 +4645,45 @@ impl App {
                 RECT {
                     left: edit_rect.left + 14,
                     top: edit_rect.top,
-                    right: edit_rect.right - 14,
+                    right: edit_rect.right - 92,
                     bottom: edit_rect.bottom,
                 },
                 COLOR_TEXT,
+            );
+            let zoom_rect = RECT {
+                left: edit_rect.right - 88,
+                top: edit_rect.top,
+                right: edit_rect.right - 38,
+                bottom: edit_rect.bottom,
+            };
+            draw_centered_text(
+                hdc,
+                &self.fonts.small,
+                &format!("{}%", self.active_zoom_percent()),
+                zoom_rect,
+                COLOR_MUTED,
+            );
+            let bookmark_rect = self.bookmark_button_rect();
+            let bookmark_hover = self.hover_target == Some(HoverTarget::Bookmark);
+            let bookmarked = self.is_active_bookmarked();
+            if bookmark_hover {
+                fill_round_rect(hdc, bookmark_rect, COLOR_SURFACE_HOVER, 8);
+            }
+            let bookmark_glyph = if bookmarked {
+                glyph(0xE735)
+            } else {
+                glyph(0xE734)
+            };
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.toolbar_icon,
+                bookmark_glyph.as_str(),
+                bookmark_rect,
+                if bookmarked || bookmark_hover {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_MUTED
+                },
             );
 
             draw_settings_button(
@@ -4330,6 +4849,9 @@ impl App {
 
             if self.settings_open {
                 self.paint_settings_menu(hdc);
+            }
+            if self.find_open {
+                self.paint_find_bar(hdc);
             }
             if self.download_panel.is_some() {
                 if self.download_panel_reveal >= 0.995 {
@@ -5070,6 +5592,76 @@ impl App {
         }
     }
 
+    fn paint_find_bar(&self, hdc: HDC) {
+        unsafe {
+            let bar = self.find_bar_rect();
+            fill_round_rect(hdc, bar, 0x111111, 10);
+            draw_outline(hdc, bar, 0x343434, 10);
+            let input = self.find_input_rect();
+            fill_round_rect(
+                hdc,
+                RECT {
+                    left: input.left - 6,
+                    top: input.top - 4,
+                    right: input.right + 6,
+                    bottom: input.bottom + 4,
+                },
+                0x080808,
+                8,
+            );
+            let count_text = if self.find_match_count == 0 {
+                "0/0".to_string()
+            } else {
+                format!("{}/{}", self.find_current_match, self.find_match_count)
+            };
+            draw_centered_text(
+                hdc,
+                &self.fonts.small,
+                &count_text,
+                RECT {
+                    left: input.right + 8,
+                    top: bar.top,
+                    right: input.right + 50,
+                    bottom: bar.bottom,
+                },
+                COLOR_MUTED,
+            );
+            let prev = self.find_prev_rect();
+            let next = self.find_next_rect();
+            let close = self.find_close_rect();
+            if self.hover_target == Some(HoverTarget::FindPrev) {
+                fill_round_rect(hdc, prev, COLOR_SURFACE_HOVER, 7);
+            }
+            if self.hover_target == Some(HoverTarget::FindNext) {
+                fill_round_rect(hdc, next, COLOR_SURFACE_HOVER, 7);
+            }
+            if self.hover_target == Some(HoverTarget::FindClose) {
+                fill_round_rect(hdc, close, COLOR_SURFACE_HOVER, 7);
+            }
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.toolbar_icon,
+                glyph(0xE70E).as_str(),
+                prev,
+                COLOR_MUTED,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.toolbar_icon,
+                glyph(0xE70D).as_str(),
+                next,
+                COLOR_MUTED,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE711).as_str(),
+                close,
+                COLOR_MUTED,
+            );
+        }
+    }
+
     fn paint_command_popup(&self, hdc: HDC) {
         unsafe {
             let rect = client_rect(self.command_hwnd);
@@ -5746,6 +6338,26 @@ impl App {
             return;
         }
 
+        if point_in_rect(x, y, self.bookmark_button_rect()) {
+            self.toggle_active_bookmark();
+            return;
+        }
+
+        if self.find_open {
+            if point_in_rect(x, y, self.find_prev_rect()) {
+                self.run_find_script(-1);
+                return;
+            }
+            if point_in_rect(x, y, self.find_next_rect()) {
+                self.run_find_script(1);
+                return;
+            }
+            if point_in_rect(x, y, self.find_close_rect()) {
+                self.close_find_bar();
+                return;
+            }
+        }
+
         if point_in_rect(x, y, self.address_pill_rect()) {
             self.open_command(CommandMode::Navigate);
             return;
@@ -5903,6 +6515,7 @@ impl App {
                         "Pin Tab".to_string()
                     },
                 ));
+                labels.push((MENU_TAB_DUPLICATE, "Duplicate Tab".to_string()));
                 labels.push((MENU_WORKSPACE_NEW_FOLDER, "New Folder".to_string()));
                 if tab.folder_id.is_some() {
                     labels.push((MENU_TAB_REMOVE_FOLDER, "Remove From Folder".to_string()));
@@ -5927,17 +6540,28 @@ impl App {
     }
 
     fn open_sidebar_blank_menu(&mut self, x: i32, y: i32) {
-        self.open_overlay_menu(
-            x,
-            y,
-            MenuTarget::SidebarBlank,
-            vec![
-                menu_item(MENU_TAB_NEW, "New Tab"),
-                menu_item(MENU_WORKSPACE_NEW_FOLDER, "New Folder"),
-                menu_item(MENU_WORKSPACE_NEW, "New Workspace"),
-                menu_item(MENU_WORKSPACE_RENAME, "Rename Workspace"),
-            ],
-        );
+        let mut items = vec![
+            menu_item(MENU_TAB_NEW, "New Tab"),
+            menu_item(MENU_WORKSPACE_NEW_FOLDER, "New Folder"),
+            menu_item(MENU_WORKSPACE_NEW, "New Workspace"),
+            menu_item(MENU_WORKSPACE_RENAME, "Rename Workspace"),
+        ];
+        if !self.closed_tabs.is_empty() {
+            items.push(menu_item(MENU_REOPEN_CLOSED, "Reopen Last Closed Tab"));
+            for (offset, closed) in self.closed_tabs.iter().rev().take(5).enumerate() {
+                let title = if closed.title.trim().is_empty() {
+                    label_for_url(&closed.url)
+                } else {
+                    closed.title.clone()
+                };
+                items.push(menu_item_with_subtitle(
+                    MENU_RECENTLY_CLOSED_BASE + offset,
+                    &title,
+                    &closed.url,
+                ));
+            }
+        }
+        self.open_overlay_menu(x, y, MenuTarget::SidebarBlank, items);
     }
 
     fn open_new_item_menu(&mut self, x: i32, y: i32) {
@@ -6111,6 +6735,10 @@ impl App {
                 };
                 self.open_command(CommandMode::RenameWorkspace(workspace_id));
             }
+            MENU_REOPEN_CLOSED => self.reopen_closed_tab(),
+            id if (MENU_RECENTLY_CLOSED_BASE..MENU_RECENTLY_CLOSED_BASE + 20).contains(&id) => {
+                self.reopen_closed_tab_at(id - MENU_RECENTLY_CLOSED_BASE);
+            }
             MENU_FOLDER_RENAME => {
                 if let SidebarHit::Folder(folder_id) = hit {
                     if self.renaming_folder_id.is_some() {
@@ -6156,6 +6784,7 @@ impl App {
             MENU_TAB_PIN
             | MENU_TAB_UNPIN
             | MENU_TAB_REMOVE_FOLDER
+            | MENU_TAB_DUPLICATE
             | MENU_TAB_CLOSE
             | MENU_TAB_DELETE_PIN
                 if matches!(hit, SidebarHit::Tab(_)) =>
@@ -6179,6 +6808,9 @@ impl App {
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.folder_id = None;
                             }
+                        }
+                        MENU_TAB_DUPLICATE => {
+                            let _ = self.duplicate_tab(index, true);
                         }
                         MENU_TAB_CLOSE => self.close_tab(index),
                         MENU_TAB_DELETE_PIN => self.delete_pin(index),
@@ -6354,7 +6986,13 @@ impl App {
         }
 
         if self.hover_target.is_none() {
-            if point_in_rect(x, y, self.logo_rect()) {
+            if self.find_open && point_in_rect(x, y, self.find_prev_rect()) {
+                self.hover_target = Some(HoverTarget::FindPrev);
+            } else if self.find_open && point_in_rect(x, y, self.find_next_rect()) {
+                self.hover_target = Some(HoverTarget::FindNext);
+            } else if self.find_open && point_in_rect(x, y, self.find_close_rect()) {
+                self.hover_target = Some(HoverTarget::FindClose);
+            } else if point_in_rect(x, y, self.logo_rect()) {
                 self.hover_target = Some(HoverTarget::Logo);
             } else if self.new_tab_opacity() > 0.6 && point_in_rect(x, y, self.new_tab_rect()) {
                 self.hover_target = Some(HoverTarget::NewTab);
@@ -6372,6 +7010,8 @@ impl App {
                     self.hover_target = Some(HoverTarget::Forward);
                 } else if point_in_rect(x, y, reload) {
                     self.hover_target = Some(HoverTarget::Reload);
+                } else if point_in_rect(x, y, self.bookmark_button_rect()) {
+                    self.hover_target = Some(HoverTarget::Bookmark);
                 } else if point_in_rect(x, y, self.address_pill_rect()) {
                     self.hover_target = Some(HoverTarget::Address);
                 } else if point_in_rect(x, y, self.settings_rect()) {
@@ -6521,17 +7161,25 @@ impl App {
             self.drop_target = Some(DropTarget::None);
             return false;
         }
-        self.handle_drop(drag.source, x, y);
+        let duplicate = matches!(drag.source, DragSource::Tab(_))
+            && unsafe { (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
+        self.handle_drop(drag.source, x, y, duplicate);
         self.drop_target = Some(DropTarget::None);
         true
     }
-    fn handle_drop(&mut self, source: DragSource, _x: i32, _y: i32) {
+    fn handle_drop(&mut self, source: DragSource, _x: i32, _y: i32, duplicate_tab: bool) {
         let target = self.drop_target.unwrap_or(DropTarget::None);
 
         match source {
-            DragSource::Tab(from_index) => {
+            DragSource::Tab(mut from_index) => {
                 if from_index >= self.tabs.len() {
                     return;
+                }
+                if duplicate_tab {
+                    let Some(new_index) = self.duplicate_tab(from_index, true) else {
+                        return;
+                    };
+                    from_index = new_index;
                 }
                 let dragged_workspace = self.tabs[from_index].workspace_id;
 
@@ -7458,6 +8106,38 @@ fn create_address_bar(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+fn create_find_edit(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("EDIT"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_TABSTOP.0),
+            0,
+            0,
+            220,
+            22,
+            Some(parent),
+            Some(HMENU(FIND_ID as usize as *mut _)),
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        let _ = WindowsAndMessaging::SendMessageW(
+            hwnd,
+            EM_SETMARGINS,
+            Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)),
+            Some(LPARAM((2 | (2 << 16)) as isize)),
+        );
+        set_edit_cue_banner(hwnd, "Find in page");
+        OLD_FIND_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            find_edit_proc as *const () as isize,
+        ));
+        Ok(hwnd)
+    }
+}
+
 fn create_command_popup(parent: HWND) -> AppResult<HWND> {
     unsafe {
         let hwnd = WindowsAndMessaging::CreateWindowExW(
@@ -7692,6 +8372,36 @@ fn is_typing_key(key: u32) -> bool {
         0x91, // VK_SCROLL
     ];
     !excluded.contains(&key)
+}
+
+unsafe extern "system" fn find_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        let key = w_param.0 as u32;
+        if key == VK_RETURN.0 as u32 {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+                with_app(parent, |app| {
+                    app.run_find_script(if shift { -1 } else { 1 })
+                });
+            }
+            return LRESULT(0);
+        }
+        if key == VK_ESCAPE.0 as u32 {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| app.close_find_bar());
+            }
+            return LRESULT(0);
+        }
+    }
+    if msg == WM_CHAR && w_param.0 as u32 == VK_RETURN.0 as u32 {
+        return LRESULT(0);
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_FIND_PROC, hwnd, msg, w_param, l_param)
 }
 
 unsafe extern "system" fn address_bar_proc(
@@ -8029,6 +8739,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     let logo = app.logo_rect();
                     let new_tab = app.new_tab_rect();
                     let address = app.address_pill_rect();
+                    let bookmark = app.bookmark_button_rect();
+                    let find_bar = app.find_bar_rect();
                     let (min_btn, max_btn, close_btn) = app.window_button_rects();
 
                     if point_in_rect(pt.x, pt.y, logo)
@@ -8037,6 +8749,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         || point_in_rect(pt.x, pt.y, forward)
                         || point_in_rect(pt.x, pt.y, reload)
                         || point_in_rect(pt.x, pt.y, address)
+                        || point_in_rect(pt.x, pt.y, bookmark)
+                        || (app.find_open && point_in_rect(pt.x, pt.y, find_bar))
                         || point_in_rect(pt.x, pt.y, min_btn)
                         || point_in_rect(pt.x, pt.y, max_btn)
                         || point_in_rect(pt.x, pt.y, close_btn)
@@ -8249,6 +8963,15 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         WM_COMMAND => {
             let id = loword(w_param.0 as u32) as i32;
             let code = hiword(w_param.0 as u32) as u16;
+            if id == FIND_ID {
+                if code == 0x0300 {
+                    with_app(hwnd, |app| {
+                        app.find_query = get_window_text(app.find_hwnd);
+                        app.run_find_script(0);
+                    });
+                }
+                return LRESULT(0);
+            }
             if id == ADDRESS_ID {
                 if code == 0x0300 {
                     with_app(hwnd, |app| {
@@ -8405,6 +9128,12 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
             0x5A if ctrl && shift => {
                 app.reopen_closed_tab();
             }
+            0x44 if ctrl => {
+                app.toggle_active_bookmark();
+            }
+            0x46 if ctrl => {
+                app.open_find_bar();
+            }
             0x4C if ctrl => {
                 app.open_command(CommandMode::Navigate);
             }
@@ -8420,6 +9149,9 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
             0x52 if ctrl => {
                 app.reload();
             }
+            0x30 | 0x60 if ctrl => app.reset_active_zoom(),
+            0xBB | 0x6B if ctrl => app.adjust_active_zoom(0.1),
+            0xBD | 0x6D if ctrl => app.adjust_active_zoom(-0.1),
             0x25 if alt => app.go_back(),
             0x27 if alt => app.go_forward(),
             0x41 if alt => app.go_back(),
@@ -8442,7 +9174,7 @@ fn is_aster_shortcut(key: u32) -> bool {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
         let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
-        matches!(key, 0x4C | 0x53 | 0x54 | 0x57 | 0x52 if ctrl)
+        matches!(key, 0x44 | 0x46 | 0x4C | 0x53 | 0x54 | 0x57 | 0x52 | 0x30 | 0x60 | 0xBB | 0x6B | 0xBD | 0x6D if ctrl)
             || (key == 0x5A && ctrl && shift)
             || matches!(key, 0x25 | 0x27 | 0x41 | 0x44 | 0x57 | 0x53 if alt)
             || key == VK_F5.0 as u32
@@ -10020,6 +10752,139 @@ fn parse_history(raw: &str) -> Vec<HistoryEntry> {
             }
         })
         .collect()
+}
+
+fn serialize_tag_list(tags: &[String]) -> String {
+    tags.iter()
+        .map(|tag| escape_state(tag))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_tag_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(unescape_state)
+        .filter(|tag| !tag.trim().is_empty())
+        .collect()
+}
+
+fn js_string_literal(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn build_find_script(query: &str, delta: i32) -> String {
+    format!(
+        r##"(function(query, delta) {{
+  const cls = "aster-find-mark";
+  const activeCls = "aster-find-active";
+  function clearMarks() {{
+    document.querySelectorAll("mark." + cls).forEach((mark) => {{
+      const parent = mark.parentNode;
+      if (!parent) return;
+      parent.replaceChild(document.createTextNode(mark.textContent || ""), mark);
+      parent.normalize();
+    }});
+  }}
+  function collectTextNodes(root) {{
+    const nodes = [];
+    if (!root) return nodes;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {{
+      acceptNode(node) {{
+        const parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        const tag = parent.tagName;
+        if (["SCRIPT","STYLE","NOSCRIPT","TEXTAREA","INPUT","MARK"].includes(tag)) {{
+          return NodeFilter.FILTER_REJECT;
+        }}
+        return node.nodeValue && node.nodeValue.trim()
+          ? NodeFilter.FILTER_ACCEPT
+          : NodeFilter.FILTER_REJECT;
+      }}
+    }});
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    return nodes;
+  }}
+  query = (query || "").trim();
+  if (!query) {{
+    clearMarks();
+    window.__asterFind = {{ query: "", index: 0 }};
+    return {{ count: 0, index: 0 }};
+  }}
+  if (!window.__asterFind || window.__asterFind.query !== query) {{
+    clearMarks();
+    const needle = query.toLowerCase();
+    collectTextNodes(document.body).forEach((node) => {{
+      const text = node.nodeValue || "";
+      const lower = text.toLowerCase();
+      let cursor = 0;
+      let hit = lower.indexOf(needle);
+      if (hit < 0) return;
+      const frag = document.createDocumentFragment();
+      while (hit >= 0) {{
+        if (hit > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, hit)));
+        const mark = document.createElement("mark");
+        mark.className = cls;
+        mark.textContent = text.slice(hit, hit + query.length);
+        mark.style.background = "#f16f63";
+        mark.style.color = "#0b0b0b";
+        mark.style.borderRadius = "2px";
+        mark.style.padding = "0 1px";
+        frag.appendChild(mark);
+        cursor = hit + query.length;
+        hit = lower.indexOf(needle, cursor);
+      }}
+      if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+      node.parentNode.replaceChild(frag, node);
+    }});
+    window.__asterFind = {{ query, index: 0 }};
+  }}
+  const marks = Array.from(document.querySelectorAll("mark." + cls));
+  if (!marks.length) return {{ count: 0, index: 0 }};
+  let index = window.__asterFind.index || 0;
+  if (delta) index = (index + delta + marks.length) % marks.length;
+  window.__asterFind.index = index;
+  marks.forEach((mark) => {{
+    mark.classList.remove(activeCls);
+    mark.style.outline = "";
+  }});
+  const active = marks[index];
+  active.classList.add(activeCls);
+  active.style.outline = "2px solid #ffffff";
+  active.scrollIntoView({{ block: "center", inline: "nearest" }});
+  return {{ count: marks.length, index }};
+}})({}, {});"##,
+        js_string_literal(query),
+        delta
+    )
+}
+
+fn parse_json_usize_field(raw: &str, field: &str) -> Option<usize> {
+    let needle = format!("\"{}\":", field);
+    let start = raw.find(&needle)? + needle.len();
+    let mut digits = String::new();
+    for ch in raw[start..].chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            break;
+        } else if ch != ' ' {
+            break;
+        }
+    }
+    digits.parse::<usize>().ok()
 }
 
 fn escape_state(value: &str) -> String {
