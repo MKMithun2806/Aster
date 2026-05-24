@@ -6354,7 +6354,13 @@ impl App {
                     }
                 }
                 DropTarget::Tab(_) => {
-                    // Dropped on a tab - preserve existing folder state
+                    if let Some(pos) = self.folders.iter().position(|f| f.id == from_folder_id) {
+                        let mut folder = self.folders.remove(pos);
+                        folder.pinned = true;
+                        folder.parent_id = None;
+                        self.folders.insert(0, folder);
+                    }
+                    self.propagate_folder_pinning(from_folder_id, true);
                 }
                 DropTarget::None if in_sidebar => {
                     if let Some(folder) =
