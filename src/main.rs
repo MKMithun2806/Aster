@@ -3820,7 +3820,7 @@ impl App {
     }
 
     fn open_settings_page(&mut self) {
-        self.navigate_active("aster:settings");
+        let _ = self.create_tab("aster:settings");
     }
 
     fn navigate_active(&mut self, url: &str) {
