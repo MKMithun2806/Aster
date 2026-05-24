@@ -6226,34 +6226,18 @@ impl App {
                 CURRENT_DRAG_GHOST_BITMAP = None;
             }
         }
-        self.drop_target = Some(DropTarget::None);
         if !drag.active {
+            self.drop_target = Some(DropTarget::None);
             return false;
         }
         self.handle_drop(drag.source, x, y);
+        self.drop_target = Some(DropTarget::None);
         true
     }
-    fn handle_drop(&mut self, source: DragSource, x: i32, y: i32) {
-        let hit = self.hit_sidebar(x, y);
-        let divider_y = self
-            .sidebar_row_rects()
-            .iter()
-            .find(|(row, _)| matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
-            .map(|(_, rect)| rect.top)
-            .unwrap_or(self.sidebar_rows_top() + 72);
+    fn handle_drop(&mut self, source: DragSource, x: i32, _y: i32) {
+        let target = self.drop_target.unwrap_or(DropTarget::None);
 
-        let hit = if hit.is_none() && x >= 0 && (x as f32) < self.sidebar_width {
-            if y <= divider_y {
-                Some(SidebarHit::PinnedSection)
-            } else {
-                None
-            }
-        } else {
-            hit
-        };
-
-        let is_normal_fallback =
-            hit.is_none() && x >= 0 && (x as f32) < self.sidebar_width && y > divider_y;
+        let in_sidebar = x >= 0 && (x as f32) < self.sidebar_width;
 
         match source {
             DragSource::Tab(from_index) => {
@@ -6262,8 +6246,8 @@ impl App {
                 }
                 let dragged_workspace = self.tabs[from_index].workspace_id;
 
-                match hit {
-                    Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
+                match target {
+                    DropTarget::PinnedSection => {
                         let tab_id = self.tabs[from_index].id;
                         let mut tab = self.tabs.remove(from_index);
                         tab.pinned = true;
@@ -6274,7 +6258,7 @@ impl App {
                             self.active = new_active;
                         }
                     }
-                    Some(SidebarHit::Folder(folder_id)) => {
+                    DropTarget::Folder(folder_id) => {
                         if let Some(folder) = self.folders.iter().find(|folder| {
                             folder.id == folder_id && folder.workspace_id == dragged_workspace
                         }) {
@@ -6289,7 +6273,7 @@ impl App {
                             }
                         }
                     }
-                    Some(SidebarHit::Tab(target_index)) if target_index < self.tabs.len() => {
+                    DropTarget::Tab(target_index) if target_index < self.tabs.len() => {
                         if target_index == from_index {
                             return;
                         }
@@ -6316,19 +6300,18 @@ impl App {
                             self.active = new_active;
                         }
                     }
-                    _ => {
-                        if is_normal_fallback {
-                            let mut tab = self.tabs.remove(from_index);
-                            tab.pinned = false;
-                            tab.pinned_url = None;
-                            tab.folder_id = None;
-                            self.tabs.push(tab);
-                        }
+                    DropTarget::None if in_sidebar => {
+                        let mut tab = self.tabs.remove(from_index);
+                        tab.pinned = false;
+                        tab.pinned_url = None;
+                        tab.folder_id = None;
+                        self.tabs.push(tab);
                     }
+                    _ => {}
                 }
             }
-            DragSource::Folder(from_folder_id) => match hit {
-                Some(SidebarHit::PinnedSection) | Some(SidebarHit::WorkspaceHeader) => {
+            DragSource::Folder(from_folder_id) => match target {
+                DropTarget::PinnedSection => {
                     if let Some(pos) = self.folders.iter().position(|f| f.id == from_folder_id) {
                         let mut folder = self.folders.remove(pos);
                         folder.pinned = true;
@@ -6337,7 +6320,7 @@ impl App {
                     }
                     self.propagate_folder_pinning(from_folder_id, true);
                 }
-                Some(SidebarHit::Folder(target_folder_id)) => {
+                DropTarget::Folder(target_folder_id) => {
                     if target_folder_id == from_folder_id
                         || self.is_descendant_of(target_folder_id, from_folder_id)
                         || self.is_descendant_of(from_folder_id, target_folder_id)
@@ -6359,17 +6342,16 @@ impl App {
                         self.propagate_folder_pinning(from_folder_id, target_pinned);
                     }
                 }
-                _ => {
-                    if is_normal_fallback {
-                        if let Some(folder) =
-                            self.folders.iter_mut().find(|f| f.id == from_folder_id)
-                        {
-                            folder.pinned = false;
-                            folder.parent_id = None;
-                        }
-                        self.propagate_folder_pinning(from_folder_id, false);
+                DropTarget::Tab(_) | DropTarget::None if in_sidebar => {
+                    if let Some(folder) =
+                        self.folders.iter_mut().find(|f| f.id == from_folder_id)
+                    {
+                        folder.pinned = false;
+                        folder.parent_id = None;
                     }
+                    self.propagate_folder_pinning(from_folder_id, false);
                 }
+                _ => {}
             },
         }
         self.save_state();
