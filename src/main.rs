@@ -12,6 +12,7 @@ use std::{
 
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
+    core::PWSTR,
     core::*,
     Win32::{
         Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -406,6 +407,7 @@ enum HoverTarget {
     Forward,
     Reload,
     Settings,
+    SettingsPage,
     ModeRow,
     ModeAuto,
     ModeDark,
@@ -622,6 +624,9 @@ struct App {
     last_clip_width: Cell<f32>,
     last_clip_top: Cell<f32>,
     last_bounds_rect: Cell<RECT>,
+    dominant_color: u32,
+    accent_color: u32,
+    custom_keybinds: Vec<(String, String)>,
     site_mode: SiteMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -783,6 +788,9 @@ impl App {
                 right: -1,
                 bottom: -1,
             }),
+            dominant_color: COLOR_BLACK,
+            accent_color: COLOR_ACCENT,
+            custom_keybinds: Vec::new(),
             site_mode: SiteMode::Auto,
             settings_open: false,
             mode_menu_open: false,
@@ -1033,7 +1041,7 @@ impl App {
         else {
             return;
         };
-        let script = build_find_script(query, delta, colorref_to_css(COLOR_ACCENT));
+        let script = build_find_script(query, delta, colorref_to_css(self.accent_color));
         let hwnd = self.hwnd;
         unsafe {
             let js = CoTaskMemPWSTR::from(script.as_str());
@@ -1213,6 +1221,110 @@ impl App {
         }
     }
 
+    fn attach_web_message_handler(&self, webview: &ICoreWebView2) {
+        let hwnd = self.hwnd;
+        unsafe {
+            let mut token = 0;
+            let _ = webview.add_WebMessageReceived(
+                &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+                    if let Some(args) = args {
+                        let mut raw = PWSTR::null();
+                        if args.TryGetWebMessageAsString(&mut raw).is_ok() {
+                            let message = take_pwstr(raw);
+                            with_app(hwnd, |app| app.handle_settings_message(&message));
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+        }
+    }
+
+    fn handle_settings_message(&mut self, message: &str) {
+        if let Some(value) = message.strip_prefix("settings:accent:") {
+            if let Some(color) = parse_css_color_to_colorref(value) {
+                self.accent_color = color;
+                self.run_find_script(0);
+            }
+        } else if let Some(value) = message.strip_prefix("settings:dominant:") {
+            if let Some(color) = parse_css_color_to_colorref(value) {
+                self.dominant_color = color;
+            }
+        } else if let Some(value) = message.strip_prefix("settings:site-mode:") {
+            match value {
+                "auto" => self.set_site_mode(SiteMode::Auto),
+                "dark" => self.set_site_mode(SiteMode::Dark),
+                "light" => self.set_site_mode(SiteMode::Light),
+                _ => {}
+            }
+        } else if let Some(value) = message.strip_prefix("settings:keybind:") {
+            if let Some((action, combo)) = value.rsplit_once(':') {
+                if !action.trim().is_empty() && !combo.trim().is_empty() {
+                    if let Some(existing) = self
+                        .custom_keybinds
+                        .iter_mut()
+                        .find(|(name, _)| name == action)
+                    {
+                        existing.1 = combo.to_string();
+                    } else {
+                        self.custom_keybinds
+                            .push((action.to_string(), combo.to_string()));
+                    }
+                }
+            }
+        }
+        self.save_state();
+        self.refresh();
+    }
+
+    fn run_custom_keybind(&mut self, key: u32, ctrl: bool, alt: bool, shift: bool) -> bool {
+        let combo = combo_label_for_event(key, ctrl, alt, shift);
+        if combo.is_empty() {
+            return false;
+        }
+        if let Some(action) = self
+            .custom_keybinds
+            .iter()
+            .find(|(_, saved)| saved.eq_ignore_ascii_case(&combo))
+            .map(|(action, _)| action.clone())
+        {
+            self.execute_keybind_action(&action);
+            return true;
+        }
+        if let Some(default_action) = default_action_for_event(key, ctrl, alt, shift) {
+            if self
+                .custom_keybinds
+                .iter()
+                .any(|(action, _)| action == default_action)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn execute_keybind_action(&mut self, action: &str) {
+        match action {
+            "Navigate" => self.open_command(CommandMode::Navigate),
+            "Bookmark site" => self.toggle_active_bookmark(),
+            "Find in page" => self.open_find_bar(),
+            "New tab" => self.open_command(CommandMode::NewTab),
+            "Close tab" => {
+                if let Some(index) = self.active_tab_index() {
+                    self.close_tab(index);
+                }
+            }
+            "Reload" => self.reload(),
+            "Reset zoom" => self.reset_active_zoom(),
+            "Zoom in" => self.adjust_active_zoom(0.1),
+            "Zoom out" => self.adjust_active_zoom(-0.1),
+            "Reopen closed tab" => self.reopen_closed_tab(),
+            "Toggle sidebar" => self.toggle_sidebar(),
+            _ => {}
+        }
+    }
+
     fn create_tab_in_workspace(
         &mut self,
         url: &str,
@@ -1230,6 +1342,7 @@ impl App {
         let webview = unsafe { controller.CoreWebView2()? };
         configure_webview(&webview)?;
         apply_site_mode_to_webview(&webview, self.site_mode);
+        self.attach_web_message_handler(&webview);
 
         let id = self.next_id;
         self.next_id += 1;
@@ -1282,11 +1395,15 @@ impl App {
             self.active_workspace = workspace_id;
             self.switch_to(index, true);
         }
-        let wide = CoTaskMemPWSTR::from(url);
-        unsafe {
-            let _ = self.tabs[index]
-                .webview
-                .Navigate(*wide.as_ref().as_pcwstr());
+        if url == "aster:settings" {
+            self.load_settings_page(index);
+        } else {
+            let wide = CoTaskMemPWSTR::from(url);
+            unsafe {
+                let _ = self.tabs[index]
+                    .webview
+                    .Navigate(*wide.as_ref().as_pcwstr());
+            }
         }
         self.save_state();
         Ok(())
@@ -2139,6 +2256,7 @@ impl App {
         self.tabs.clear();
         self.workspace_active_tabs.clear();
         self.visited_sites.clear();
+        self.custom_keybinds.clear();
 
         let mut tab_records = Vec::new();
         let mut active_workspace = 1usize;
@@ -2281,6 +2399,30 @@ impl App {
                         self.workspace_active_tabs.push((workspace_id, tab_id));
                     }
                 }
+                "setting" if parts.len() >= 3 => match parts[1].as_str() {
+                    "dominant_color" => {
+                        if let Ok(color) = parts[2].parse::<u32>() {
+                            self.dominant_color = color;
+                        }
+                    }
+                    "accent_color" => {
+                        if let Ok(color) = parts[2].parse::<u32>() {
+                            self.accent_color = color;
+                        }
+                    }
+                    "site_mode" => {
+                        self.site_mode = match parts[2].as_str() {
+                            "dark" => SiteMode::Dark,
+                            "light" => SiteMode::Light,
+                            _ => SiteMode::Auto,
+                        };
+                    }
+                    _ => {}
+                },
+                "keybind" if parts.len() >= 3 => {
+                    self.custom_keybinds
+                        .push((parts[1].clone(), parts[2].clone()));
+                }
                 _ => {}
             }
         }
@@ -2386,6 +2528,23 @@ impl App {
         }
         let mut lines = Vec::new();
         lines.push(format!("active_workspace\t{}", self.active_workspace));
+        lines.push(format!("setting\tdominant_color\t{}", self.dominant_color));
+        lines.push(format!("setting\taccent_color\t{}", self.accent_color));
+        lines.push(format!(
+            "setting\tsite_mode\t{}",
+            match self.site_mode {
+                SiteMode::Auto => "auto",
+                SiteMode::Dark => "dark",
+                SiteMode::Light => "light",
+            }
+        ));
+        for (action, combo) in &self.custom_keybinds {
+            lines.push(format!(
+                "keybind\t{}\t{}",
+                escape_state(action),
+                escape_state(combo)
+            ));
+        }
         for (workspace_id, active_tab_id) in &self.workspace_active_tabs {
             lines.push(format!("active_tab\t{}\t{}", workspace_id, active_tab_id));
         }
@@ -3660,11 +3819,19 @@ impl App {
         self.navigate_active(&url);
     }
 
+    fn open_settings_page(&mut self) {
+        self.navigate_active("aster:settings");
+    }
+
     fn navigate_active(&mut self, url: &str) {
         let Some(index) = self.active_tab_index() else {
             let _ = self.create_tab(url);
             return;
         };
+        if url == "aster:settings" {
+            self.load_settings_page(index);
+            return;
+        }
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = url.to_string();
             tab.title = label_for_url(url);
@@ -3672,6 +3839,25 @@ impl App {
             let wide = CoTaskMemPWSTR::from(url);
             unsafe {
                 let _ = tab.webview.Navigate(*wide.as_ref().as_pcwstr());
+            }
+        }
+        self.save_state();
+        self.refresh();
+    }
+
+    fn load_settings_page(&mut self, index: usize) {
+        let html = settings_page_html(
+            self.dominant_color,
+            self.accent_color,
+            self.site_mode.label(),
+        );
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.url = "aster:settings".to_string();
+            tab.title = "Aster Settings".to_string();
+            set_window_text(self.address_hwnd, "aster:settings");
+            unsafe {
+                let html = CoTaskMemPWSTR::from(html.as_str());
+                let _ = tab.webview.NavigateToString(*html.as_ref().as_pcwstr());
             }
         }
         self.save_state();
@@ -4175,7 +4361,7 @@ impl App {
         let bottom = settings.top - 8;
         RECT {
             left: 12,
-            top: bottom - 108,
+            top: bottom - 152,
             right: 196,
             bottom,
         }
@@ -4188,6 +4374,16 @@ impl App {
             top: menu.top + 10,
             right: menu.right - 8,
             bottom: menu.top + 46,
+        }
+    }
+
+    fn settings_page_row_rect(&self) -> RECT {
+        let row = self.mode_row_rect();
+        RECT {
+            left: row.left,
+            top: row.bottom + 8,
+            right: row.right,
+            bottom: row.bottom + 44,
         }
     }
 
@@ -4816,7 +5012,7 @@ impl App {
                                     right: fr,
                                     bottom: edit_rect.bottom - 1,
                                 },
-                                COLOR_ACCENT,
+                                self.accent_color,
                             );
                         }
                     }
@@ -4829,7 +5025,7 @@ impl App {
                             right: full_right,
                             bottom: edit_rect.bottom - 1,
                         },
-                        COLOR_ACCENT,
+                        self.accent_color,
                     );
                 }
             }
@@ -5007,7 +5203,7 @@ impl App {
                                     right: rect.right,
                                     bottom: rect.bottom,
                                 },
-                                COLOR_ACCENT,
+                                self.accent_color,
                             );
                             let _ = DeleteObject(HGDIOBJ(large_pin_font.0));
                         }
@@ -5288,7 +5484,7 @@ impl App {
                                 right: item.left + 16,
                                 bottom: item.top + 19,
                             },
-                            COLOR_ACCENT,
+                            self.accent_color,
                             4,
                         );
                     }
@@ -5306,6 +5502,35 @@ impl App {
                     );
                 }
             }
+
+            let settings_row = self.settings_page_row_rect();
+            if self.hover_target == Some(HoverTarget::SettingsPage) {
+                fill_round_rect(hdc, settings_row, COLOR_SURFACE_HOVER, 9);
+            }
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                "Settings",
+                RECT {
+                    left: settings_row.left + 12,
+                    top: settings_row.top,
+                    right: settings_row.right - 30,
+                    bottom: settings_row.bottom,
+                },
+                COLOR_TEXT,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE713).as_str(),
+                RECT {
+                    left: settings_row.right - 28,
+                    top: settings_row.top,
+                    right: settings_row.right - 6,
+                    bottom: settings_row.bottom,
+                },
+                COLOR_MUTED,
+            );
         }
     }
 
@@ -5705,7 +5930,7 @@ impl App {
                         + ((progress_track.right - progress_track.left) as f32 * progress) as i32,
                     bottom: progress_track.bottom,
                 };
-                fill_rect(hdc, filled, COLOR_ACCENT);
+                fill_rect(hdc, filled, self.accent_color);
 
                 let cancel_glyph = if download.state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED {
                     glyph(0xE74D)
@@ -5861,7 +6086,7 @@ impl App {
                 bottom: rect.bottom - rect.top,
             };
             fill_round_rect(hdc, panel, 0x080808, 14);
-            draw_outline(hdc, panel, COLOR_ACCENT, 14);
+            draw_outline(hdc, panel, self.accent_color, 14);
 
             let input = RECT {
                 left: 18,
@@ -5921,7 +6146,7 @@ impl App {
                         right: row.left + 4,
                         bottom: row.bottom - 8,
                     };
-                    fill_round_rect(hdc, indicator, COLOR_ACCENT, 2);
+                    fill_round_rect(hdc, indicator, self.accent_color, 2);
                 }
                 let favicon = RECT {
                     left: row.left + 14,
@@ -5959,7 +6184,7 @@ impl App {
                         &self.fonts.toolbar_icon,
                         icon_glyph.as_str(),
                         favicon,
-                        COLOR_ACCENT,
+                        self.accent_color,
                     );
                 }
                 draw_text(
@@ -6032,7 +6257,7 @@ impl App {
                     right: 22 + 20,
                     bottom: rect.top + 4 + 18,
                 },
-                COLOR_ACCENT,
+                self.accent_color,
             );
             fill_rect(
                 hdc,
@@ -6151,10 +6376,15 @@ impl App {
                         fill_round_rect(
                             hdc,
                             rect,
-                            if active { COLOR_ACCENT } else { 0x151515 },
+                            if active { self.accent_color } else { 0x151515 },
                             14,
                         );
-                        draw_outline(hdc, rect, if active { COLOR_ACCENT } else { 0x2f2f2f }, 14);
+                        draw_outline(
+                            hdc,
+                            rect,
+                            if active { self.accent_color } else { 0x2f2f2f },
+                            14,
+                        );
                         let label = self
                             .workspaces
                             .iter()
@@ -6200,7 +6430,7 @@ impl App {
                             right: rect.right - 4,
                             bottom: rect.bottom,
                         };
-                        fill_rect(hdc, line_rect, COLOR_ACCENT);
+                        fill_rect(hdc, line_rect, self.accent_color);
                     } else {
                         let width = self.sidebar_width() as i32;
                         let line_rect = RECT {
@@ -6209,7 +6439,7 @@ impl App {
                             right: width - 14,
                             bottom: self.sidebar_rows_top(),
                         };
-                        fill_rect(hdc, line_rect, COLOR_ACCENT);
+                        fill_rect(hdc, line_rect, self.accent_color);
                     }
                 }
                 Some(DropTarget::UnpinnedSection) => {
@@ -6235,7 +6465,7 @@ impl App {
                                 right: width - 14,
                                 bottom: target_y,
                             },
-                            COLOR_ACCENT,
+                            self.accent_color,
                         );
                     }
                 }
@@ -6265,7 +6495,7 @@ impl App {
                             right: width - 14,
                             bottom: target_y,
                         },
-                        COLOR_ACCENT,
+                        self.accent_color,
                     );
                 }
                 Some(DropTarget::Folder(folder_id)) => {
@@ -6280,7 +6510,7 @@ impl App {
                             right: rect.right - 4,
                             bottom: rect.bottom,
                         };
-                        fill_rect(hdc, line_rect, COLOR_ACCENT);
+                        fill_rect(hdc, line_rect, self.accent_color);
                     }
                 }
                 Some(DropTarget::Tab(index)) => {
@@ -6295,7 +6525,7 @@ impl App {
                             right: rect.right - 4,
                             bottom: rect.bottom,
                         };
-                        fill_rect(hdc, line_rect, COLOR_ACCENT);
+                        fill_rect(hdc, line_rect, self.accent_color);
                     }
                 }
                 Some(DropTarget::None) | None => {}
@@ -6486,6 +6716,12 @@ impl App {
             if point_in_rect(x, y, self.mode_row_rect()) {
                 self.mode_menu_open = !self.mode_menu_open;
                 self.refresh();
+                return;
+            }
+            if point_in_rect(x, y, self.settings_page_row_rect()) {
+                self.settings_open = false;
+                self.mode_menu_open = false;
+                self.open_settings_page();
                 return;
             }
 
@@ -7270,6 +7506,8 @@ impl App {
                 } else if self.settings_open && point_in_rect(x, y, self.mode_row_rect()) {
                     self.hover_target = Some(HoverTarget::ModeRow);
                     self.mode_menu_open = true;
+                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
+                    self.hover_target = Some(HoverTarget::SettingsPage);
                 } else if self.settings_open
                     && self.mode_menu_open
                     && point_in_rect(x, y, self.mode_options_rect())
@@ -9183,7 +9421,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                             }
                             cached.dc
                         };
-                        let _ = FillRect(mem_dc, &rect, app.brushes.black);
+                        fill_rect(mem_dc, rect, app.dominant_color);
                         app.paint(mem_dc);
                         let _ = BitBlt(hdc, 0, 0, width, height, Some(mem_dc), 0, 0, SRCCOPY);
                     });
@@ -9485,6 +9723,7 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
         let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
         with_app(hwnd, |app| match key {
+            _ if app.run_custom_keybind(key, ctrl, alt, shift) => {}
             0x5A if ctrl && shift => {
                 app.reopen_closed_tab();
             }
@@ -9539,6 +9778,57 @@ fn is_aster_shortcut(key: u32) -> bool {
             || matches!(key, 0x25 | 0x27 | 0x41 | 0x44 | 0x57 | 0x53 if alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
+    }
+}
+
+fn default_action_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> Option<&'static str> {
+    if alt {
+        return None;
+    }
+    match key {
+        0x4C if ctrl => Some("Navigate"),
+        0x44 if ctrl => Some("Bookmark site"),
+        0x46 if ctrl => Some("Find in page"),
+        0x54 if ctrl => Some("New tab"),
+        0x57 if ctrl => Some("Close tab"),
+        0x52 if ctrl => Some("Reload"),
+        0x30 | 0x60 if ctrl => Some("Reset zoom"),
+        0xBB | 0x6B if ctrl => Some("Zoom in"),
+        0xBD | 0x6D if ctrl => Some("Zoom out"),
+        0x5A if ctrl && shift => Some("Reopen closed tab"),
+        0x53 if ctrl => Some("Toggle sidebar"),
+        _ => None,
+    }
+}
+
+fn combo_label_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> String {
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if shift {
+        parts.push("Shift".to_string());
+    }
+    if alt {
+        parts.push("Alt".to_string());
+    }
+    let key_label = match key {
+        0x30..=0x39 => char::from_u32(key).map(|ch| ch.to_string()),
+        0x41..=0x5A => char::from_u32(key).map(|ch| ch.to_string()),
+        0x60..=0x69 => char::from_u32(key - 0x30).map(|ch| ch.to_string()),
+        0xBB | 0x6B => Some("+".to_string()),
+        0xBD | 0x6D => Some("-".to_string()),
+        code if code == VK_F5.0 as u32 => Some("F5".to_string()),
+        code if code == VK_F11.0 as u32 => Some("F11".to_string()),
+        _ => None,
+    };
+    if let Some(label) = key_label {
+        parts.push(label);
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("+")
     }
 }
 
@@ -10913,6 +11203,129 @@ fn menu_item_with_subtitle(id: usize, label: &str, sublabel: &str) -> OverlayMen
     }
 }
 
+fn settings_page_html(dominant_color: u32, accent_color: u32, site_mode: &str) -> String {
+    let dominant = colorref_to_css(dominant_color);
+    let accent = colorref_to_css(accent_color);
+    format!(
+        r##"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aster Settings</title>
+<style>
+:root {{ --accent: {accent}; --bg: {dominant}; --panel: #111; --line: #2a2a2a; --text: #f5f5f5; --muted: #a1a1a1; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", sans-serif; }}
+.shell {{ display: grid; grid-template-columns: 224px minmax(0, 1fr); min-height: 100vh; }}
+nav {{ border-right: 1px solid var(--line); padding: 28px 14px; background: #080808; }}
+h1 {{ font-size: 20px; margin: 0 0 22px; font-weight: 650; }}
+button, input, select {{ font: inherit; }}
+.tab {{ width: 100%; border: 0; color: var(--muted); background: transparent; text-align: left; padding: 10px 12px; border-radius: 8px; cursor: pointer; }}
+.tab.active, .tab:hover {{ color: var(--text); background: #181818; }}
+main {{ padding: 34px clamp(24px, 5vw, 72px); max-width: 980px; }}
+section {{ display: none; }}
+section.active {{ display: block; }}
+h2 {{ font-size: 24px; margin: 0 0 6px; }}
+.lead {{ color: var(--muted); margin: 0 0 26px; }}
+.group {{ border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin: 16px 0; background: var(--panel); }}
+.row {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; padding: 16px 18px; border-top: 1px solid var(--line); }}
+.row:first-child {{ border-top: 0; }}
+.title {{ font-weight: 600; }}
+.hint {{ color: var(--muted); font-size: 12px; margin-top: 3px; }}
+input[type=color] {{ width: 44px; height: 32px; border: 1px solid var(--line); background: transparent; border-radius: 6px; padding: 2px; }}
+select, .capture {{ min-width: 170px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; }}
+.capture.recording {{ border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent), transparent 70%); }}
+.pill {{ display: inline-flex; align-items: center; gap: 8px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; }}
+.dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }}
+</style>
+</head>
+<body>
+<div class="shell">
+<nav>
+<h1>Aster Settings</h1>
+<button class="tab active" data-tab="general">General</button>
+<button class="tab" data-tab="appearance">Appearance</button>
+<button class="tab" data-tab="keybinds">Keybinds</button>
+<button class="tab" data-tab="privacy">Privacy</button>
+</nav>
+<main>
+<section id="general" class="active">
+<h2>General</h2><p class="lead">Startup, tabs, and everyday browser behavior.</p>
+<div class="group">
+<div class="row"><div><div class="title">Startup page</div><div class="hint">Open a fresh search page when Aster starts.</div></div><select><option>New tab</option><option>Restore last session</option></select></div>
+<div class="row"><div><div class="title">Recently closed tabs</div><div class="hint">Keep closed tabs available for the current session.</div></div><span class="pill"><span class="dot"></span> Enabled</span></div>
+<div class="row"><div><div class="title">Bookmarks</div><div class="hint">Save bookmarks in .aster-state with folders and tags.</div></div><span class="pill">Ctrl+D</span></div>
+</div>
+</section>
+<section id="appearance">
+<h2>Appearance</h2><p class="lead">Tune Aster's browser chrome and page preference.</p>
+<div class="group">
+<div class="row"><div><div class="title">Dominant theme</div><div class="hint">The main browser background color.</div></div><input id="dominant" type="color" value="{dominant}"></div>
+<div class="row"><div><div class="title">Accent</div><div class="hint">Used for highlights, active states, and find-in-page marks.</div></div><input id="accent" type="color" value="{accent}"></div>
+<div class="row"><div><div class="title">Site theme</div><div class="hint">Preferred color scheme for webpages.</div></div><select id="siteMode"><option value="auto">Auto</option><option value="dark">Dark</option><option value="light">Light</option></select></div>
+</div>
+</section>
+<section id="keybinds">
+<h2>Keybinds</h2><p class="lead">Click a shortcut, then press the new combination.</p>
+<div class="group" id="keybindRows"></div>
+</section>
+<section id="privacy">
+<h2>Privacy</h2><p class="lead">Site data and browsing controls.</p>
+<div class="group">
+<div class="row"><div><div class="title">Clear site data</div><div class="hint">Available from the URL kebab menu for the current site.</div></div><span class="pill">Cookies + cache</span></div>
+<div class="row"><div><div class="title">Search suggestions</div><div class="hint">Stored locally in .aster-state.</div></div><span class="pill">Local only</span></div>
+</div>
+</section>
+</main>
+</div>
+<script>
+const post = (m) => window.chrome?.webview?.postMessage(m);
+document.querySelectorAll(".tab").forEach((tab) => tab.onclick = () => {{
+  document.querySelectorAll(".tab, section").forEach((el) => el.classList.remove("active"));
+  tab.classList.add("active");
+  document.getElementById(tab.dataset.tab).classList.add("active");
+}});
+const siteMode = document.getElementById("siteMode");
+siteMode.value = "{site_mode_lc}";
+siteMode.onchange = () => post("settings:site-mode:" + siteMode.value);
+document.getElementById("dominant").oninput = (e) => {{ document.documentElement.style.setProperty("--bg", e.target.value); post("settings:dominant:" + e.target.value); }};
+document.getElementById("accent").oninput = (e) => {{ document.documentElement.style.setProperty("--accent", e.target.value); post("settings:accent:" + e.target.value); }};
+const defaults = [
+  ["Navigate", "Ctrl+L"], ["Bookmark site", "Ctrl+D"], ["Find in page", "Ctrl+F"], ["New tab", "Ctrl+T"],
+  ["Close tab", "Ctrl+W"], ["Reload", "Ctrl+R"], ["Reset zoom", "Ctrl+0"], ["Zoom in", "Ctrl++"],
+  ["Zoom out", "Ctrl+-"], ["Reopen closed tab", "Ctrl+Shift+Z"], ["Toggle sidebar", "Ctrl+S"]
+];
+const rows = document.getElementById("keybindRows");
+defaults.forEach(([name, combo]) => {{
+  const saved = localStorage.getItem("aster.keybind." + name) || combo;
+  const row = document.createElement("div");
+  row.className = "row";
+  row.innerHTML = `<div><div class="title">${{name}}</div><div class="hint">Current shortcut</div></div><button class="capture">${{saved}}</button>`;
+  const button = row.querySelector("button");
+  button.onclick = () => {{ button.textContent = "Press keys"; button.classList.add("recording"); button.focus(); }};
+  button.onkeydown = (event) => {{
+    event.preventDefault();
+    const parts = [];
+    if (event.ctrlKey) parts.push("Ctrl");
+    if (event.shiftKey) parts.push("Shift");
+    if (event.altKey) parts.push("Alt");
+    if (!["Control","Shift","Alt"].includes(event.key)) parts.push(event.key.length === 1 ? event.key.toUpperCase() : event.key);
+    const next = parts.join("+");
+    if (next) {{ localStorage.setItem("aster.keybind." + name, next); button.textContent = next; post("settings:keybind:" + name + ":" + next); }}
+    button.classList.remove("recording");
+  }};
+  rows.appendChild(row);
+}});
+</script>
+</body>
+</html>"##,
+        dominant = dominant,
+        accent = accent,
+        site_mode_lc = site_mode.to_ascii_lowercase()
+    )
+}
+
 fn mix_color(from: u32, to: u32, amount: f32) -> u32 {
     let t = amount.clamp(0.0, 1.0);
     let fr = (from & 0xff) as f32;
@@ -10934,6 +11347,32 @@ fn colorref_to_css(color: u32) -> String {
         (color >> 8) & 0xff,
         (color >> 16) & 0xff
     )
+}
+
+fn parse_css_color_to_colorref(value: &str) -> Option<u32> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let rgb = u32::from_str_radix(hex, 16).ok()?;
+    let r = (rgb >> 16) & 0xff;
+    let g = (rgb >> 8) & 0xff;
+    let b = rgb & 0xff;
+    Some(r | (g << 8) | (b << 16))
+}
+
+unsafe fn take_pwstr(value: PWSTR) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while *value.0.add(len) != 0 {
+        len += 1;
+    }
+    let slice = std::slice::from_raw_parts(value.0, len);
+    let out = String::from_utf16_lossy(slice);
+    CoTaskMemFree(Some(value.0 as *const _));
+    out
 }
 
 fn client_rect(hwnd: HWND) -> RECT {
@@ -11036,6 +11475,9 @@ fn normalize_address(raw: &str) -> String {
     let value = raw.trim();
     if value.is_empty() {
         return DEFAULT_URL.to_string();
+    }
+    if value.eq_ignore_ascii_case(":settings") || value.eq_ignore_ascii_case("aster:settings") {
+        return "aster:settings".to_string();
     }
     if value.contains("://") || value.starts_with("about:") {
         value.to_string()
