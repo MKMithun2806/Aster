@@ -3854,11 +3854,11 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = "aster:settings".to_string();
             tab.title = "Aster Settings".to_string();
-            set_window_text(self.address_hwnd, "aster:settings");
             unsafe {
                 let html = CoTaskMemPWSTR::from(html.as_str());
                 let _ = tab.webview.NavigateToString(*html.as_ref().as_pcwstr());
             }
+            set_window_text(self.address_hwnd, "aster:settings");
         }
         self.save_state();
         self.refresh();
