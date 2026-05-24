@@ -626,6 +626,7 @@ struct App {
     last_bounds_rect: Cell<RECT>,
     dominant_color: u32,
     accent_color: u32,
+    custom_keybinds: Vec<(String, String)>,
     site_mode: SiteMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -789,6 +790,7 @@ impl App {
             }),
             dominant_color: COLOR_BLACK,
             accent_color: COLOR_ACCENT,
+            custom_keybinds: Vec::new(),
             site_mode: SiteMode::Auto,
             settings_open: false,
             mode_menu_open: false,
@@ -1256,9 +1258,71 @@ impl App {
                 "light" => self.set_site_mode(SiteMode::Light),
                 _ => {}
             }
+        } else if let Some(value) = message.strip_prefix("settings:keybind:") {
+            if let Some((action, combo)) = value.rsplit_once(':') {
+                if !action.trim().is_empty() && !combo.trim().is_empty() {
+                    if let Some(existing) = self
+                        .custom_keybinds
+                        .iter_mut()
+                        .find(|(name, _)| name == action)
+                    {
+                        existing.1 = combo.to_string();
+                    } else {
+                        self.custom_keybinds
+                            .push((action.to_string(), combo.to_string()));
+                    }
+                }
+            }
         }
         self.save_state();
         self.refresh();
+    }
+
+    fn run_custom_keybind(&mut self, key: u32, ctrl: bool, alt: bool, shift: bool) -> bool {
+        let combo = combo_label_for_event(key, ctrl, alt, shift);
+        if combo.is_empty() {
+            return false;
+        }
+        if let Some(action) = self
+            .custom_keybinds
+            .iter()
+            .find(|(_, saved)| saved.eq_ignore_ascii_case(&combo))
+            .map(|(action, _)| action.clone())
+        {
+            self.execute_keybind_action(&action);
+            return true;
+        }
+        if let Some(default_action) = default_action_for_event(key, ctrl, alt, shift) {
+            if self
+                .custom_keybinds
+                .iter()
+                .any(|(action, _)| action == default_action)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn execute_keybind_action(&mut self, action: &str) {
+        match action {
+            "Navigate" => self.open_command(CommandMode::Navigate),
+            "Bookmark site" => self.toggle_active_bookmark(),
+            "Find in page" => self.open_find_bar(),
+            "New tab" => self.open_command(CommandMode::NewTab),
+            "Close tab" => {
+                if let Some(index) = self.active_tab_index() {
+                    self.close_tab(index);
+                }
+            }
+            "Reload" => self.reload(),
+            "Reset zoom" => self.reset_active_zoom(),
+            "Zoom in" => self.adjust_active_zoom(0.1),
+            "Zoom out" => self.adjust_active_zoom(-0.1),
+            "Reopen closed tab" => self.reopen_closed_tab(),
+            "Toggle sidebar" => self.toggle_sidebar(),
+            _ => {}
+        }
     }
 
     fn create_tab_in_workspace(
@@ -2192,6 +2256,7 @@ impl App {
         self.tabs.clear();
         self.workspace_active_tabs.clear();
         self.visited_sites.clear();
+        self.custom_keybinds.clear();
 
         let mut tab_records = Vec::new();
         let mut active_workspace = 1usize;
@@ -2354,6 +2419,10 @@ impl App {
                     }
                     _ => {}
                 },
+                "keybind" if parts.len() >= 3 => {
+                    self.custom_keybinds
+                        .push((parts[1].clone(), parts[2].clone()));
+                }
                 _ => {}
             }
         }
@@ -2469,6 +2538,13 @@ impl App {
                 SiteMode::Light => "light",
             }
         ));
+        for (action, combo) in &self.custom_keybinds {
+            lines.push(format!(
+                "keybind\t{}\t{}",
+                escape_state(action),
+                escape_state(combo)
+            ));
+        }
         for (workspace_id, active_tab_id) in &self.workspace_active_tabs {
             lines.push(format!("active_tab\t{}\t{}", workspace_id, active_tab_id));
         }
@@ -9647,6 +9723,7 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
         let alt = (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0;
         let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
         with_app(hwnd, |app| match key {
+            _ if app.run_custom_keybind(key, ctrl, alt, shift) => {}
             0x5A if ctrl && shift => {
                 app.reopen_closed_tab();
             }
@@ -9701,6 +9778,57 @@ fn is_aster_shortcut(key: u32) -> bool {
             || matches!(key, 0x25 | 0x27 | 0x41 | 0x44 | 0x57 | 0x53 if alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
+    }
+}
+
+fn default_action_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> Option<&'static str> {
+    if alt {
+        return None;
+    }
+    match key {
+        0x4C if ctrl => Some("Navigate"),
+        0x44 if ctrl => Some("Bookmark site"),
+        0x46 if ctrl => Some("Find in page"),
+        0x54 if ctrl => Some("New tab"),
+        0x57 if ctrl => Some("Close tab"),
+        0x52 if ctrl => Some("Reload"),
+        0x30 | 0x60 if ctrl => Some("Reset zoom"),
+        0xBB | 0x6B if ctrl => Some("Zoom in"),
+        0xBD | 0x6D if ctrl => Some("Zoom out"),
+        0x5A if ctrl && shift => Some("Reopen closed tab"),
+        0x53 if ctrl => Some("Toggle sidebar"),
+        _ => None,
+    }
+}
+
+fn combo_label_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> String {
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if shift {
+        parts.push("Shift".to_string());
+    }
+    if alt {
+        parts.push("Alt".to_string());
+    }
+    let key_label = match key {
+        0x30..=0x39 => char::from_u32(key).map(|ch| ch.to_string()),
+        0x41..=0x5A => char::from_u32(key).map(|ch| ch.to_string()),
+        0x60..=0x69 => char::from_u32(key - 0x30).map(|ch| ch.to_string()),
+        0xBB | 0x6B => Some("+".to_string()),
+        0xBD | 0x6D => Some("-".to_string()),
+        code if code == VK_F5.0 as u32 => Some("F5".to_string()),
+        code if code == VK_F11.0 as u32 => Some("F11".to_string()),
+        _ => None,
+    };
+    if let Some(label) = key_label {
+        parts.push(label);
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("+")
     }
 }
 
