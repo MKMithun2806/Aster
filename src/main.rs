@@ -4361,7 +4361,7 @@ impl App {
         let bottom = settings.top - 8;
         RECT {
             left: 12,
-            top: bottom - 152,
+            top: bottom - 108,
             right: 196,
             bottom,
         }
@@ -7508,6 +7508,7 @@ impl App {
                     self.mode_menu_open = true;
                 } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
                     self.hover_target = Some(HoverTarget::SettingsPage);
+                    self.mode_menu_open = false;
                 } else if self.settings_open
                     && self.mode_menu_open
                     && point_in_rect(x, y, self.mode_options_rect())
