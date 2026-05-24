@@ -1236,10 +1236,30 @@ impl App {
                                     .unwrap_or(0)
                             }
                             Some(DropTarget::Tab(target_tab_index)) => {
-                                // After the hovered tab
-                                base_rows.iter().position(|r| matches!(r, SidebarRow::Tab(idx) if *idx == target_tab_index))
-                                    .map(|pos| pos + 1)
-                                    .unwrap_or(0)
+                                // Insert after the last root folder of the same pinned type —
+                                // this matches handle_drop, which always places root folders
+                                // in the folders-first, tabs-second section layout.
+                                let tab_pinned = self.tabs.get(target_tab_index).map(|t| t.pinned).unwrap_or(false);
+                                base_rows.iter()
+                                    .enumerate()
+                                    .rev()
+                                    .find(|(_, r)| match r {
+                                        SidebarRow::Folder(fid) => self.folders.iter().any(|f|
+                                            f.id == *fid && f.pinned == tab_pinned && f.parent_id.is_none()
+                                        ),
+                                        _ => false,
+                                    })
+                                    .map(|(i, _)| i + 1)
+                                    .unwrap_or_else(|| {
+                                        if tab_pinned {
+                                            0
+                                        } else {
+                                            base_rows.iter()
+                                                .position(|r| matches!(r, SidebarRow::Label(SidebarLabel::Tabs)))
+                                                .map(|pos| pos + 1)
+                                                .unwrap_or(base_rows.len())
+                                        }
+                                    })
                             }
                             _ => {
                                 // Unpinned section fallback: after the divider (SidebarLabel::Tabs)
@@ -6407,7 +6427,14 @@ impl App {
             if y <= divider_y {
                 Some(SidebarHit::PinnedSection)
             } else {
-                None
+                let rects = self.sidebar_row_rects();
+                let last_row = rects.iter().rev()
+                    .find(|(row, _)| !matches!(row, SidebarRow::Label(_)));
+                match last_row {
+                    Some((SidebarRow::Folder(id), _)) => Some(SidebarHit::Folder(*id)),
+                    Some((SidebarRow::Tab(idx), _)) => Some(SidebarHit::Tab(*idx)),
+                    _ => None,
+                }
             }
         } else {
             hit
