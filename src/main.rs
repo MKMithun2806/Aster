@@ -6342,7 +6342,10 @@ impl App {
                         self.propagate_folder_pinning(from_folder_id, target_pinned);
                     }
                 }
-                DropTarget::Tab(_) | DropTarget::None if in_sidebar => {
+                DropTarget::Tab(_) => {
+                    // Dropped on a tab - preserve existing folder state
+                }
+                DropTarget::None if in_sidebar => {
                     if let Some(folder) =
                         self.folders.iter_mut().find(|f| f.id == from_folder_id)
                     {
