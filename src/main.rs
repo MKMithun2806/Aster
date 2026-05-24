@@ -79,6 +79,11 @@ const LOADING_TIMER_ID: usize = 46;
 const TOPBAR_TIMER_ID: usize = 47;
 const DOWNLOAD_TIMER_ID: usize = 48;
 const STATE_FILE: &str = ".aster-state";
+const FOCUS_EDIT_MSG: u32 = WM_APP + 1;
+
+thread_local! {
+    static WITH_APP_GUARD: Cell<bool> = const { Cell::new(false) };
+}
 const MENU_TAB_PIN: usize = 3101;
 const MENU_TAB_UNPIN: usize = 3102;
 const MENU_TAB_REMOVE_FOLDER: usize = 3103;
@@ -1327,11 +1332,18 @@ impl App {
         } else {
             self.sidebar_rows_top() + 72
         };
-        for row in self
-            .sidebar_rows()
-            .into_iter()
-            .skip(self.sidebar_scroll_offset)
-        {
+        let all_rows = self.sidebar_rows();
+        let effective_offset = self.sidebar_scroll_offset.min(
+            all_rows.len().saturating_sub(1),
+        );
+        for skipped in all_rows.iter().take(effective_offset) {
+            y += match skipped {
+                SidebarRow::Label(_) => 24,
+                SidebarRow::Folder(_) => 36,
+                SidebarRow::Tab(_) => 44,
+            };
+        }
+        for row in all_rows.into_iter().skip(effective_offset) {
             let height = match row {
                 SidebarRow::Label(_) => 24,
                 SidebarRow::Folder(_) => 36,
@@ -1428,12 +1440,15 @@ impl App {
         if width <= 92 {
             return None;
         }
-        let rows = self.sidebar_rows();
-        let pinned_count = rows
+        let has_pinned = self
+            .folders
             .iter()
-            .take_while(|row| matches!(row, SidebarRow::Folder(_) | SidebarRow::Tab(_)))
-            .count();
-        if pinned_count == 0 {
+            .any(|f| f.workspace_id == self.active_workspace && f.pinned)
+            || self
+                .tabs
+                .iter()
+                .any(|t| t.workspace_id == self.active_workspace && t.pinned);
+        if !has_pinned {
             let y = self.sidebar_rows_top();
             let height = 72;
             Some(RECT {
@@ -3191,7 +3206,12 @@ impl App {
                         rename_edit_proc as *const () as isize,
                     ));
 
-                    let _ = SetFocus(Some(edit));
+                    let _ = WindowsAndMessaging::PostMessageW(
+                        Some(self.hwnd),
+                        FOCUS_EDIT_MSG,
+                        WPARAM(edit.0 as usize),
+                        LPARAM(0),
+                    );
                     self.renaming_edit = Some(edit);
                 }
             }
@@ -6320,6 +6340,7 @@ impl App {
                 Some(SidebarHit::Folder(target_folder_id)) => {
                     if target_folder_id == from_folder_id
                         || self.is_descendant_of(target_folder_id, from_folder_id)
+                        || self.is_descendant_of(from_folder_id, target_folder_id)
                     {
                         return;
                     }
@@ -6504,7 +6525,7 @@ impl App {
                 ghost_height,
                 Some(self.hwnd),
                 None,
-                Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None).unwrap().0)),
+                Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None).unwrap_or_default().0)),
                 None,
             )
             .ok();
@@ -8023,6 +8044,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         },
         WM_SETCURSOR => unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) },
         WM_ERASEBKGND => LRESULT(1),
+        msg if msg == FOCUS_EDIT_MSG => unsafe {
+            let edit = HWND(w_param.0 as *mut _);
+            let _ = SetFocus(Some(edit));
+            LRESULT(0)
+        },
         WM_CLOSE => {
             unsafe {
                 let _ = WindowsAndMessaging::DestroyWindow(hwnd);
@@ -9681,10 +9707,18 @@ where
     F: FnOnce(&mut App),
 {
     unsafe {
+        WITH_APP_GUARD.with(|guard| {
+            if guard.replace(true) {
+                return;
+            }
+        });
         let ptr = WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
         if !ptr.is_null() {
             f(&mut *ptr);
         }
+        WITH_APP_GUARD.with(|guard| {
+            guard.set(false);
+        });
     }
 }
 
@@ -9693,12 +9727,18 @@ where
     F: FnOnce(&mut App) -> T,
 {
     unsafe {
+        let re_entered = WITH_APP_GUARD.with(|g| g.replace(true));
+        if re_entered {
+            return None;
+        }
         let ptr = WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-        if ptr.is_null() {
+        let result = if ptr.is_null() {
             None
         } else {
             Some(f(&mut *ptr))
-        }
+        };
+        WITH_APP_GUARD.with(|g| g.set(false));
+        result
     }
 }
 
