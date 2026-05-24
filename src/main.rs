@@ -9706,20 +9706,17 @@ fn with_app<F>(hwnd: HWND, f: F)
 where
     F: FnOnce(&mut App),
 {
+    let re_entered = WITH_APP_GUARD.with(|guard| guard.replace(true));
+    if re_entered {
+        return;
+    }
     unsafe {
-        WITH_APP_GUARD.with(|guard| {
-            if guard.replace(true) {
-                return;
-            }
-        });
         let ptr = WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
         if !ptr.is_null() {
             f(&mut *ptr);
         }
-        WITH_APP_GUARD.with(|guard| {
-            guard.set(false);
-        });
     }
+    WITH_APP_GUARD.with(|guard| guard.set(false));
 }
 
 fn with_app_return<T, F>(hwnd: HWND, f: F) -> Option<T>
