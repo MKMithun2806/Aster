@@ -1208,7 +1208,7 @@ impl App {
                 match drag.source {
                     DragSource::Folder(from_folder_id) => {
                         // 1. Filter out the dragged folder and its descendants
-                        let subtree_rows = self.get_folder_subtree_rows(from_folder_id);
+                        let subtree_rows = vec![SidebarRow::Folder(from_folder_id)];
                         let mut base_rows: Vec<SidebarRow> = rows
                             .into_iter()
                             .filter(|row| match *row {
@@ -6327,7 +6327,11 @@ impl App {
                         let mut folder = self.folders.remove(pos);
                         folder.pinned = true;
                         folder.parent_id = None;
-                        self.folders.insert(0, folder);
+                        let insert_pos = self.folders.iter().enumerate().rev()
+                            .find(|(_, f)| f.workspace_id == self.active_workspace && f.pinned && f.parent_id.is_none())
+                            .map(|(i, _)| i + 1)
+                            .unwrap_or(0);
+                        self.folders.insert(insert_pos.min(self.folders.len()), folder);
                     }
                     self.propagate_folder_pinning(from_folder_id, true);
                 }
@@ -6353,14 +6357,26 @@ impl App {
                         self.propagate_folder_pinning(from_folder_id, target_pinned);
                     }
                 }
-                DropTarget::Tab(_) => {
+                DropTarget::Tab(target_tab_index) => {
+                    let tab_pinned = self.tabs.get(target_tab_index).map(|t| t.pinned).unwrap_or(false);
                     if let Some(pos) = self.folders.iter().position(|f| f.id == from_folder_id) {
                         let mut folder = self.folders.remove(pos);
-                        folder.pinned = true;
+                        folder.pinned = tab_pinned;
                         folder.parent_id = None;
-                        self.folders.insert(0, folder);
+                        let insert_pos = if tab_pinned {
+                            self.folders.iter().enumerate().rev()
+                                .find(|(_, f)| f.workspace_id == self.active_workspace && f.pinned && f.parent_id.is_none())
+                                .map(|(i, _)| i + 1)
+                                .unwrap_or(0)
+                        } else {
+                            self.folders.iter().enumerate().rev()
+                                .find(|(_, f)| f.workspace_id == self.active_workspace && !f.pinned && f.parent_id.is_none())
+                                .map(|(i, _)| i + 1)
+                                .unwrap_or(self.folders.len())
+                        };
+                        self.folders.insert(insert_pos.min(self.folders.len()), folder);
                     }
-                    self.propagate_folder_pinning(from_folder_id, true);
+                    self.propagate_folder_pinning(from_folder_id, tab_pinned);
                 }
                 DropTarget::None if in_sidebar => {
                     if let Some(folder) =
