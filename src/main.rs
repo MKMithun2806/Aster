@@ -6151,7 +6151,18 @@ impl App {
         }
 
         if self.drag_state.as_ref().map(|d| d.active).unwrap_or(false) {
+            // Temporarily disable drag preview so that calculate_drop_target
+            // sees the raw (non-preview) sidebar layout, where the pinned
+            // section divider is at its true position. Without this, the
+            // preview shifts the dragged item into the unpinned section,
+            // causing the divider to move up and making y <= divider_y fail.
+            if let Some(ref mut d) = self.drag_state {
+                d.active = false;
+            }
             self.drop_target = Some(self.calculate_drop_target(x, y));
+            if let Some(ref mut d) = self.drag_state {
+                d.active = true;
+            }
         }
 
         if !self.animating_sidebar
