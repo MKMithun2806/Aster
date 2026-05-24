@@ -4360,10 +4360,9 @@ impl App {
     fn settings_menu_rect(&self) -> RECT {
         let settings = self.settings_rect();
         let bottom = settings.top - 8;
-        let height = if self.mode_menu_open { 224 } else { 108 };
         RECT {
             left: 12,
-            top: bottom - height,
+            top: bottom - 108,
             right: 196,
             bottom,
         }
@@ -4381,35 +4380,24 @@ impl App {
 
     fn settings_page_row_rect(&self) -> RECT {
         let row = self.mode_row_rect();
-        let top = if self.mode_menu_open {
-            self.mode_options_rect().bottom + 8
-        } else {
-            row.bottom + 8
-        };
         RECT {
             left: row.left,
-            top,
+            top: row.bottom + 8,
             right: row.right,
-            bottom: top + 36,
+            bottom: row.bottom + 44,
         }
     }
 
     fn mode_options_rect(&self) -> RECT {
         let row = self.mode_row_rect();
-        if self.mode_menu_open {
-            RECT {
-                left: row.left,
-                top: row.bottom + 8,
-                right: row.right,
-                bottom: row.bottom + 8 + 114,
-            }
-        } else {
-            RECT {
-                left: row.right + 8,
-                top: row.top - 6,
-                right: row.right + 132,
-                bottom: row.top + 108,
-            }
+        let panel_width = 132;
+        let right = self.sidebar_width() - 12;
+        let left = right - panel_width;
+        RECT {
+            left: left.max(row.left),
+            top: row.top - 6,
+            right: right.max(row.left + panel_width),
+            bottom: row.top + 108,
         }
     }
 
