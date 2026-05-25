@@ -1375,6 +1375,11 @@ impl App {
             "Zoom out" => self.adjust_active_zoom(-0.1),
             "Reopen closed tab" => self.reopen_closed_tab(),
             "Toggle sidebar" => self.toggle_sidebar(),
+            "Go back" => self.go_back(),
+            "Go forward" => self.go_forward(),
+            "Switch tab above" => self.switch_tab_above(),
+            "Switch tab below" => self.switch_tab_below(),
+            "Toggle fullscreen" => self.toggle_fullscreen(),
             _ => {}
         }
     }
@@ -9868,9 +9873,6 @@ fn is_aster_shortcut(key: u32) -> bool {
 }
 
 fn default_action_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> Option<&'static str> {
-    if alt {
-        return None;
-    }
     match key {
         0x4C if ctrl => Some("Navigate"),
         0x44 if ctrl => Some("Bookmark site"),
@@ -9883,6 +9885,12 @@ fn default_action_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> Opt
         0xBD | 0x6D if ctrl => Some("Zoom out"),
         0x5A if ctrl && shift => Some("Reopen closed tab"),
         0x53 if ctrl => Some("Toggle sidebar"),
+        0x25 | 0x41 if alt => Some("Go back"),
+        0x27 | 0x44 if alt => Some("Go forward"),
+        0x57 if alt => Some("Switch tab above"),
+        0x53 if alt => Some("Switch tab below"),
+        code if code == VK_F5.0 as u32 => Some("Reload"),
+        code if code == VK_F11.0 as u32 => Some("Toggle fullscreen"),
         _ => None,
     }
 }
@@ -9904,6 +9912,8 @@ fn combo_label_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> String
         0x60..=0x69 => char::from_u32(key - 0x30).map(|ch| ch.to_string()),
         0xBB | 0x6B => Some("+".to_string()),
         0xBD | 0x6D => Some("-".to_string()),
+        0x25 => Some("ArrowLeft".to_string()),
+        0x27 => Some("ArrowRight".to_string()),
         code if code == VK_F5.0 as u32 => Some("F5".to_string()),
         code if code == VK_F11.0 as u32 => Some("F11".to_string()),
         _ => None,
@@ -11462,7 +11472,9 @@ document.getElementById("accent").oninput = (e) => {{ document.documentElement.s
 const defaults = [
   ["Navigate", "Ctrl+L"], ["Bookmark site", "Ctrl+D"], ["Find in page", "Ctrl+F"], ["New tab", "Ctrl+T"],
   ["Close tab", "Ctrl+W"], ["Reload", "Ctrl+R"], ["Reset zoom", "Ctrl+0"], ["Zoom in", "Ctrl++"],
-  ["Zoom out", "Ctrl+-"], ["Reopen closed tab", "Ctrl+Shift+Z"], ["Toggle sidebar", "Ctrl+S"]
+  ["Zoom out", "Ctrl+-"], ["Reopen closed tab", "Ctrl+Shift+Z"], ["Toggle sidebar", "Ctrl+S"],
+  ["Go back", "Alt+A"], ["Go forward", "Alt+D"], ["Switch tab above", "Alt+W"],
+  ["Switch tab below", "Alt+S"], ["Toggle fullscreen", "F11"]
 ];
 const rows = document.getElementById("keybindRows");
 defaults.forEach(([name, combo]) => {{
