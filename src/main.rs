@@ -7975,9 +7975,15 @@ impl App {
                             .map(|folder| folder.pinned)
                             .unwrap_or(false);
                         if y < rect.top + third {
-                            DropTarget::RootAfter {
-                                pinned: folder_pinned,
-                                row: previous_root_row(&rows, idx, folder_pinned),
+                            if folder_pinned
+                                && previous_root_row(&rows, idx, true).is_none()
+                            {
+                                DropTarget::PinnedSection
+                            } else {
+                                DropTarget::RootAfter {
+                                    pinned: folder_pinned,
+                                    row: previous_root_row(&rows, idx, folder_pinned),
+                                }
                             }
                         } else if y > rect.bottom - third {
                             DropTarget::RootAfter {
@@ -7991,13 +7997,22 @@ impl App {
                     SidebarRow::Tab(index) => {
                         let tab_pinned =
                             self.tabs.get(index).map(|tab| tab.pinned).unwrap_or(false);
-                        DropTarget::RootAfter {
-                            pinned: tab_pinned,
-                            row: if y < (rect.top + rect.bottom) / 2 {
-                                previous_root_row(&rows, idx, tab_pinned)
+                        if y < (rect.top + rect.bottom) / 2 {
+                            if tab_pinned
+                                && previous_root_row(&rows, idx, true).is_none()
+                            {
+                                DropTarget::PinnedSection
                             } else {
-                                Some(SidebarRow::Tab(index))
-                            },
+                                DropTarget::RootAfter {
+                                    pinned: tab_pinned,
+                                    row: previous_root_row(&rows, idx, tab_pinned),
+                                }
+                            }
+                        } else {
+                            DropTarget::RootAfter {
+                                pinned: tab_pinned,
+                                row: Some(SidebarRow::Tab(index)),
+                            }
                         }
                     }
                     SidebarRow::TabGhost(_) => DropTarget::None,
