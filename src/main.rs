@@ -469,6 +469,7 @@ struct DownloadToastState {
 
 struct BookmarkToastState {
     start_time: std::time::Instant,
+    is_unbookmark: bool,
 }
 
 struct DownloadCollapseAnim {
@@ -501,6 +502,12 @@ enum SiteMode {
     Auto,
     Dark,
     Light,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum StartupMode {
+    HomePage,
+    LastSession,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -560,6 +567,7 @@ impl Drop for UiFonts {
 struct UiBrushes {
     black: HBRUSH,
     panel: HBRUSH,
+    secondary: HBRUSH,
     panel_2: HBRUSH,
     edit: HBRUSH,
     hover: HBRUSH,
@@ -570,6 +578,7 @@ impl Drop for UiBrushes {
         unsafe {
             let _ = DeleteObject(HGDIOBJ(self.black.0));
             let _ = DeleteObject(HGDIOBJ(self.panel.0));
+            let _ = DeleteObject(HGDIOBJ(self.secondary.0));
             let _ = DeleteObject(HGDIOBJ(self.panel_2.0));
             let _ = DeleteObject(HGDIOBJ(self.edit.0));
             let _ = DeleteObject(HGDIOBJ(self.hover.0));
@@ -625,9 +634,11 @@ struct App {
     last_clip_top: Cell<f32>,
     last_bounds_rect: Cell<RECT>,
     dominant_color: u32,
+    secondary_color: u32,
     accent_color: u32,
     custom_keybinds: Vec<(String, String)>,
     site_mode: SiteMode,
+    startup_mode: StartupMode,
     settings_open: bool,
     mode_menu_open: bool,
     overlay_menu: Option<OverlayMenu>,
@@ -708,6 +719,7 @@ impl App {
         let brushes = UiBrushes {
             black: solid_brush(COLOR_BLACK),
             panel: solid_brush(COLOR_PANEL),
+            secondary: solid_brush(COLOR_PANEL),
             panel_2: solid_brush(COLOR_PANEL_2),
             edit: solid_brush(0x080808),
             hover: solid_brush(COLOR_SURFACE_HOVER),
@@ -789,9 +801,11 @@ impl App {
                 bottom: -1,
             }),
             dominant_color: COLOR_BLACK,
+            secondary_color: COLOR_PANEL,
             accent_color: COLOR_ACCENT,
             custom_keybinds: Vec::new(),
             site_mode: SiteMode::Auto,
+            startup_mode: StartupMode::LastSession,
             settings_open: false,
             mode_menu_open: false,
             overlay_menu: None,
@@ -834,6 +848,11 @@ impl App {
             dl_panel_cache: RefCell::new(None),
         };
         app.load_state()?;
+        if app.startup_mode == StartupMode::LastSession {
+            if let Some(index) = app.active_tab_index() {
+                app.switch_to(index, true);
+            }
+        }
         app.ensure_default_bookmark_folder();
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
@@ -925,8 +944,11 @@ impl App {
         self.save_state();
         if added {
             self.show_bookmark_toast();
+            self.refresh();
+        } else {
+            self.show_unbookmark_toast();
+            self.refresh();
         }
-        self.refresh();
     }
 
     fn address_menu_rect(&self) -> RECT {
@@ -1022,6 +1044,35 @@ impl App {
         self.find_current_match = 0;
         self.run_find_script(0);
         self.layout();
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
+            unsafe {
+                let _ = tab
+                    .controller
+                    .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+        }
+        self.refresh();
+    }
+
+    fn hide_find_bar(&mut self) {
+        self.find_open = false;
+        self.find_match_count = 0;
+        self.find_current_match = 0;
+        self.run_find_script(0);
+        self.layout();
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
+            unsafe {
+                let _ = tab
+                    .controller
+                    .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+        }
         self.refresh();
     }
 
@@ -1101,6 +1152,27 @@ impl App {
     fn show_bookmark_toast(&mut self) {
         self.bookmark_toast = Some(BookmarkToastState {
             start_time: std::time::Instant::now(),
+            is_unbookmark: false,
+        });
+        let rect = client_rect(self.hwnd);
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.bookmark_popup_hwnd,
+                Some(HWND_TOP),
+                18,
+                rect.bottom - 74,
+                210,
+                48,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+        }
+        self.ensure_download_timer();
+    }
+
+    fn show_unbookmark_toast(&mut self) {
+        self.bookmark_toast = Some(BookmarkToastState {
+            start_time: std::time::Instant::now(),
+            is_unbookmark: true,
         });
         let rect = client_rect(self.hwnd);
         unsafe {
@@ -1241,6 +1313,13 @@ impl App {
         }
     }
 
+    fn recreate_secondary_brush(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.brushes.secondary.0));
+        }
+        self.brushes.secondary = solid_brush(self.secondary_color);
+    }
+
     fn handle_settings_message(&mut self, message: &str) {
         if let Some(value) = message.strip_prefix("settings:accent:") {
             if let Some(color) = parse_css_color_to_colorref(value) {
@@ -1251,11 +1330,27 @@ impl App {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.dominant_color = color;
             }
+        } else if let Some(value) = message.strip_prefix("settings:secondary:") {
+            if let Some(color) = parse_css_color_to_colorref(value) {
+                self.secondary_color = color;
+                self.recreate_secondary_brush();
+            }
+        } else if message == "settings:open-state-file" {
+            let path = state_path();
+            let _ = std::process::Command::new("notepad")
+                .arg(path.to_string_lossy().as_ref())
+                .spawn();
         } else if let Some(value) = message.strip_prefix("settings:site-mode:") {
             match value {
                 "auto" => self.set_site_mode(SiteMode::Auto),
                 "dark" => self.set_site_mode(SiteMode::Dark),
                 "light" => self.set_site_mode(SiteMode::Light),
+                _ => {}
+            }
+        } else if let Some(value) = message.strip_prefix("settings:startup:") {
+            match value {
+                "home" => self.startup_mode = StartupMode::HomePage,
+                "last" => self.startup_mode = StartupMode::LastSession,
                 _ => {}
             }
         } else if let Some(value) = message.strip_prefix("settings:keybind:") {
@@ -1321,6 +1416,11 @@ impl App {
             "Zoom out" => self.adjust_active_zoom(-0.1),
             "Reopen closed tab" => self.reopen_closed_tab(),
             "Toggle sidebar" => self.toggle_sidebar(),
+            "Go back" => self.go_back(),
+            "Go forward" => self.go_forward(),
+            "Switch tab above" => self.switch_tab_above(),
+            "Switch tab below" => self.switch_tab_below(),
+            "Toggle fullscreen" => self.toggle_fullscreen(),
             _ => {}
         }
     }
@@ -2400,12 +2500,18 @@ impl App {
                     }
                 }
                 "setting" if parts.len() >= 3 => match parts[1].as_str() {
-                    "dominant_color" => {
-                        if let Ok(color) = parts[2].parse::<u32>() {
-                            self.dominant_color = color;
-                        }
+                "dominant_color" => {
+                    if let Ok(color) = parts[2].parse::<u32>() {
+                        self.dominant_color = color;
                     }
-                    "accent_color" => {
+                }
+                "secondary_color" => {
+                    if let Ok(color) = parts[2].parse::<u32>() {
+                        self.secondary_color = color;
+                        self.recreate_secondary_brush();
+                    }
+                }
+                "accent_color" => {
                         if let Ok(color) = parts[2].parse::<u32>() {
                             self.accent_color = color;
                         }
@@ -2415,6 +2521,12 @@ impl App {
                             "dark" => SiteMode::Dark,
                             "light" => SiteMode::Light,
                             _ => SiteMode::Auto,
+                        };
+                    }
+                    "startup_mode" => {
+                        self.startup_mode = match parts[2].as_str() {
+                            "home" => StartupMode::HomePage,
+                            _ => StartupMode::LastSession,
                         };
                     }
                     _ => {}
@@ -2529,6 +2641,7 @@ impl App {
         let mut lines = Vec::new();
         lines.push(format!("active_workspace\t{}", self.active_workspace));
         lines.push(format!("setting\tdominant_color\t{}", self.dominant_color));
+        lines.push(format!("setting\tsecondary_color\t{}", self.secondary_color));
         lines.push(format!("setting\taccent_color\t{}", self.accent_color));
         lines.push(format!(
             "setting\tsite_mode\t{}",
@@ -2536,6 +2649,13 @@ impl App {
                 SiteMode::Auto => "auto",
                 SiteMode::Dark => "dark",
                 SiteMode::Light => "light",
+            }
+        ));
+        lines.push(format!(
+            "setting\tstartup_mode\t{}",
+            match self.startup_mode {
+                StartupMode::HomePage => "home",
+                StartupMode::LastSession => "last",
             }
         ));
         for (action, combo) in &self.custom_keybinds {
@@ -3820,7 +3940,7 @@ impl App {
     }
 
     fn open_settings_page(&mut self) {
-        self.navigate_active("aster:settings");
+        let _ = self.create_tab("aster:settings");
     }
 
     fn navigate_active(&mut self, url: &str) {
@@ -3848,17 +3968,23 @@ impl App {
     fn load_settings_page(&mut self, index: usize) {
         let html = settings_page_html(
             self.dominant_color,
+            self.secondary_color,
             self.accent_color,
             self.site_mode.label(),
+            match self.startup_mode {
+                StartupMode::HomePage => "home",
+                StartupMode::LastSession => "last",
+            },
         );
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = "aster:settings".to_string();
             tab.title = "Aster Settings".to_string();
-            set_window_text(self.address_hwnd, "aster:settings");
+            tab.favicon_bitmap = render_glyph_favicon(18, 0xE713, &self.fonts.icon, COLOR_ACCENT);
             unsafe {
                 let html = CoTaskMemPWSTR::from(html.as_str());
                 let _ = tab.webview.NavigateToString(*html.as_ref().as_pcwstr());
             }
+            set_window_text(self.address_hwnd, "aster:settings");
         }
         self.save_state();
         self.refresh();
@@ -4361,7 +4487,7 @@ impl App {
         let bottom = settings.top - 8;
         RECT {
             left: 12,
-            top: bottom - 152,
+            top: bottom - 108,
             right: 196,
             bottom,
         }
@@ -4389,10 +4515,13 @@ impl App {
 
     fn mode_options_rect(&self) -> RECT {
         let row = self.mode_row_rect();
+        let panel_width = 132;
+        let right = self.sidebar_width() - 12;
+        let left = right - panel_width;
         RECT {
-            left: row.right + 8,
+            left: left.max(row.left),
             top: row.top - 6,
-            right: row.right + 132,
+            right: right.max(row.left + panel_width),
             bottom: row.top + 108,
         }
     }
@@ -4818,9 +4947,9 @@ impl App {
                     let clip_right = rect.right;
                     let clip_bottom = rect.bottom - self.topbar_pushed_height();
                     let region = CreateRectRgn(clip_left, clip_top, clip_right, clip_bottom);
-                    let _ = SetWindowRgn(tab.child_hwnd, Some(region), false);
+                    let _ = SetWindowRgn(tab.child_hwnd, Some(region), true);
                 } else if should_clear {
-                    let _ = SetWindowRgn(tab.child_hwnd, None, false);
+                    let _ = SetWindowRgn(tab.child_hwnd, None, true);
                 }
                 let _ = tab.controller.SetIsVisible(is_active && !tab.unloaded);
             }
@@ -4878,7 +5007,7 @@ impl App {
                 right: rect.right,
                 bottom: self.topbar_y() + TOPBAR_HEIGHT,
             };
-            let _ = FillRect(hdc, &topbar, self.brushes.panel);
+            let _ = FillRect(hdc, &topbar, self.brushes.secondary);
             fill_rect(
                 hdc,
                 RECT {
@@ -4914,7 +5043,7 @@ impl App {
                     right: sidebar_width,
                     bottom: rect.bottom,
                 };
-                let _ = FillRect(hdc, &sidebar, self.brushes.panel);
+                let _ = FillRect(hdc, &sidebar, self.brushes.secondary);
                 if !is_overlay {
                     fill_rect(
                         hdc,
@@ -5070,7 +5199,6 @@ impl App {
                 hdc,
                 self.settings_rect(),
                 self.hover_target == Some(HoverTarget::Settings),
-                &self.fonts.icon,
             );
 
             let (min_btn, max_btn, close_btn) = self.window_button_rects();
@@ -5406,7 +5534,7 @@ impl App {
     fn paint_settings_menu(&self, hdc: HDC) {
         unsafe {
             let menu = self.settings_menu_rect();
-            fill_round_rect(hdc, menu, 0x151515, 12);
+            fill_round_rect(hdc, menu, self.secondary_color, 12);
             draw_outline(hdc, menu, COLOR_BORDER, 12);
 
             let row = self.mode_row_rect();
@@ -5455,9 +5583,38 @@ impl App {
                 COLOR_MUTED,
             );
 
+            let settings_row = self.settings_page_row_rect();
+            if self.hover_target == Some(HoverTarget::SettingsPage) {
+                fill_round_rect(hdc, settings_row, COLOR_SURFACE_HOVER, 9);
+            }
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                "Settings",
+                RECT {
+                    left: settings_row.left + 12,
+                    top: settings_row.top,
+                    right: settings_row.right - 30,
+                    bottom: settings_row.bottom,
+                },
+                COLOR_TEXT,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE713).as_str(),
+                RECT {
+                    left: settings_row.right - 28,
+                    top: settings_row.top,
+                    right: settings_row.right - 6,
+                    bottom: settings_row.bottom,
+                },
+                COLOR_MUTED,
+            );
+
             if self.mode_menu_open {
                 let options = self.mode_options_rect();
-                fill_round_rect(hdc, options, 0x151515, 12);
+                fill_round_rect(hdc, options, self.secondary_color, 12);
                 draw_outline(hdc, options, COLOR_BORDER, 12);
                 let modes = [
                     (SiteMode::Auto, HoverTarget::ModeAuto, "Auto"),
@@ -5502,35 +5659,6 @@ impl App {
                     );
                 }
             }
-
-            let settings_row = self.settings_page_row_rect();
-            if self.hover_target == Some(HoverTarget::SettingsPage) {
-                fill_round_rect(hdc, settings_row, COLOR_SURFACE_HOVER, 9);
-            }
-            draw_text(
-                hdc,
-                &self.fonts.small,
-                "Settings",
-                RECT {
-                    left: settings_row.left + 12,
-                    top: settings_row.top,
-                    right: settings_row.right - 30,
-                    bottom: settings_row.bottom,
-                },
-                COLOR_TEXT,
-            );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.icon,
-                glyph(0xE713).as_str(),
-                RECT {
-                    left: settings_row.right - 28,
-                    top: settings_row.top,
-                    right: settings_row.right - 6,
-                    bottom: settings_row.bottom,
-                },
-                COLOR_MUTED,
-            );
         }
     }
 
@@ -5841,7 +5969,7 @@ impl App {
             return;
         };
         unsafe {
-            fill_round_rect(hdc, panel, 0x151515, 12);
+            fill_round_rect(hdc, panel, self.secondary_color, 12);
             draw_outline(hdc, panel, COLOR_BORDER, 12);
             let rows = self.download_panel_rows();
             let mut top = panel.top + 9;
@@ -6318,7 +6446,7 @@ impl App {
             } else if is_renaming {
                 fill_round_rect(hdc, item, 0x242424, 8);
             } else if self.hover_folder == Some(folder_id) {
-                fill_round_rect(hdc, item, 0x151515, 8);
+                fill_round_rect(hdc, item, self.secondary_color, 8);
             }
             let folder_arrow = if folder.collapsed {
                 glyph(0xE76C)
@@ -6376,7 +6504,7 @@ impl App {
                         fill_round_rect(
                             hdc,
                             rect,
-                            if active { self.accent_color } else { 0x151515 },
+                            if active { self.accent_color } else { self.secondary_color },
                             14,
                         );
                         draw_outline(
@@ -6545,7 +6673,7 @@ impl App {
                 fill_round_rect(hdc, item, 0x0f0f0f, 10);
                 draw_outline(hdc, item, 0x333333, 10);
             } else if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
-                fill_round_rect(hdc, item, 0x151515, 10);
+                fill_round_rect(hdc, item, self.secondary_color, 10);
             }
             let text_left = item.left + 40;
             let favicon_left = item.left + 12;
@@ -6692,6 +6820,8 @@ impl App {
             && self.sidebar_width > SIDEBAR_EXPANDED * 0.5
             && (x as f32) >= self.sidebar_width
         {
+            self.settings_open = false;
+            self.mode_menu_open = false;
             self.set_sidebar_mode(SidebarMode::Hidden);
             return;
         }
@@ -6714,8 +6844,6 @@ impl App {
             }
 
             if point_in_rect(x, y, self.mode_row_rect()) {
-                self.mode_menu_open = !self.mode_menu_open;
-                self.refresh();
                 return;
             }
             if point_in_rect(x, y, self.settings_page_row_rect()) {
@@ -7506,10 +7634,7 @@ impl App {
                 } else if self.settings_open && point_in_rect(x, y, self.mode_row_rect()) {
                     self.hover_target = Some(HoverTarget::ModeRow);
                     self.mode_menu_open = true;
-                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
-                    self.hover_target = Some(HoverTarget::SettingsPage);
                 } else if self.settings_open
-                    && self.mode_menu_open
                     && point_in_rect(x, y, self.mode_options_rect())
                 {
                     let options = self.mode_options_rect();
@@ -7522,8 +7647,19 @@ impl App {
                             _ => None,
                         };
                     }
+                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
+                    self.hover_target = Some(HoverTarget::SettingsPage);
+                    self.mode_menu_open = false;
                 }
             }
+        }
+
+        if self.settings_open
+            && self.mode_menu_open
+            && !point_in_rect(x, y, self.mode_row_rect())
+            && !point_in_rect(x, y, self.mode_options_rect())
+        {
+            self.mode_menu_open = false;
         }
 
         if let Some(SidebarHit::Tab(tab_array_index)) = self.hit_sidebar(x, y) {
@@ -7864,9 +8000,15 @@ impl App {
                             .map(|folder| folder.pinned)
                             .unwrap_or(false);
                         if y < rect.top + third {
-                            DropTarget::RootAfter {
-                                pinned: folder_pinned,
-                                row: previous_root_row(&rows, idx, folder_pinned),
+                            if folder_pinned
+                                && previous_root_row(&rows, idx, true).is_none()
+                            {
+                                DropTarget::PinnedSection
+                            } else {
+                                DropTarget::RootAfter {
+                                    pinned: folder_pinned,
+                                    row: previous_root_row(&rows, idx, folder_pinned),
+                                }
                             }
                         } else if y > rect.bottom - third {
                             DropTarget::RootAfter {
@@ -7880,13 +8022,22 @@ impl App {
                     SidebarRow::Tab(index) => {
                         let tab_pinned =
                             self.tabs.get(index).map(|tab| tab.pinned).unwrap_or(false);
-                        DropTarget::RootAfter {
-                            pinned: tab_pinned,
-                            row: if y < (rect.top + rect.bottom) / 2 {
-                                previous_root_row(&rows, idx, tab_pinned)
+                        if y < (rect.top + rect.bottom) / 2 {
+                            if tab_pinned
+                                && previous_root_row(&rows, idx, true).is_none()
+                            {
+                                DropTarget::PinnedSection
                             } else {
-                                Some(SidebarRow::Tab(index))
-                            },
+                                DropTarget::RootAfter {
+                                    pinned: tab_pinned,
+                                    row: previous_root_row(&rows, idx, tab_pinned),
+                                }
+                            }
+                        } else {
+                            DropTarget::RootAfter {
+                                pinned: tab_pinned,
+                                row: Some(SidebarRow::Tab(index)),
+                            }
                         }
                     }
                     SidebarRow::TabGhost(_) => DropTarget::None,
@@ -8132,6 +8283,8 @@ impl App {
                 self.sidebar_mode = SidebarMode::Hidden;
                 self.sidebar_expand_mode = SidebarMode::Hidden;
                 self.hovering_sidebar = false;
+                self.mode_menu_open = false;
+                self.settings_open = false;
                 self.clear_webview_clipping();
                 self.ensure_hover_detect_timer();
             } else if self.sidebar_target >= SIDEBAR_EXPANDED {
@@ -8255,6 +8408,8 @@ impl App {
                     }
 
                     if !over_sidebar && self.sidebar_mode == SidebarMode::Overlay {
+                        self.settings_open = false;
+                        self.mode_menu_open = false;
                         self.sidebar_expand_mode = SidebarMode::Hidden;
                         self.set_sidebar_mode(SidebarMode::Hidden);
                     }
@@ -8957,9 +9112,21 @@ unsafe extern "system" fn find_edit_proc(
             }
             return LRESULT(0);
         }
+        if key == 0x46 && (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| app.hide_find_bar());
+            }
+            return LRESULT(0);
+        }
     }
-    if msg == WM_CHAR && w_param.0 as u32 == VK_RETURN.0 as u32 {
-        return LRESULT(0);
+    if msg == WM_CHAR {
+        let ch = w_param.0 as u32;
+        if ch == VK_RETURN.0 as u32 {
+            return LRESULT(0);
+        }
+        if ch < 0x20 && !matches!(ch, 0x08 | 0x09 | 0x0D | 0x1B) {
+            return LRESULT(0);
+        }
     }
     WindowsAndMessaging::CallWindowProcW(OLD_FIND_PROC, hwnd, msg, w_param, l_param)
 }
@@ -9230,6 +9397,7 @@ unsafe extern "system" fn bookmark_popup_proc(
                             hdc,
                             rect,
                             toast.start_time.elapsed().as_millis() as u64,
+                            toast.is_unbookmark,
                         );
                     }
                 });
@@ -9731,7 +9899,11 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
                 app.toggle_active_bookmark();
             }
             0x46 if ctrl => {
-                app.open_find_bar();
+                if app.find_open {
+                    app.hide_find_bar();
+                } else {
+                    app.open_find_bar();
+                }
             }
             0x4C if ctrl => {
                 app.open_command(CommandMode::Navigate);
@@ -9782,9 +9954,6 @@ fn is_aster_shortcut(key: u32) -> bool {
 }
 
 fn default_action_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> Option<&'static str> {
-    if alt {
-        return None;
-    }
     match key {
         0x4C if ctrl => Some("Navigate"),
         0x44 if ctrl => Some("Bookmark site"),
@@ -9797,6 +9966,12 @@ fn default_action_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> Opt
         0xBD | 0x6D if ctrl => Some("Zoom out"),
         0x5A if ctrl && shift => Some("Reopen closed tab"),
         0x53 if ctrl => Some("Toggle sidebar"),
+        0x25 | 0x41 if alt => Some("Go back"),
+        0x27 | 0x44 if alt => Some("Go forward"),
+        0x57 if alt => Some("Switch tab above"),
+        0x53 if alt => Some("Switch tab below"),
+        code if code == VK_F5.0 as u32 => Some("Reload"),
+        code if code == VK_F11.0 as u32 => Some("Toggle fullscreen"),
         _ => None,
     }
 }
@@ -9818,6 +9993,8 @@ fn combo_label_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> String
         0x60..=0x69 => char::from_u32(key - 0x30).map(|ch| ch.to_string()),
         0xBB | 0x6B => Some("+".to_string()),
         0xBD | 0x6D => Some("-".to_string()),
+        0x25 => Some("ArrowLeft".to_string()),
+        0x27 => Some("ArrowRight".to_string()),
         code if code == VK_F5.0 as u32 => Some("F5".to_string()),
         code if code == VK_F11.0 as u32 => Some("F11".to_string()),
         _ => None,
@@ -9920,12 +10097,35 @@ fn draw_logo(hdc: HDC, rect: RECT, hovered: bool) {
     }
 }
 
-fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool, icon_font: &HFONT) {
+fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool) {
     unsafe {
         if hovered {
             fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 10);
         }
-        draw_icon_glyph(hdc, icon_font, glyph(0xE713).as_str(), rect, COLOR_MUTED);
+        let cx = (rect.left + rect.right) / 2;
+        let cy = (rect.top + rect.bottom) / 2;
+        let r = 2;
+        let spacing = 6;
+        BRUSH_CACHE.with(|cache| {
+            let mut c = cache.borrow_mut();
+            let brush = *c.brushes.entry(COLOR_MUTED).or_insert_with(|| solid_brush(COLOR_MUTED));
+            let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+            let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+            let size = r * 2;
+            for dy in [-spacing, 0, spacing] {
+                let _ = RoundRect(
+                    hdc,
+                    cx - r,
+                    cy + dy - r,
+                    cx - r + size,
+                    cy + dy - r + size,
+                    size,
+                    size,
+                );
+            }
+            let _ = SelectObject(hdc, old_pen);
+            let _ = SelectObject(hdc, old_brush);
+        });
     }
 }
 
@@ -10077,7 +10277,7 @@ unsafe fn draw_download_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
     }
 }
 
-unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
+unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64, is_unbookmark: bool) {
     let slide = if elapsed_ms < 180 {
         1.0 - (elapsed_ms as f32 / 180.0)
     } else {
@@ -10095,7 +10295,13 @@ unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
     };
     let icon_font = create_font_with_face(20, 600, w!("Segoe UI Symbol"))
         .unwrap_or(HFONT(std::ptr::null_mut()));
-    draw_centered_text(hdc, &icon_font, "*", star_rect, 0x27d8ff);
+    draw_centered_text(
+        hdc,
+        &icon_font,
+        if is_unbookmark { "☆" } else { "*" },
+        star_rect,
+        if is_unbookmark { 0x888888 } else { 0x27d8ff },
+    );
     if icon_font != HFONT(std::ptr::null_mut()) {
         let _ = DeleteObject(HGDIOBJ(icon_font.0));
     }
@@ -10103,7 +10309,7 @@ unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64) {
     draw_text(
         hdc,
         &text_font,
-        "Bookmarked Site!",
+        if is_unbookmark { "Unbookmarked" } else { "Bookmarked Site!" },
         RECT {
             left: body.left + 52,
             top: body.top,
@@ -10779,6 +10985,59 @@ fn decode_favicon_stream(stream: &IStream) -> Option<FaviconBitmap> {
     }
 }
 
+fn render_glyph_favicon(size: i32, codepoint: u32, icon_font: &HFONT, color: u32) -> Option<FaviconBitmap> {
+    unsafe {
+        let hdc = CreateCompatibleDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size,
+            biHeight: -size,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = ptr::null_mut();
+        let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(hdc);
+            return None;
+        }
+        let old = SelectObject(hdc, HGDIOBJ(bitmap.0));
+        ptr::write_bytes(bits as *mut u8, 0, (size * size * 4) as usize);
+        draw_icon_glyph(
+            hdc,
+            icon_font,
+            &glyph(codepoint),
+            RECT {
+                left: 0,
+                top: 0,
+                right: size,
+                bottom: size,
+            },
+            color,
+        );
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
+        for chunk in pixels.chunks_exact_mut(4) {
+            if chunk[0] != 0 || chunk[1] != 0 || chunk[2] != 0 {
+                chunk[3] = 255;
+            }
+        }
+        SelectObject(hdc, old);
+        let _ = DeleteDC(hdc);
+        Some(FaviconBitmap {
+            handle: bitmap,
+            width: size,
+            height: size,
+        })
+    }
+}
+
 fn create_aster_icon(size: i32) -> Option<HICON> {
     let mut pixels = vec![0u8; (size * size * 4) as usize];
     let cx = size as f32 / 2.0;
@@ -11203,8 +11462,9 @@ fn menu_item_with_subtitle(id: usize, label: &str, sublabel: &str) -> OverlayMen
     }
 }
 
-fn settings_page_html(dominant_color: u32, accent_color: u32, site_mode: &str) -> String {
+fn settings_page_html(dominant_color: u32, secondary_color: u32, accent_color: u32, site_mode: &str, startup_mode: &str) -> String {
     let dominant = colorref_to_css(dominant_color);
+    let secondary = colorref_to_css(secondary_color);
     let accent = colorref_to_css(accent_color);
     format!(
         r##"<!doctype html>
@@ -11214,7 +11474,7 @@ fn settings_page_html(dominant_color: u32, accent_color: u32, site_mode: &str) -
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Aster Settings</title>
 <style>
-:root {{ --accent: {accent}; --bg: {dominant}; --panel: #111; --line: #2a2a2a; --text: #f5f5f5; --muted: #a1a1a1; }}
+:root {{ --accent: {accent}; --bg: {dominant}; --secondary: {secondary}; --panel: {secondary}; --line: #2a2a2a; --text: #f5f5f5; --muted: #a1a1a1; }}
 * {{ box-sizing: border-box; }}
 body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", sans-serif; }}
 .shell {{ display: grid; grid-template-columns: 224px minmax(0, 1fr); min-height: 100vh; }}
@@ -11236,6 +11496,10 @@ h2 {{ font-size: 24px; margin: 0 0 6px; }}
 input[type=color] {{ width: 44px; height: 32px; border: 1px solid var(--line); background: transparent; border-radius: 6px; padding: 2px; }}
 select, .capture {{ min-width: 170px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; }}
 .capture.recording {{ border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent), transparent 70%); }}
+.reset-btn {{ width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 6px; background: #080808; color: var(--muted); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; }}
+.reset-btn:hover {{ color: var(--text); background: var(--panel); }}
+.action-btn {{ min-width: 130px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; cursor: pointer; }}
+.action-btn:hover {{ background: var(--panel); }}
 .pill {{ display: inline-flex; align-items: center; gap: 8px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }}
 </style>
@@ -11251,18 +11515,17 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 </nav>
 <main>
 <section id="general" class="active">
-<h2>General</h2><p class="lead">Startup, tabs, and everyday browser behavior.</p>
+<h2>General</h2><p class="lead">Startup behavior.</p>
 <div class="group">
-<div class="row"><div><div class="title">Startup page</div><div class="hint">Open a fresh search page when Aster starts.</div></div><select><option>New tab</option><option>Restore last session</option></select></div>
-<div class="row"><div><div class="title">Recently closed tabs</div><div class="hint">Keep closed tabs available for the current session.</div></div><span class="pill"><span class="dot"></span> Enabled</span></div>
-<div class="row"><div><div class="title">Bookmarks</div><div class="hint">Save bookmarks in .aster-state with folders and tags.</div></div><span class="pill">Ctrl+D</span></div>
+<div class="row"><div><div class="title">Startup page</div><div class="hint">Choose what opens when Aster starts.</div></div><select id="startupMode"><option value="home">Home page</option><option value="last">Last session</option></select></div>
 </div>
 </section>
 <section id="appearance">
 <h2>Appearance</h2><p class="lead">Tune Aster's browser chrome and page preference.</p>
 <div class="group">
-<div class="row"><div><div class="title">Dominant theme</div><div class="hint">The main browser background color.</div></div><input id="dominant" type="color" value="{dominant}"></div>
-<div class="row"><div><div class="title">Accent</div><div class="hint">Used for highlights, active states, and find-in-page marks.</div></div><input id="accent" type="color" value="{accent}"></div>
+<div class="row"><div><div class="title">Primary</div><div class="hint">The main browser background color.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="dominant" type="color" value="{dominant}"><button class="reset-btn" data-target="dominant">↺</button></div></div>
+<div class="row"><div><div class="title">Secondary</div><div class="hint">The chrome panel and sidebar color.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="secondary" type="color" value="{secondary}"><button class="reset-btn" data-target="secondary">↺</button></div></div>
+<div class="row"><div><div class="title">Accent</div><div class="hint">Used for highlights, active states, and find-in-page marks.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="accent" type="color" value="{accent}"><button class="reset-btn" data-target="accent">↺</button></div></div>
 <div class="row"><div><div class="title">Site theme</div><div class="hint">Preferred color scheme for webpages.</div></div><select id="siteMode"><option value="auto">Auto</option><option value="dark">Dark</option><option value="light">Light</option></select></div>
 </div>
 </section>
@@ -11273,8 +11536,7 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 <section id="privacy">
 <h2>Privacy</h2><p class="lead">Site data and browsing controls.</p>
 <div class="group">
-<div class="row"><div><div class="title">Clear site data</div><div class="hint">Available from the URL kebab menu for the current site.</div></div><span class="pill">Cookies + cache</span></div>
-<div class="row"><div><div class="title">Search suggestions</div><div class="hint">Stored locally in .aster-state.</div></div><span class="pill">Local only</span></div>
+<div class="row"><div><div class="title">Browser data</div><div class="hint">View your saved bookmarks, tabs, and settings.</div></div><button class="action-btn" id="openStateFile">Open aster-state</button></div>
 </div>
 </section>
 </main>
@@ -11289,21 +11551,49 @@ document.querySelectorAll(".tab").forEach((tab) => tab.onclick = () => {{
 const siteMode = document.getElementById("siteMode");
 siteMode.value = "{site_mode_lc}";
 siteMode.onchange = () => post("settings:site-mode:" + siteMode.value);
+const startupMode = document.getElementById("startupMode");
+startupMode.value = "{startup_mode}";
+startupMode.onchange = () => post("settings:startup:" + startupMode.value);
 document.getElementById("dominant").oninput = (e) => {{ document.documentElement.style.setProperty("--bg", e.target.value); post("settings:dominant:" + e.target.value); }};
+document.getElementById("secondary").oninput = (e) => {{ document.documentElement.style.setProperty("--secondary", e.target.value); document.documentElement.style.setProperty("--panel", e.target.value); post("settings:secondary:" + e.target.value); }};
 document.getElementById("accent").oninput = (e) => {{ document.documentElement.style.setProperty("--accent", e.target.value); post("settings:accent:" + e.target.value); }};
+document.querySelectorAll(".reset-btn").forEach((btn) => {{
+  btn.onclick = () => {{
+    const target = btn.dataset.target;
+    if (target === "dominant") {{
+      document.getElementById("dominant").value = "#000000";
+      document.documentElement.style.setProperty("--bg", "#000000");
+      post("settings:dominant:#000000");
+    }} else if (target === "secondary") {{
+      document.getElementById("secondary").value = "#090909";
+      document.documentElement.style.setProperty("--secondary", "#090909");
+      document.documentElement.style.setProperty("--panel", "#090909");
+      post("settings:secondary:#090909");
+    }} else if (target === "accent") {{
+      document.getElementById("accent").value = "#636ff1";
+      document.documentElement.style.setProperty("--accent", "#636ff1");
+      post("settings:accent:#636ff1");
+    }}
+  }};
+}});
+document.getElementById("openStateFile").onclick = () => post("settings:open-state-file");
 const defaults = [
   ["Navigate", "Ctrl+L"], ["Bookmark site", "Ctrl+D"], ["Find in page", "Ctrl+F"], ["New tab", "Ctrl+T"],
   ["Close tab", "Ctrl+W"], ["Reload", "Ctrl+R"], ["Reset zoom", "Ctrl+0"], ["Zoom in", "Ctrl++"],
-  ["Zoom out", "Ctrl+-"], ["Reopen closed tab", "Ctrl+Shift+Z"], ["Toggle sidebar", "Ctrl+S"]
+  ["Zoom out", "Ctrl+-"], ["Reopen closed tab", "Ctrl+Shift+Z"], ["Toggle sidebar", "Ctrl+S"],
+  ["Go back", "Alt+A"], ["Go forward", "Alt+D"], ["Switch tab above", "Alt+W"],
+  ["Switch tab below", "Alt+S"], ["Toggle fullscreen", "F11"]
 ];
 const rows = document.getElementById("keybindRows");
 defaults.forEach(([name, combo]) => {{
-  const saved = localStorage.getItem("aster.keybind." + name) || combo;
+  let saved = combo;
+  try {{ saved = localStorage.getItem("aster.keybind." + name) || combo; }} catch {{}}
   const row = document.createElement("div");
   row.className = "row";
   row.innerHTML = `<div><div class="title">${{name}}</div><div class="hint">Current shortcut</div></div><button class="capture">${{saved}}</button>`;
   const button = row.querySelector("button");
   button.onclick = () => {{ button.textContent = "Press keys"; button.classList.add("recording"); button.focus(); }};
+  button.onblur = () => {{ button.classList.remove("recording"); button.textContent = saved; }};
   button.onkeydown = (event) => {{
     event.preventDefault();
     const parts = [];
@@ -11312,7 +11602,7 @@ defaults.forEach(([name, combo]) => {{
     if (event.altKey) parts.push("Alt");
     if (!["Control","Shift","Alt"].includes(event.key)) parts.push(event.key.length === 1 ? event.key.toUpperCase() : event.key);
     const next = parts.join("+");
-    if (next) {{ localStorage.setItem("aster.keybind." + name, next); button.textContent = next; post("settings:keybind:" + name + ":" + next); }}
+    if (next) {{ try {{ localStorage.setItem("aster.keybind." + name, next); }} catch {{}} saved = next; button.textContent = next; post("settings:keybind:" + name + ":" + next); }}
     button.classList.remove("recording");
   }};
   rows.appendChild(row);
@@ -11322,7 +11612,8 @@ defaults.forEach(([name, combo]) => {{
 </html>"##,
         dominant = dominant,
         accent = accent,
-        site_mode_lc = site_mode.to_ascii_lowercase()
+        site_mode_lc = site_mode.to_ascii_lowercase(),
+        startup_mode = startup_mode
     )
 }
 
