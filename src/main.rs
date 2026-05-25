@@ -843,14 +843,9 @@ impl App {
             dl_panel_cache: RefCell::new(None),
         };
         app.load_state()?;
-        match app.startup_mode {
-            StartupMode::LastSession => {
-                if let Some(index) = app.active_tab_index() {
-                    app.switch_to(index, true);
-                }
-            }
-            StartupMode::HomePage => {
-                let _ = app.create_tab(DEFAULT_URL);
+        if app.startup_mode == StartupMode::LastSession {
+            if let Some(index) = app.active_tab_index() {
+                app.switch_to(index, true);
             }
         }
         app.ensure_default_bookmark_folder();
