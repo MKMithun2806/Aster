@@ -1026,6 +1026,16 @@ impl App {
         self.find_current_match = 0;
         self.run_find_script(0);
         self.layout();
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
+            unsafe {
+                let _ = tab
+                    .controller
+                    .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+        }
         self.refresh();
     }
 
@@ -1035,6 +1045,16 @@ impl App {
         self.find_current_match = 0;
         self.run_find_script(0);
         self.layout();
+        if let Some(tab) = self
+            .active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+        {
+            unsafe {
+                let _ = tab
+                    .controller
+                    .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+        }
         self.refresh();
     }
 
@@ -9013,8 +9033,14 @@ unsafe extern "system" fn find_edit_proc(
             return LRESULT(0);
         }
     }
-    if msg == WM_CHAR && w_param.0 as u32 == VK_RETURN.0 as u32 {
-        return LRESULT(0);
+    if msg == WM_CHAR {
+        let ch = w_param.0 as u32;
+        if ch == VK_RETURN.0 as u32 {
+            return LRESULT(0);
+        }
+        if ch < 0x20 && !matches!(ch, 0x08 | 0x09 | 0x0D | 0x1B) {
+            return LRESULT(0);
+        }
     }
     WindowsAndMessaging::CallWindowProcW(OLD_FIND_PROC, hwnd, msg, w_param, l_param)
 }
