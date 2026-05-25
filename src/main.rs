@@ -567,6 +567,7 @@ impl Drop for UiFonts {
 struct UiBrushes {
     black: HBRUSH,
     panel: HBRUSH,
+    secondary: HBRUSH,
     panel_2: HBRUSH,
     edit: HBRUSH,
     hover: HBRUSH,
@@ -577,6 +578,7 @@ impl Drop for UiBrushes {
         unsafe {
             let _ = DeleteObject(HGDIOBJ(self.black.0));
             let _ = DeleteObject(HGDIOBJ(self.panel.0));
+            let _ = DeleteObject(HGDIOBJ(self.secondary.0));
             let _ = DeleteObject(HGDIOBJ(self.panel_2.0));
             let _ = DeleteObject(HGDIOBJ(self.edit.0));
             let _ = DeleteObject(HGDIOBJ(self.hover.0));
@@ -632,6 +634,7 @@ struct App {
     last_clip_top: Cell<f32>,
     last_bounds_rect: Cell<RECT>,
     dominant_color: u32,
+    secondary_color: u32,
     accent_color: u32,
     custom_keybinds: Vec<(String, String)>,
     site_mode: SiteMode,
@@ -716,6 +719,7 @@ impl App {
         let brushes = UiBrushes {
             black: solid_brush(COLOR_BLACK),
             panel: solid_brush(COLOR_PANEL),
+            secondary: solid_brush(COLOR_PANEL),
             panel_2: solid_brush(COLOR_PANEL_2),
             edit: solid_brush(0x080808),
             hover: solid_brush(COLOR_SURFACE_HOVER),
@@ -797,6 +801,7 @@ impl App {
                 bottom: -1,
             }),
             dominant_color: COLOR_BLACK,
+            secondary_color: COLOR_PANEL,
             accent_color: COLOR_ACCENT,
             custom_keybinds: Vec::new(),
             site_mode: SiteMode::Auto,
@@ -1308,6 +1313,13 @@ impl App {
         }
     }
 
+    fn recreate_secondary_brush(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.brushes.secondary.0));
+        }
+        self.brushes.secondary = solid_brush(self.secondary_color);
+    }
+
     fn handle_settings_message(&mut self, message: &str) {
         if let Some(value) = message.strip_prefix("settings:accent:") {
             if let Some(color) = parse_css_color_to_colorref(value) {
@@ -1317,6 +1329,11 @@ impl App {
         } else if let Some(value) = message.strip_prefix("settings:dominant:") {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.dominant_color = color;
+            }
+        } else if let Some(value) = message.strip_prefix("settings:secondary:") {
+            if let Some(color) = parse_css_color_to_colorref(value) {
+                self.secondary_color = color;
+                self.recreate_secondary_brush();
             }
         } else if message == "settings:open-state-file" {
             let path = state_path();
@@ -2483,12 +2500,18 @@ impl App {
                     }
                 }
                 "setting" if parts.len() >= 3 => match parts[1].as_str() {
-                    "dominant_color" => {
-                        if let Ok(color) = parts[2].parse::<u32>() {
-                            self.dominant_color = color;
-                        }
+                "dominant_color" => {
+                    if let Ok(color) = parts[2].parse::<u32>() {
+                        self.dominant_color = color;
                     }
-                    "accent_color" => {
+                }
+                "secondary_color" => {
+                    if let Ok(color) = parts[2].parse::<u32>() {
+                        self.secondary_color = color;
+                        self.recreate_secondary_brush();
+                    }
+                }
+                "accent_color" => {
                         if let Ok(color) = parts[2].parse::<u32>() {
                             self.accent_color = color;
                         }
@@ -2618,6 +2641,7 @@ impl App {
         let mut lines = Vec::new();
         lines.push(format!("active_workspace\t{}", self.active_workspace));
         lines.push(format!("setting\tdominant_color\t{}", self.dominant_color));
+        lines.push(format!("setting\tsecondary_color\t{}", self.secondary_color));
         lines.push(format!("setting\taccent_color\t{}", self.accent_color));
         lines.push(format!(
             "setting\tsite_mode\t{}",
@@ -3944,6 +3968,7 @@ impl App {
     fn load_settings_page(&mut self, index: usize) {
         let html = settings_page_html(
             self.dominant_color,
+            self.secondary_color,
             self.accent_color,
             self.site_mode.label(),
             match self.startup_mode {
@@ -4982,7 +5007,7 @@ impl App {
                 right: rect.right,
                 bottom: self.topbar_y() + TOPBAR_HEIGHT,
             };
-            let _ = FillRect(hdc, &topbar, self.brushes.panel);
+            let _ = FillRect(hdc, &topbar, self.brushes.secondary);
             fill_rect(
                 hdc,
                 RECT {
@@ -5018,7 +5043,7 @@ impl App {
                     right: sidebar_width,
                     bottom: rect.bottom,
                 };
-                let _ = FillRect(hdc, &sidebar, self.brushes.panel);
+                let _ = FillRect(hdc, &sidebar, self.brushes.secondary);
                 if !is_overlay {
                     fill_rect(
                         hdc,
@@ -5509,7 +5534,7 @@ impl App {
     fn paint_settings_menu(&self, hdc: HDC) {
         unsafe {
             let menu = self.settings_menu_rect();
-            fill_round_rect(hdc, menu, 0x151515, 12);
+            fill_round_rect(hdc, menu, self.secondary_color, 12);
             draw_outline(hdc, menu, COLOR_BORDER, 12);
 
             let row = self.mode_row_rect();
@@ -5589,7 +5614,7 @@ impl App {
 
             if self.mode_menu_open {
                 let options = self.mode_options_rect();
-                fill_round_rect(hdc, options, 0x151515, 12);
+                fill_round_rect(hdc, options, self.secondary_color, 12);
                 draw_outline(hdc, options, COLOR_BORDER, 12);
                 let modes = [
                     (SiteMode::Auto, HoverTarget::ModeAuto, "Auto"),
@@ -5944,7 +5969,7 @@ impl App {
             return;
         };
         unsafe {
-            fill_round_rect(hdc, panel, 0x151515, 12);
+            fill_round_rect(hdc, panel, self.secondary_color, 12);
             draw_outline(hdc, panel, COLOR_BORDER, 12);
             let rows = self.download_panel_rows();
             let mut top = panel.top + 9;
@@ -6421,7 +6446,7 @@ impl App {
             } else if is_renaming {
                 fill_round_rect(hdc, item, 0x242424, 8);
             } else if self.hover_folder == Some(folder_id) {
-                fill_round_rect(hdc, item, 0x151515, 8);
+                fill_round_rect(hdc, item, self.secondary_color, 8);
             }
             let folder_arrow = if folder.collapsed {
                 glyph(0xE76C)
@@ -6479,7 +6504,7 @@ impl App {
                         fill_round_rect(
                             hdc,
                             rect,
-                            if active { self.accent_color } else { 0x151515 },
+                            if active { self.accent_color } else { self.secondary_color },
                             14,
                         );
                         draw_outline(
@@ -6648,7 +6673,7 @@ impl App {
                 fill_round_rect(hdc, item, 0x0f0f0f, 10);
                 draw_outline(hdc, item, 0x333333, 10);
             } else if self.hover_tab == Some(index) || Some(index) == self.active_tab_index() {
-                fill_round_rect(hdc, item, 0x151515, 10);
+                fill_round_rect(hdc, item, self.secondary_color, 10);
             }
             let text_left = item.left + 40;
             let favicon_left = item.left + 12;
@@ -11437,8 +11462,9 @@ fn menu_item_with_subtitle(id: usize, label: &str, sublabel: &str) -> OverlayMen
     }
 }
 
-fn settings_page_html(dominant_color: u32, accent_color: u32, site_mode: &str, startup_mode: &str) -> String {
+fn settings_page_html(dominant_color: u32, secondary_color: u32, accent_color: u32, site_mode: &str, startup_mode: &str) -> String {
     let dominant = colorref_to_css(dominant_color);
+    let secondary = colorref_to_css(secondary_color);
     let accent = colorref_to_css(accent_color);
     format!(
         r##"<!doctype html>
@@ -11448,7 +11474,7 @@ fn settings_page_html(dominant_color: u32, accent_color: u32, site_mode: &str, s
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Aster Settings</title>
 <style>
-:root {{ --accent: {accent}; --bg: {dominant}; --panel: #111; --line: #2a2a2a; --text: #f5f5f5; --muted: #a1a1a1; }}
+:root {{ --accent: {accent}; --bg: {dominant}; --secondary: {secondary}; --panel: {secondary}; --line: #2a2a2a; --text: #f5f5f5; --muted: #a1a1a1; }}
 * {{ box-sizing: border-box; }}
 body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", sans-serif; }}
 .shell {{ display: grid; grid-template-columns: 224px minmax(0, 1fr); min-height: 100vh; }}
@@ -11497,7 +11523,8 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 <section id="appearance">
 <h2>Appearance</h2><p class="lead">Tune Aster's browser chrome and page preference.</p>
 <div class="group">
-<div class="row"><div><div class="title">Dominant theme</div><div class="hint">The main browser background color.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="dominant" type="color" value="{dominant}"><button class="reset-btn" data-target="dominant">↺</button></div></div>
+<div class="row"><div><div class="title">Primary</div><div class="hint">The main browser background color.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="dominant" type="color" value="{dominant}"><button class="reset-btn" data-target="dominant">↺</button></div></div>
+<div class="row"><div><div class="title">Secondary</div><div class="hint">The chrome panel and sidebar color.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="secondary" type="color" value="{secondary}"><button class="reset-btn" data-target="secondary">↺</button></div></div>
 <div class="row"><div><div class="title">Accent</div><div class="hint">Used for highlights, active states, and find-in-page marks.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="accent" type="color" value="{accent}"><button class="reset-btn" data-target="accent">↺</button></div></div>
 <div class="row"><div><div class="title">Site theme</div><div class="hint">Preferred color scheme for webpages.</div></div><select id="siteMode"><option value="auto">Auto</option><option value="dark">Dark</option><option value="light">Light</option></select></div>
 </div>
@@ -11528,6 +11555,7 @@ const startupMode = document.getElementById("startupMode");
 startupMode.value = "{startup_mode}";
 startupMode.onchange = () => post("settings:startup:" + startupMode.value);
 document.getElementById("dominant").oninput = (e) => {{ document.documentElement.style.setProperty("--bg", e.target.value); post("settings:dominant:" + e.target.value); }};
+document.getElementById("secondary").oninput = (e) => {{ document.documentElement.style.setProperty("--secondary", e.target.value); document.documentElement.style.setProperty("--panel", e.target.value); post("settings:secondary:" + e.target.value); }};
 document.getElementById("accent").oninput = (e) => {{ document.documentElement.style.setProperty("--accent", e.target.value); post("settings:accent:" + e.target.value); }};
 document.querySelectorAll(".reset-btn").forEach((btn) => {{
   btn.onclick = () => {{
@@ -11536,6 +11564,11 @@ document.querySelectorAll(".reset-btn").forEach((btn) => {{
       document.getElementById("dominant").value = "#000000";
       document.documentElement.style.setProperty("--bg", "#000000");
       post("settings:dominant:#000000");
+    }} else if (target === "secondary") {{
+      document.getElementById("secondary").value = "#090909";
+      document.documentElement.style.setProperty("--secondary", "#090909");
+      document.documentElement.style.setProperty("--panel", "#090909");
+      post("settings:secondary:#090909");
     }} else if (target === "accent") {{
       document.getElementById("accent").value = "#636ff1";
       document.documentElement.style.setProperty("--accent", "#636ff1");
