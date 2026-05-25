@@ -7609,9 +7609,6 @@ impl App {
                 } else if self.settings_open && point_in_rect(x, y, self.mode_row_rect()) {
                     self.hover_target = Some(HoverTarget::ModeRow);
                     self.mode_menu_open = true;
-                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
-                    self.hover_target = Some(HoverTarget::SettingsPage);
-                    self.mode_menu_open = false;
                 } else if self.settings_open
                     && point_in_rect(x, y, self.mode_options_rect())
                 {
@@ -7625,6 +7622,9 @@ impl App {
                             _ => None,
                         };
                     }
+                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
+                    self.hover_target = Some(HoverTarget::SettingsPage);
+                    self.mode_menu_open = false;
                 }
             }
         }
