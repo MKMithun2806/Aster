@@ -1316,6 +1316,11 @@ impl App {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.dominant_color = color;
             }
+        } else if message == "settings:open-state-file" {
+            let path = state_path();
+            let _ = std::process::Command::new("notepad")
+                .arg(path.to_string_lossy().as_ref())
+                .spawn();
         } else if let Some(value) = message.strip_prefix("settings:site-mode:") {
             match value {
                 "auto" => self.set_site_mode(SiteMode::Auto),
@@ -11451,6 +11456,10 @@ h2 {{ font-size: 24px; margin: 0 0 6px; }}
 input[type=color] {{ width: 44px; height: 32px; border: 1px solid var(--line); background: transparent; border-radius: 6px; padding: 2px; }}
 select, .capture {{ min-width: 170px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; }}
 .capture.recording {{ border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent), transparent 70%); }}
+.reset-btn {{ width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 6px; background: #080808; color: var(--muted); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; }}
+.reset-btn:hover {{ color: var(--text); background: var(--panel); }}
+.action-btn {{ min-width: 130px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; cursor: pointer; }}
+.action-btn:hover {{ background: var(--panel); }}
 .pill {{ display: inline-flex; align-items: center; gap: 8px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }}
 </style>
@@ -11474,8 +11483,8 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 <section id="appearance">
 <h2>Appearance</h2><p class="lead">Tune Aster's browser chrome and page preference.</p>
 <div class="group">
-<div class="row"><div><div class="title">Dominant theme</div><div class="hint">The main browser background color.</div></div><input id="dominant" type="color" value="{dominant}"></div>
-<div class="row"><div><div class="title">Accent</div><div class="hint">Used for highlights, active states, and find-in-page marks.</div></div><input id="accent" type="color" value="{accent}"></div>
+<div class="row"><div><div class="title">Dominant theme</div><div class="hint">The main browser background color.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="dominant" type="color" value="{dominant}"><button class="reset-btn" data-target="dominant">↺</button></div></div>
+<div class="row"><div><div class="title">Accent</div><div class="hint">Used for highlights, active states, and find-in-page marks.</div></div><div style="display:flex;gap:6px;align-items:center"><input id="accent" type="color" value="{accent}"><button class="reset-btn" data-target="accent">↺</button></div></div>
 <div class="row"><div><div class="title">Site theme</div><div class="hint">Preferred color scheme for webpages.</div></div><select id="siteMode"><option value="auto">Auto</option><option value="dark">Dark</option><option value="light">Light</option></select></div>
 </div>
 </section>
@@ -11485,6 +11494,9 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 </section>
 <section id="privacy">
 <h2>Privacy</h2><p class="lead">Site data and browsing controls.</p>
+<div class="group">
+<div class="row"><div><div class="title">Browser data</div><div class="hint">View your saved bookmarks, tabs, and settings.</div></div><button class="action-btn" id="openStateFile">Open aster-state</button></div>
+</div>
 </section>
 </main>
 </div>
@@ -11503,6 +11515,21 @@ startupMode.value = "{startup_mode}";
 startupMode.onchange = () => post("settings:startup:" + startupMode.value);
 document.getElementById("dominant").oninput = (e) => {{ document.documentElement.style.setProperty("--bg", e.target.value); post("settings:dominant:" + e.target.value); }};
 document.getElementById("accent").oninput = (e) => {{ document.documentElement.style.setProperty("--accent", e.target.value); post("settings:accent:" + e.target.value); }};
+document.querySelectorAll(".reset-btn").forEach((btn) => {{
+  btn.onclick = () => {{
+    const target = btn.dataset.target;
+    if (target === "dominant") {{
+      document.getElementById("dominant").value = "#000000";
+      document.documentElement.style.setProperty("--bg", "#000000");
+      post("settings:dominant:#000000");
+    }} else if (target === "accent") {{
+      document.getElementById("accent").value = "#f16f63";
+      document.documentElement.style.setProperty("--accent", "#f16f63");
+      post("settings:accent:#f16f63");
+    }}
+  }};
+}});
+document.getElementById("openStateFile").onclick = () => post("settings:open-state-file");
 const defaults = [
   ["Navigate", "Ctrl+L"], ["Bookmark site", "Ctrl+D"], ["Find in page", "Ctrl+F"], ["New tab", "Ctrl+T"],
   ["Close tab", "Ctrl+W"], ["Reload", "Ctrl+R"], ["Reset zoom", "Ctrl+0"], ["Zoom in", "Ctrl++"],
