@@ -11522,9 +11522,9 @@ document.querySelectorAll(".reset-btn").forEach((btn) => {{
       document.documentElement.style.setProperty("--bg", "#000000");
       post("settings:dominant:#000000");
     }} else if (target === "accent") {{
-      document.getElementById("accent").value = "#f16f63";
-      document.documentElement.style.setProperty("--accent", "#f16f63");
-      post("settings:accent:#f16f63");
+      document.getElementById("accent").value = "#636ff1";
+      document.documentElement.style.setProperty("--accent", "#636ff1");
+      post("settings:accent:#636ff1");
     }}
   }};
 }});
