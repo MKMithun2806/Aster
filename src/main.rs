@@ -504,6 +504,12 @@ enum SiteMode {
     Light,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum StartupMode {
+    HomePage,
+    LastSession,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommandMode {
     Navigate,
@@ -629,6 +635,7 @@ struct App {
     accent_color: u32,
     custom_keybinds: Vec<(String, String)>,
     site_mode: SiteMode,
+    startup_mode: StartupMode,
     settings_open: bool,
     mode_menu_open: bool,
     overlay_menu: Option<OverlayMenu>,
@@ -793,6 +800,7 @@ impl App {
             accent_color: COLOR_ACCENT,
             custom_keybinds: Vec::new(),
             site_mode: SiteMode::Auto,
+            startup_mode: StartupMode::LastSession,
             settings_open: false,
             mode_menu_open: false,
             overlay_menu: None,
@@ -835,6 +843,9 @@ impl App {
             dl_panel_cache: RefCell::new(None),
         };
         app.load_state()?;
+        if app.startup_mode == StartupMode::HomePage && app.tabs.is_empty() {
+            app.create_tab(DEFAULT_URL)?;
+        }
         app.ensure_default_bookmark_folder();
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
@@ -1310,6 +1321,12 @@ impl App {
                 "auto" => self.set_site_mode(SiteMode::Auto),
                 "dark" => self.set_site_mode(SiteMode::Dark),
                 "light" => self.set_site_mode(SiteMode::Light),
+                _ => {}
+            }
+        } else if let Some(value) = message.strip_prefix("settings:startup:") {
+            match value {
+                "home" => self.startup_mode = StartupMode::HomePage,
+                "last" => self.startup_mode = StartupMode::LastSession,
                 _ => {}
             }
         } else if let Some(value) = message.strip_prefix("settings:keybind:") {
@@ -2476,6 +2493,12 @@ impl App {
                             _ => SiteMode::Auto,
                         };
                     }
+                    "startup_mode" => {
+                        self.startup_mode = match parts[2].as_str() {
+                            "home" => StartupMode::HomePage,
+                            _ => StartupMode::LastSession,
+                        };
+                    }
                     _ => {}
                 },
                 "keybind" if parts.len() >= 3 => {
@@ -2539,6 +2562,9 @@ impl App {
         };
 
         for (workspace_id, folder_id, pinned, title, url, history, sidebar_order) in tab_records {
+            if self.startup_mode == StartupMode::HomePage {
+                break;
+            }
             if !url.trim().is_empty()
                 && self
                     .workspaces
@@ -2595,6 +2621,13 @@ impl App {
                 SiteMode::Auto => "auto",
                 SiteMode::Dark => "dark",
                 SiteMode::Light => "light",
+            }
+        ));
+        lines.push(format!(
+            "setting\tstartup_mode\t{}",
+            match self.startup_mode {
+                StartupMode::HomePage => "home",
+                StartupMode::LastSession => "last",
             }
         ));
         for (action, combo) in &self.custom_keybinds {
@@ -3909,6 +3942,10 @@ impl App {
             self.dominant_color,
             self.accent_color,
             self.site_mode.label(),
+            match self.startup_mode {
+                StartupMode::HomePage => "home",
+                StartupMode::LastSession => "last",
+            },
         );
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = "aster:settings".to_string();
@@ -11381,7 +11418,7 @@ fn menu_item_with_subtitle(id: usize, label: &str, sublabel: &str) -> OverlayMen
     }
 }
 
-fn settings_page_html(dominant_color: u32, accent_color: u32, site_mode: &str) -> String {
+fn settings_page_html(dominant_color: u32, accent_color: u32, site_mode: &str, startup_mode: &str) -> String {
     let dominant = colorref_to_css(dominant_color);
     let accent = colorref_to_css(accent_color);
     format!(
@@ -11429,11 +11466,9 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 </nav>
 <main>
 <section id="general" class="active">
-<h2>General</h2><p class="lead">Startup, tabs, and everyday browser behavior.</p>
+<h2>General</h2><p class="lead">Startup behavior.</p>
 <div class="group">
-<div class="row"><div><div class="title">Startup page</div><div class="hint">Open a fresh search page when Aster starts.</div></div><select><option>New tab</option><option>Restore last session</option></select></div>
-<div class="row"><div><div class="title">Recently closed tabs</div><div class="hint">Keep closed tabs available for the current session.</div></div><span class="pill"><span class="dot"></span> Enabled</span></div>
-<div class="row"><div><div class="title">Bookmarks</div><div class="hint">Save bookmarks in .aster-state with folders and tags.</div></div><span class="pill">Ctrl+D</span></div>
+<div class="row"><div><div class="title">Startup page</div><div class="hint">Choose what opens when Aster starts.</div></div><select id="startupMode"><option value="home">Home page</option><option value="last">Last session</option></select></div>
 </div>
 </section>
 <section id="appearance">
@@ -11450,10 +11485,6 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 </section>
 <section id="privacy">
 <h2>Privacy</h2><p class="lead">Site data and browsing controls.</p>
-<div class="group">
-<div class="row"><div><div class="title">Clear site data</div><div class="hint">Available from the URL kebab menu for the current site.</div></div><span class="pill">Cookies + cache</span></div>
-<div class="row"><div><div class="title">Search suggestions</div><div class="hint">Stored locally in .aster-state.</div></div><span class="pill">Local only</span></div>
-</div>
 </section>
 </main>
 </div>
@@ -11467,6 +11498,9 @@ document.querySelectorAll(".tab").forEach((tab) => tab.onclick = () => {{
 const siteMode = document.getElementById("siteMode");
 siteMode.value = "{site_mode_lc}";
 siteMode.onchange = () => post("settings:site-mode:" + siteMode.value);
+const startupMode = document.getElementById("startupMode");
+startupMode.value = "{startup_mode}";
+startupMode.onchange = () => post("settings:startup:" + startupMode.value);
 document.getElementById("dominant").oninput = (e) => {{ document.documentElement.style.setProperty("--bg", e.target.value); post("settings:dominant:" + e.target.value); }};
 document.getElementById("accent").oninput = (e) => {{ document.documentElement.style.setProperty("--accent", e.target.value); post("settings:accent:" + e.target.value); }};
 const defaults = [
@@ -11504,7 +11538,8 @@ defaults.forEach(([name, combo]) => {{
 </html>"##,
         dominant = dominant,
         accent = accent,
-        site_mode_lc = site_mode.to_ascii_lowercase()
+        site_mode_lc = site_mode.to_ascii_lowercase(),
+        startup_mode = startup_mode
     )
 }
 
