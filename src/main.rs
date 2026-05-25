@@ -11478,7 +11478,8 @@ const defaults = [
 ];
 const rows = document.getElementById("keybindRows");
 defaults.forEach(([name, combo]) => {{
-  const saved = localStorage.getItem("aster.keybind." + name) || combo;
+  let saved = combo;
+  try {{ saved = localStorage.getItem("aster.keybind." + name) || combo; }} catch {{}}
   const row = document.createElement("div");
   row.className = "row";
   row.innerHTML = `<div><div class="title">${{name}}</div><div class="hint">Current shortcut</div></div><button class="capture">${{saved}}</button>`;
@@ -11492,7 +11493,7 @@ defaults.forEach(([name, combo]) => {{
     if (event.altKey) parts.push("Alt");
     if (!["Control","Shift","Alt"].includes(event.key)) parts.push(event.key.length === 1 ? event.key.toUpperCase() : event.key);
     const next = parts.join("+");
-    if (next) {{ localStorage.setItem("aster.keybind." + name, next); button.textContent = next; post("settings:keybind:" + name + ":" + next); }}
+    if (next) {{ try {{ localStorage.setItem("aster.keybind." + name, next); }} catch {{}} button.textContent = next; post("settings:keybind:" + name + ":" + next); }}
     button.classList.remove("recording");
   }};
   rows.appendChild(row);
