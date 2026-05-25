@@ -11485,6 +11485,7 @@ defaults.forEach(([name, combo]) => {{
   row.innerHTML = `<div><div class="title">${{name}}</div><div class="hint">Current shortcut</div></div><button class="capture">${{saved}}</button>`;
   const button = row.querySelector("button");
   button.onclick = () => {{ button.textContent = "Press keys"; button.classList.add("recording"); button.focus(); }};
+  button.onblur = () => {{ button.classList.remove("recording"); button.textContent = saved; }};
   button.onkeydown = (event) => {{
     event.preventDefault();
     const parts = [];
@@ -11493,7 +11494,7 @@ defaults.forEach(([name, combo]) => {{
     if (event.altKey) parts.push("Alt");
     if (!["Control","Shift","Alt"].includes(event.key)) parts.push(event.key.length === 1 ? event.key.toUpperCase() : event.key);
     const next = parts.join("+");
-    if (next) {{ try {{ localStorage.setItem("aster.keybind." + name, next); }} catch {{}} button.textContent = next; post("settings:keybind:" + name + ":" + next); }}
+    if (next) {{ try {{ localStorage.setItem("aster.keybind." + name, next); }} catch {{}} saved = next; button.textContent = next; post("settings:keybind:" + name + ":" + next); }}
     button.classList.remove("recording");
   }};
   rows.appendChild(row);
