@@ -5500,8 +5500,12 @@ impl App {
                 self.paint_download_toast(hdc, rect);
             }
 
-            if self.show_default_bubble && sidebar_width >= 240 {
-                self.paint_default_bubble(hdc);
+            if self.show_default_bubble {
+                let width_f = sidebar_width as f32;
+                let alpha = (((width_f - 120.0) / 120.0).clamp(0.0, 1.0) * 255.0) as u8;
+                if alpha > 0 {
+                    self.paint_default_bubble(hdc, alpha);
+                }
             }
         }
     }
@@ -5545,10 +5549,6 @@ impl App {
             return None;
         }
         let rect = client_rect(self.hwnd);
-        let sidebar_width = self.sidebar_width();
-        if sidebar_width < 240 {
-            return None;
-        }
         let left = 12;
         let right = left + 224;
         Some(RECT {
@@ -5579,7 +5579,7 @@ impl App {
         })
     }
 
-    fn paint_default_bubble(&self, hdc: HDC) {
+    fn paint_default_bubble(&self, hdc: HDC, alpha: u8) {
         let Some(rect) = self.default_bubble_rect() else {
             return;
         };
@@ -5587,33 +5587,93 @@ impl App {
         let height = rect.bottom - rect.top;
 
         unsafe {
-            // 1. Create a rounded region for clipping
-            let rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
-            let _ = SelectClipRgn(hdc, Some(rgn));
-
-            // 2. Draw semi-transparent rounded slate-grey background (#25252b, i.e., 0x2b2525 at 90% opacity = 230 constant alpha)
+            // Create a memory DC compatible with hdc to draw the entire bubble offscreen
             let mem_dc = CreateCompatibleDC(Some(hdc));
             if !mem_dc.is_invalid() {
                 let bitmap = CreateCompatibleBitmap(hdc, width, height);
                 if !bitmap.is_invalid() {
                     let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+
+                    // Use viewport origin shift so all existing coordinate variables can remain unchanged
+                    let _ = SetViewportOrgEx(mem_dc, -rect.left, -rect.top, None);
+
+                    // 1. Draw rounded slate-grey background onto mem_dc (clipped to round region in local coordinates)
+                    let rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+                    let _ = SelectClipRgn(mem_dc, Some(rgn));
                     fill_rect(
                         mem_dc,
                         RECT {
-                            left: 0,
-                            top: 0,
-                            right: width,
-                            bottom: height,
+                            left: rect.left,
+                            top: rect.top,
+                            right: rect.right,
+                            bottom: rect.bottom,
                         },
                         self.secondary_color,
                     );
-                    
+                    let _ = SelectClipRgn(mem_dc, None);
+                    let _ = DeleteObject(HGDIOBJ(rgn.0));
+
+                    // 2. Draw outline around the bubble with accent color
+                    draw_outline(mem_dc, rect, self.accent_color, 16);
+
+                    // 3. Draw close button
+                    let close_rect = self.default_bubble_close_rect().unwrap();
+                    let is_close_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleClose);
+                    if is_close_hovered {
+                        fill_round_rect(mem_dc, close_rect, COLOR_SURFACE_HOVER, 6);
+                    }
+                    draw_icon_glyph(mem_dc, &self.fonts.toolbar_icon, "\u{E8BB}", close_rect, if is_close_hovered { 0xffffff } else { COLOR_MUTED });
+
+                    // 4. Draw messages
+                    let line1_rect = RECT {
+                        left: rect.left + 14,
+                        top: rect.top + 10,
+                        right: rect.right - 36,
+                        bottom: rect.top + 28,
+                    };
+                    draw_text(mem_dc, &self.fonts.body, "Make Aster default browser?", line1_rect, COLOR_TEXT);
+
+                    let line2_rect = RECT {
+                        left: rect.left + 14,
+                        top: rect.top + 28,
+                        right: rect.right - 36,
+                        bottom: rect.top + 46,
+                    };
+                    draw_text(mem_dc, &self.fonts.small, "For a faster web experience.", line2_rect, COLOR_MUTED);
+
+                    // 5. Draw primary action button
+                    let btn_rect = self.default_bubble_button_rect().unwrap();
+                    let is_btn_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
+                    let btn_bg = if is_btn_hovered {
+                        self.accent_color
+                    } else {
+                        0x343434
+                    };
+                    let btn_fg = if is_btn_hovered {
+                        0x000000
+                    } else {
+                        0xffffff
+                    };
+                    fill_round_rect(mem_dc, btn_rect, btn_bg, 8);
+                    if !is_btn_hovered {
+                        draw_outline(mem_dc, btn_rect, 0x454545, 8);
+                    }
+                    draw_centered_text(mem_dc, &self.fonts.body, "Set as Default", btn_rect, btn_fg);
+
+                    // Reset viewport origin before alpha blending onto the destination
+                    let _ = SetViewportOrgEx(mem_dc, 0, 0, None);
+
+                    // Select a rounded clip region on the destination hdc to cleanly truncate corners
+                    let dest_rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+                    let _ = SelectClipRgn(hdc, Some(dest_rgn));
+
                     let blend = BLENDFUNCTION {
                         BlendOp: AC_SRC_OVER as u8,
                         BlendFlags: 0,
-                        SourceConstantAlpha: 255, // 100%
+                        SourceConstantAlpha: alpha,
                         AlphaFormat: 0,
                     };
+
                     let _ = AlphaBlend(
                         hdc,
                         rect.left,
@@ -5627,62 +5687,16 @@ impl App {
                         height,
                         blend,
                     );
+
+                    // Restore clipping region on hdc and clean up resources
+                    let _ = SelectClipRgn(hdc, None);
+                    let _ = DeleteObject(HGDIOBJ(dest_rgn.0));
+
                     let _ = SelectObject(mem_dc, old_bitmap);
                     let _ = DeleteObject(HGDIOBJ(bitmap.0));
                 }
                 let _ = DeleteDC(mem_dc);
             }
-
-            // Restore clipping region and delete region object
-            let _ = SelectClipRgn(hdc, None);
-            let _ = DeleteObject(HGDIOBJ(rgn.0));
-
-            // 3. Draw a subtle 1px border around the bubble with the accent color
-            draw_outline(hdc, rect, self.accent_color, 16);
-
-            // 4. Draw interactive close "×" button in the top-right corner
-            let close_rect = self.default_bubble_close_rect().unwrap();
-            let is_close_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleClose);
-            if is_close_hovered {
-                fill_round_rect(hdc, close_rect, COLOR_SURFACE_HOVER, 6);
-            }
-            draw_icon_glyph(hdc, &self.fonts.toolbar_icon, "\u{E8BB}", close_rect, if is_close_hovered { 0xffffff } else { COLOR_MUTED });
-
-            // 5. Draw the insisting promo message on two lines
-            let line1_rect = RECT {
-                left: rect.left + 14,
-                top: rect.top + 10,
-                right: rect.right - 36,
-                bottom: rect.top + 28,
-            };
-            draw_text(hdc, &self.fonts.body, "Make Aster default browser?", line1_rect, COLOR_TEXT);
-
-            let line2_rect = RECT {
-                left: rect.left + 14,
-                top: rect.top + 28,
-                right: rect.right - 36,
-                bottom: rect.top + 46,
-            };
-            draw_text(hdc, &self.fonts.small, "For a faster web experience.", line2_rect, COLOR_MUTED);
-
-            // 6. Draw themed "Set as Default" CTA button at the bottom
-            let btn_rect = self.default_bubble_button_rect().unwrap();
-            let is_btn_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
-            let btn_bg = if is_btn_hovered {
-                self.accent_color
-            } else {
-                0x343434
-            };
-            let btn_fg = if is_btn_hovered {
-                0x000000
-            } else {
-                0xffffff
-            };
-            fill_round_rect(hdc, btn_rect, btn_bg, 8);
-            if !is_btn_hovered {
-                draw_outline(hdc, btn_rect, 0x454545, 8);
-            }
-            draw_centered_text(hdc, &self.fonts.body, "Set as Default", btn_rect, btn_fg);
         }
     }
 
