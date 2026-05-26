@@ -867,12 +867,6 @@ impl App {
         app.load_state()?;
         app.default_bubble_dismissed = false;
         app.show_default_bubble = !is_aster_default_browser();
-        if app.show_default_bubble {
-            app.sidebar_mode = SidebarMode::Pushed;
-            app.sidebar_expand_mode = SidebarMode::Pushed;
-            app.sidebar_width = SIDEBAR_EXPANDED;
-            app.sidebar_target = SIDEBAR_EXPANDED;
-        }
         app.save_state();
         
         let args: Vec<String> = std::env::args().collect();
@@ -10182,8 +10176,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     }
                 } else if !app.default_bubble_dismissed && !app.show_default_bubble {
                     app.show_default_bubble = true;
-                    app.set_sidebar_mode(SidebarMode::Pushed);
-                    app.sidebar_expand_mode = SidebarMode::Pushed;
                     app.refresh();
                 }
                 if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
@@ -10203,8 +10195,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     }
                 } else if !app.default_bubble_dismissed && !app.show_default_bubble {
                     app.show_default_bubble = true;
-                    app.set_sidebar_mode(SidebarMode::Pushed);
-                    app.sidebar_expand_mode = SidebarMode::Pushed;
                     app.refresh();
                 }
                 if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
