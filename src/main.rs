@@ -83,6 +83,16 @@ const TOPBAR_TIMER_ID: usize = 47;
 const DOWNLOAD_TIMER_ID: usize = 48;
 const STATE_FILE: &str = ".aster-state";
 const FOCUS_EDIT_MSG: u32 = WM_APP + 1;
+const WM_COPYDATA: u32 = 0x004A;
+
+#[allow(non_snake_case)]
+#[repr(C)]
+struct COPYDATASTRUCT {
+    pub dwData: usize,
+    pub cbData: u32,
+    pub lpData: *mut std::ffi::c_void,
+}
+
 
 thread_local! {
     static WITH_APP_GUARD: Cell<bool> = const { Cell::new(false) };
@@ -683,6 +693,7 @@ struct App {
     paint_cache: RefCell<Option<PaintCache>>,
     dl_panel_cache: RefCell<Option<PaintCache>>,
     show_default_bubble: bool,
+    default_bubble_dismissed: bool,
 }
 
 struct DragGhost {
@@ -851,8 +862,12 @@ impl App {
             paint_cache: RefCell::new(None),
             dl_panel_cache: RefCell::new(None),
             show_default_bubble: !is_aster_default_browser(),
+            default_bubble_dismissed: false,
         };
         app.load_state()?;
+        if app.default_bubble_dismissed {
+            app.show_default_bubble = false;
+        }
         
         let args: Vec<String> = std::env::args().collect();
         let mut startup_url = None;
@@ -2559,6 +2574,9 @@ impl App {
                             _ => StartupMode::LastSession,
                         };
                     }
+                    "default_bubble_dismissed" => {
+                        self.default_bubble_dismissed = parts[2] == "1";
+                    }
                     _ => {}
                 },
                 "keybind" if parts.len() >= 3 => {
@@ -2687,6 +2705,10 @@ impl App {
                 StartupMode::HomePage => "home",
                 StartupMode::LastSession => "last",
             }
+        ));
+        lines.push(format!(
+            "setting\tdefault_bubble_dismissed\t{}",
+            if self.default_bubble_dismissed { "1" } else { "0" }
         ));
         for (action, combo) in &self.custom_keybinds {
             lines.push(format!(
@@ -5469,7 +5491,7 @@ impl App {
                 self.paint_download_toast(hdc, rect);
             }
 
-            if self.show_default_bubble && sidebar_width > 92 {
+            if self.show_default_bubble && sidebar_width >= 240 {
                 self.paint_default_bubble(hdc);
             }
         }
@@ -5515,7 +5537,7 @@ impl App {
         }
         let rect = client_rect(self.hwnd);
         let sidebar_width = self.sidebar_width();
-        if sidebar_width <= 92 {
+        if sidebar_width < 240 {
             return None;
         }
         let left = 12;
@@ -6953,10 +6975,12 @@ impl App {
             return;
         }
 
-        if self.show_default_bubble && self.sidebar_width() > 92 {
+        if self.show_default_bubble && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
                 if point_in_rect(x, y, close_rect) {
                     self.show_default_bubble = false;
+                    self.default_bubble_dismissed = true;
+                    self.save_state();
                     self.refresh();
                     return;
                 }
@@ -6965,6 +6989,8 @@ impl App {
                 if point_in_rect(x, y, btn_rect) {
                     make_aster_default_browser();
                     self.show_default_bubble = false;
+                    self.default_bubble_dismissed = true;
+                    self.save_state();
                     self.refresh();
                     return;
                 }
@@ -7732,7 +7758,7 @@ impl App {
         self.hover_target = None;
         self.drop_target = Some(DropTarget::None);
 
-        if self.show_default_bubble && self.sidebar_width() > 92 {
+        if self.show_default_bubble && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
                 if point_in_rect(x, y, close_rect) {
                     self.hover_target = Some(HoverTarget::DefaultBubbleClose);
@@ -7904,7 +7930,7 @@ impl App {
             self.hover_folder = None;
         }
 
-        if self.show_default_bubble && self.sidebar_width() > 92 {
+        if self.show_default_bubble && self.sidebar_width() >= 240 {
             if let Some(bubble_rect) = self.default_bubble_rect() {
                 if point_in_rect(x, y, bubble_rect) {
                     self.hover_tab = None;
@@ -8790,10 +8816,48 @@ fn main() -> AppResult<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     }
+    
+    unsafe {
+        if let Ok(existing_hwnd) = WindowsAndMessaging::FindWindowW(CLASS_NAME, None) {
+            if !existing_hwnd.is_invalid() {
+                let args: Vec<String> = std::env::args().collect();
+                let mut startup_url = String::new();
+                if args.len() > 1 {
+                    for arg in args.iter().skip(1) {
+                        if !arg.starts_with('-') && !arg.starts_with('/') {
+                            startup_url = normalize_address(arg);
+                            break;
+                        }
+                    }
+                }
+                
+                let _ = WindowsAndMessaging::ShowWindow(existing_hwnd, WindowsAndMessaging::SW_RESTORE);
+                let _ = WindowsAndMessaging::SetForegroundWindow(existing_hwnd);
+                
+                if !startup_url.is_empty() {
+                    let bytes = startup_url.as_bytes();
+                    let cds = COPYDATASTRUCT {
+                        dwData: 0x1234,
+                        cbData: bytes.len() as u32,
+                        lpData: bytes.as_ptr() as *const _ as *mut _,
+                    };
+                    let _ = WindowsAndMessaging::SendMessageW(
+                        existing_hwnd,
+                        WM_COPYDATA,
+                        None,
+                        Some(LPARAM(&cds as *const _ as isize)),
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+
     set_process_dpi_awareness();
     register_window_class()?;
     let hwnd = create_main_window()?;
     let environment = create_environment()?;
+
 
     let app = Box::new(App::new(hwnd, environment)?);
     unsafe {
@@ -9646,6 +9710,29 @@ unsafe extern "system" fn bookmark_popup_proc(
 
 extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     match msg {
+        WM_COPYDATA => {
+            unsafe {
+                let cds = &*(l_param.0 as *const COPYDATASTRUCT);
+                if cds.dwData == 0x1234 {
+                    let len = cds.cbData as usize;
+                    let ptr = cds.lpData as *const u8;
+                    let slice = std::slice::from_raw_parts(ptr, len);
+                    if let Ok(url_str) = std::str::from_utf8(slice) {
+                        let url = url_str.to_string();
+                        with_app(hwnd, move |app| {
+                            let _ = app.create_tab(&url);
+                            if let Some(index) = app.tabs.iter().position(|t| t.url == url) {
+                                app.switch_to(index, true);
+                            }
+                            app.refresh();
+                        });
+                        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_RESTORE);
+                        let _ = WindowsAndMessaging::SetForegroundWindow(hwnd);
+                    }
+                }
+            }
+            LRESULT(1)
+        }
         WindowsAndMessaging::WM_GETMINMAXINFO => {
             unsafe {
                 let mmi = &mut *(l_param.0 as *mut WindowsAndMessaging::MINMAXINFO);
@@ -12508,7 +12595,7 @@ fn make_aster_default_browser() {
         }
         
         let _ = std::process::Command::new("cmd")
-            .args(&["/c", "start", "ms-settings:defaultapps?registeredApp=Aster"])
+            .args(&["/c", "start", "ms-settings:defaultapps?registeredAppUser=Aster"])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
