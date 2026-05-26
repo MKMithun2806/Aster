@@ -865,9 +865,9 @@ impl App {
             default_bubble_dismissed: false,
         };
         app.load_state()?;
-        if app.default_bubble_dismissed {
-            app.show_default_bubble = false;
-        }
+        app.default_bubble_dismissed = false;
+        app.show_default_bubble = !is_aster_default_browser();
+        app.save_state();
         
         let args: Vec<String> = std::env::args().collect();
         let mut startup_url = None;
@@ -6988,9 +6988,6 @@ impl App {
             if let Some(btn_rect) = self.default_bubble_button_rect() {
                 if point_in_rect(x, y, btn_rect) {
                     make_aster_default_browser();
-                    self.show_default_bubble = false;
-                    self.default_bubble_dismissed = true;
-                    self.save_state();
                     self.refresh();
                     return;
                 }
@@ -10150,8 +10147,34 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             handle_keydown(hwnd, w_param);
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
+        WindowsAndMessaging::WM_ACTIVATE => {
+            with_app(hwnd, |app| {
+                let is_default = is_aster_default_browser();
+                if is_default {
+                    if app.show_default_bubble {
+                        app.show_default_bubble = false;
+                        app.refresh();
+                    }
+                } else if !app.default_bubble_dismissed && !app.show_default_bubble {
+                    app.show_default_bubble = true;
+                    app.refresh();
+                }
+            });
+            unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
+        }
         WM_SETFOCUS => {
             with_app(hwnd, |app| {
+                let is_default = is_aster_default_browser();
+                if is_default {
+                    if app.show_default_bubble {
+                        app.show_default_bubble = false;
+                        app.refresh();
+                    }
+                } else if !app.default_bubble_dismissed && !app.show_default_bubble {
+                    app.show_default_bubble = true;
+                    app.refresh();
+                }
+
                 if app.renaming_folder_id.is_some() {
                     return;
                 }
