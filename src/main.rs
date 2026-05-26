@@ -23,13 +23,14 @@ use windows::{
         Graphics::Gdi::{
             self, AlphaBlend, BeginPaint, BitBlt, CreateBitmap, CreateCompatibleBitmap,
             CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRectRgn,
-            CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-            GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx,
-            RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, SetViewportOrgEx,
-            SetWindowRgn, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
-            BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-            DT_SINGLELINE, DT_VCENTER, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
-            MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, SRCCOPY, TRANSPARENT,
+            CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint,
+            FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo, MonitorFromWindow,
+            MoveToEx, RoundRect, ScreenToClient, SelectClipRgn, SelectObject, SetBkMode,
+            SetTextColor, SetViewportOrgEx, SetWindowRgn, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER,
+            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER,
+            DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBITMAP, HBRUSH, HDC, HFONT,
+            HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, SRCCOPY,
+            TRANSPARENT,
         },
         Graphics::Imaging::{
             CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
@@ -423,6 +424,8 @@ enum HoverTarget {
     MinButton,
     MaxButton,
     CloseButton,
+    DefaultBubbleClose,
+    DefaultBubbleSetDefault,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -679,6 +682,7 @@ struct App {
     download_collapse_anim: Option<DownloadCollapseAnim>,
     paint_cache: RefCell<Option<PaintCache>>,
     dl_panel_cache: RefCell<Option<PaintCache>>,
+    show_default_bubble: bool,
 }
 
 struct DragGhost {
@@ -846,13 +850,39 @@ impl App {
             download_collapse_anim: None,
             paint_cache: RefCell::new(None),
             dl_panel_cache: RefCell::new(None),
+            show_default_bubble: !is_aster_default_browser(),
         };
         app.load_state()?;
-        if app.startup_mode == StartupMode::LastSession {
+        
+        let args: Vec<String> = std::env::args().collect();
+        let mut startup_url = None;
+        if args.len() > 1 {
+            for arg in args.iter().skip(1) {
+                if !arg.starts_with('-') && !arg.starts_with('/') {
+                    startup_url = Some(normalize_address(arg));
+                    break;
+                }
+            }
+        }
+
+        if let Some(url) = startup_url {
+            let _ = app.create_tab(&url);
+            if let Some(index) = app.tabs.iter().position(|t| t.url == url) {
+                app.switch_to(index, true);
+            }
+        } else if app.startup_mode == StartupMode::LastSession {
             if let Some(index) = app.active_tab_index() {
                 app.switch_to(index, true);
             }
         }
+        
+        if app.tabs.is_empty() {
+            let _ = app.create_tab(DEFAULT_URL);
+            if let Some(index) = app.active_tab_index() {
+                app.switch_to(index, true);
+            }
+        }
+        
         app.ensure_default_bookmark_folder();
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
@@ -5438,6 +5468,10 @@ impl App {
             if sidebar_width <= 92 {
                 self.paint_download_toast(hdc, rect);
             }
+
+            if self.show_default_bubble && sidebar_width > 92 {
+                self.paint_default_bubble(hdc);
+            }
         }
     }
 
@@ -5472,6 +5506,152 @@ impl App {
                     let _ = DeleteDC(mem_dc);
                 }
             }
+        }
+    }
+
+    fn default_bubble_rect(&self) -> Option<RECT> {
+        if !self.show_default_bubble {
+            return None;
+        }
+        let rect = client_rect(self.hwnd);
+        let sidebar_width = self.sidebar_width();
+        if sidebar_width <= 92 {
+            return None;
+        }
+        let left = 12;
+        let right = left + 224;
+        Some(RECT {
+            left,
+            top: rect.bottom - 164,
+            right,
+            bottom: rect.bottom - 60,
+        })
+    }
+
+    fn default_bubble_close_rect(&self) -> Option<RECT> {
+        let bubble = self.default_bubble_rect()?;
+        Some(RECT {
+            left: bubble.right - 28,
+            top: bubble.top + 8,
+            right: bubble.right - 8,
+            bottom: bubble.top + 28,
+        })
+    }
+
+    fn default_bubble_button_rect(&self) -> Option<RECT> {
+        let bubble = self.default_bubble_rect()?;
+        Some(RECT {
+            left: bubble.left + 12,
+            top: bubble.top + 54,
+            right: bubble.right - 12,
+            bottom: bubble.top + 92,
+        })
+    }
+
+    fn paint_default_bubble(&self, hdc: HDC) {
+        let Some(rect) = self.default_bubble_rect() else {
+            return;
+        };
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+
+        unsafe {
+            // 1. Create a rounded region for clipping
+            let rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+            let _ = SelectClipRgn(hdc, Some(rgn));
+
+            // 2. Draw semi-transparent rounded slate-grey background (#25252b, i.e., 0x2b2525 at 90% opacity = 230 constant alpha)
+            let mem_dc = CreateCompatibleDC(Some(hdc));
+            if !mem_dc.is_invalid() {
+                let bitmap = CreateCompatibleBitmap(hdc, width, height);
+                if !bitmap.is_invalid() {
+                    let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+                    fill_rect(
+                        mem_dc,
+                        RECT {
+                            left: 0,
+                            top: 0,
+                            right: width,
+                            bottom: height,
+                        },
+                        0x2b2525,
+                    );
+                    
+                    let blend = BLENDFUNCTION {
+                        BlendOp: AC_SRC_OVER as u8,
+                        BlendFlags: 0,
+                        SourceConstantAlpha: 230, // 90%
+                        AlphaFormat: 0,
+                    };
+                    let _ = AlphaBlend(
+                        hdc,
+                        rect.left,
+                        rect.top,
+                        width,
+                        height,
+                        mem_dc,
+                        0,
+                        0,
+                        width,
+                        height,
+                        blend,
+                    );
+                    let _ = SelectObject(mem_dc, old_bitmap);
+                    let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                }
+                let _ = DeleteDC(mem_dc);
+            }
+
+            // Restore clipping region and delete region object
+            let _ = SelectClipRgn(hdc, None);
+            let _ = DeleteObject(HGDIOBJ(rgn.0));
+
+            // 3. Draw a subtle 1px border around the bubble with COLOR_BORDER (0x343434)
+            draw_outline(hdc, rect, 0x343434, 16);
+
+            // 4. Draw interactive close "×" button in the top-right corner
+            let close_rect = self.default_bubble_close_rect().unwrap();
+            let is_close_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleClose);
+            if is_close_hovered {
+                fill_round_rect(hdc, close_rect, COLOR_SURFACE_HOVER, 6);
+            }
+            draw_icon_glyph(hdc, &self.fonts.toolbar_icon, "\u{E8BB}", close_rect, if is_close_hovered { 0xffffff } else { COLOR_MUTED });
+
+            // 5. Draw the insisting promo message on two lines
+            let line1_rect = RECT {
+                left: rect.left + 14,
+                top: rect.top + 10,
+                right: rect.right - 36,
+                bottom: rect.top + 28,
+            };
+            draw_text(hdc, &self.fonts.body, "Make Aster default browser?", line1_rect, COLOR_TEXT);
+
+            let line2_rect = RECT {
+                left: rect.left + 14,
+                top: rect.top + 28,
+                right: rect.right - 36,
+                bottom: rect.top + 46,
+            };
+            draw_text(hdc, &self.fonts.small, "For a faster web experience.", line2_rect, COLOR_MUTED);
+
+            // 6. Draw themed "Set as Default" CTA button at the bottom
+            let btn_rect = self.default_bubble_button_rect().unwrap();
+            let is_btn_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
+            let btn_bg = if is_btn_hovered {
+                self.accent_color
+            } else {
+                0x343434
+            };
+            let btn_fg = if is_btn_hovered {
+                0x000000
+            } else {
+                0xffffff
+            };
+            fill_round_rect(hdc, btn_rect, btn_bg, 8);
+            if !is_btn_hovered {
+                draw_outline(hdc, btn_rect, 0x454545, 8);
+            }
+            draw_centered_text(hdc, &self.fonts.body, "Set as Default", btn_rect, btn_fg);
         }
     }
 
@@ -6773,6 +6953,29 @@ impl App {
             return;
         }
 
+        if self.show_default_bubble && self.sidebar_width() > 92 {
+            if let Some(close_rect) = self.default_bubble_close_rect() {
+                if point_in_rect(x, y, close_rect) {
+                    self.show_default_bubble = false;
+                    self.refresh();
+                    return;
+                }
+            }
+            if let Some(btn_rect) = self.default_bubble_button_rect() {
+                if point_in_rect(x, y, btn_rect) {
+                    make_aster_default_browser();
+                    self.show_default_bubble = false;
+                    self.refresh();
+                    return;
+                }
+            }
+            if let Some(bubble_rect) = self.default_bubble_rect() {
+                if point_in_rect(x, y, bubble_rect) {
+                    return;
+                }
+            }
+        }
+
         if let Some(action) = self.download_action_at(x, y) {
             self.run_download_action(action);
             return;
@@ -7529,6 +7732,21 @@ impl App {
         self.hover_target = None;
         self.drop_target = Some(DropTarget::None);
 
+        if self.show_default_bubble && self.sidebar_width() > 92 {
+            if let Some(close_rect) = self.default_bubble_close_rect() {
+                if point_in_rect(x, y, close_rect) {
+                    self.hover_target = Some(HoverTarget::DefaultBubbleClose);
+                }
+            }
+            if self.hover_target.is_none() {
+                if let Some(btn_rect) = self.default_bubble_button_rect() {
+                    if point_in_rect(x, y, btn_rect) {
+                        self.hover_target = Some(HoverTarget::DefaultBubbleSetDefault);
+                    }
+                }
+            }
+        }
+
         if x < HOVER_ZONE && self.sidebar_mode == SidebarMode::Hidden && !self.animating_sidebar {
             self.sidebar_expand_mode = SidebarMode::Overlay;
             self.set_sidebar_mode(SidebarMode::Overlay);
@@ -7684,6 +7902,16 @@ impl App {
             });
         } else {
             self.hover_folder = None;
+        }
+
+        if self.show_default_bubble && self.sidebar_width() > 92 {
+            if let Some(bubble_rect) = self.default_bubble_rect() {
+                if point_in_rect(x, y, bubble_rect) {
+                    self.hover_tab = None;
+                    self.hover_close = None;
+                    self.hover_folder = None;
+                }
+            }
         }
 
         if self.drag_state.as_ref().map(|d| d.active).unwrap_or(false) {
@@ -12221,6 +12449,71 @@ unsafe fn SetWindowLong(window: HWND, index: WINDOW_LONG_PTR_INDEX, value: isize
 unsafe fn SetWindowLong(window: HWND, index: WINDOW_LONG_PTR_INDEX, value: isize) -> isize {
     WindowsAndMessaging::SetWindowLongPtrW(window, index, value)
 }
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn is_aster_default_browser() -> bool {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("reg");
+    cmd.arg("query")
+       .arg("HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice")
+       .arg("/v")
+       .arg("ProgId");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    
+    if let Ok(output) = cmd.output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.contains("AsterHTML")
+    } else {
+        false
+    }
+}
+
+fn make_aster_default_browser() {
+    use std::os::windows::process::CommandExt;
+    if let Ok(exe_path) = std::env::current_exe() {
+        let exe_str = exe_path.to_string_lossy();
+        
+        let keys = vec![
+            ("HKCU\\Software\\Classes\\AsterHTML".to_string(), "".to_string(), "REG_SZ".to_string(), "Aster HTML Document".to_string()),
+            ("HKCU\\Software\\Classes\\AsterHTML".to_string(), "URL Protocol".to_string(), "REG_SZ".to_string(), "".to_string()),
+            ("HKCU\\Software\\Classes\\AsterHTML\\DefaultIcon".to_string(), "".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
+            ("HKCU\\Software\\Classes\\AsterHTML\\shell\\open\\command".to_string(), "".to_string(), "REG_SZ".to_string(), format!("\"{}\" \"%1\"", exe_str)),
+            
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster".to_string(), "".to_string(), "REG_SZ".to_string(), "Aster".to_string()),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationDescription".to_string(), "REG_SZ".to_string(), "Aster Web Browser".to_string()),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationIcon".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationName".to_string(), "REG_SZ".to_string(), "Aster".to_string()),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations".to_string(), ".htm".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations".to_string(), ".html".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations".to_string(), "http".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations".to_string(), "https".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\DefaultIcon".to_string(), "".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
+            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\shell\\open\\command".to_string(), "".to_string(), "REG_SZ".to_string(), format!("\"{}\"", exe_str)),
+            
+            ("HKCU\\Software\\RegisteredApplications".to_string(), "Aster".to_string(), "REG_SZ".to_string(), "Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string()),
+        ];
+        
+        for (key, val_name, val_type, val_data) in keys {
+            let mut cmd = std::process::Command::new("reg");
+            cmd.arg("add").arg(&key);
+            if !val_name.is_empty() {
+                cmd.arg("/v").arg(&val_name);
+            } else {
+                cmd.arg("/ve");
+            }
+            cmd.arg("/t").arg(&val_type).arg("/d").arg(&val_data).arg("/f");
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            let _ = cmd.output();
+        }
+        
+        let _ = std::process::Command::new("cmd")
+            .args(&["/c", "start", "ms-settings:defaultapps?registeredApp=Aster"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
