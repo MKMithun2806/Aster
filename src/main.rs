@@ -5415,9 +5415,6 @@ impl App {
                 self.paint_download_indicators(hdc);
             }
 
-            if self.settings_open {
-                self.paint_settings_menu(hdc);
-            }
             if self.find_open {
                 self.paint_find_bar(hdc);
             }
@@ -5500,6 +5497,10 @@ impl App {
                 if alpha > 0 {
                     self.paint_default_bubble(hdc, alpha);
                 }
+            }
+
+            if self.settings_open {
+                self.paint_settings_menu(hdc);
             }
         }
     }
