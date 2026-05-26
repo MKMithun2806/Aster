@@ -5596,13 +5596,13 @@ impl App {
                             right: width,
                             bottom: height,
                         },
-                        0x2b2525,
+                        self.secondary_color,
                     );
                     
                     let blend = BLENDFUNCTION {
                         BlendOp: AC_SRC_OVER as u8,
                         BlendFlags: 0,
-                        SourceConstantAlpha: 230, // 90%
+                        SourceConstantAlpha: 255, // 100%
                         AlphaFormat: 0,
                     };
                     let _ = AlphaBlend(
@@ -5628,8 +5628,8 @@ impl App {
             let _ = SelectClipRgn(hdc, None);
             let _ = DeleteObject(HGDIOBJ(rgn.0));
 
-            // 3. Draw a subtle 1px border around the bubble with COLOR_BORDER (0x343434)
-            draw_outline(hdc, rect, 0x343434, 16);
+            // 3. Draw a subtle 1px border around the bubble with the accent color
+            draw_outline(hdc, rect, self.accent_color, 16);
 
             // 4. Draw interactive close "×" button in the top-right corner
             let close_rect = self.default_bubble_close_rect().unwrap();
