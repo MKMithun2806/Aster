@@ -5548,9 +5548,9 @@ impl App {
         let right = left + 224;
         Some(RECT {
             left,
-            top: rect.bottom - 164,
+            top: rect.bottom - 208,
             right,
-            bottom: rect.bottom - 60,
+            bottom: rect.bottom - 104,
         })
     }
 
