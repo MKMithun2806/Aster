@@ -867,6 +867,12 @@ impl App {
         app.load_state()?;
         app.default_bubble_dismissed = false;
         app.show_default_bubble = !is_aster_default_browser();
+        if app.show_default_bubble {
+            app.sidebar_mode = SidebarMode::Pushed;
+            app.sidebar_expand_mode = SidebarMode::Pushed;
+            app.sidebar_width = SIDEBAR_EXPANDED;
+            app.sidebar_target = SIDEBAR_EXPANDED;
+        }
         app.save_state();
         
         let args: Vec<String> = std::env::args().collect();
@@ -1385,6 +1391,8 @@ impl App {
             let _ = std::process::Command::new("notepad")
                 .arg(path.to_string_lossy().as_ref())
                 .spawn();
+        } else if message == "settings:make-default" {
+            make_aster_default_browser();
         } else if let Some(value) = message.strip_prefix("settings:site-mode:") {
             match value {
                 "auto" => self.set_site_mode(SiteMode::Auto),
@@ -4027,6 +4035,7 @@ impl App {
                 StartupMode::HomePage => "home",
                 StartupMode::LastSession => "last",
             },
+            is_aster_default_browser(),
         );
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = "aster:settings".to_string();
@@ -6980,6 +6989,7 @@ impl App {
                 if point_in_rect(x, y, close_rect) {
                     self.show_default_bubble = false;
                     self.default_bubble_dismissed = true;
+                    self.set_sidebar_mode(SidebarMode::Hidden);
                     self.save_state();
                     self.refresh();
                     return;
@@ -10153,11 +10163,17 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 if is_default {
                     if app.show_default_bubble {
                         app.show_default_bubble = false;
+                        app.set_sidebar_mode(SidebarMode::Hidden);
                         app.refresh();
                     }
                 } else if !app.default_bubble_dismissed && !app.show_default_bubble {
                     app.show_default_bubble = true;
+                    app.set_sidebar_mode(SidebarMode::Pushed);
+                    app.sidebar_expand_mode = SidebarMode::Pushed;
                     app.refresh();
+                }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
+                    app.load_settings_page(index);
                 }
             });
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
@@ -10168,11 +10184,17 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 if is_default {
                     if app.show_default_bubble {
                         app.show_default_bubble = false;
+                        app.set_sidebar_mode(SidebarMode::Hidden);
                         app.refresh();
                     }
                 } else if !app.default_bubble_dismissed && !app.show_default_bubble {
                     app.show_default_bubble = true;
+                    app.set_sidebar_mode(SidebarMode::Pushed);
+                    app.sidebar_expand_mode = SidebarMode::Pushed;
                     app.refresh();
+                }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
+                    app.load_settings_page(index);
                 }
 
                 if app.renaming_folder_id.is_some() {
@@ -11800,10 +11822,22 @@ fn menu_item_with_subtitle(id: usize, label: &str, sublabel: &str) -> OverlayMen
     }
 }
 
-fn settings_page_html(dominant_color: u32, secondary_color: u32, accent_color: u32, site_mode: &str, startup_mode: &str) -> String {
+fn settings_page_html(
+    dominant_color: u32,
+    secondary_color: u32,
+    accent_color: u32,
+    site_mode: &str,
+    startup_mode: &str,
+    is_default: bool,
+) -> String {
     let dominant = colorref_to_css(dominant_color);
     let secondary = colorref_to_css(secondary_color);
     let accent = colorref_to_css(accent_color);
+    let default_browser_button = if is_default {
+        r#"<button class="action-btn" id="makeDefaultBtn" disabled style="opacity: 0.6; cursor: not-allowed;">Aster is default</button>"#
+    } else {
+        r#"<button class="action-btn" id="makeDefaultBtn">Set as default</button>"#
+    };
     format!(
         r##"<!doctype html>
 <html>
@@ -11853,9 +11887,10 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 </nav>
 <main>
 <section id="general" class="active">
-<h2>General</h2><p class="lead">Startup behavior.</p>
+<h2>General</h2><p class="lead">Startup behavior and preferences.</p>
 <div class="group">
 <div class="row"><div><div class="title">Startup page</div><div class="hint">Choose what opens when Aster starts.</div></div><select id="startupMode"><option value="home">Home page</option><option value="last">Last session</option></select></div>
+<div class="row"><div><div class="title">Default browser</div><div class="hint">Make Aster your default web browser.</div></div>{default_browser_button}</div>
 </div>
 </section>
 <section id="appearance">
@@ -11915,6 +11950,8 @@ document.querySelectorAll(".reset-btn").forEach((btn) => {{
   }};
 }});
 document.getElementById("openStateFile").onclick = () => post("settings:open-state-file");
+const makeDefaultBtn = document.getElementById("makeDefaultBtn");
+if (makeDefaultBtn) makeDefaultBtn.onclick = () => post("settings:make-default");
 const defaults = [
   ["Navigate", "Ctrl+L"], ["Bookmark site", "Ctrl+D"], ["Find in page", "Ctrl+F"], ["New tab", "Ctrl+T"],
   ["Close tab", "Ctrl+W"], ["Reload", "Ctrl+R"], ["Reset zoom", "Ctrl+0"], ["Zoom in", "Ctrl++"],
@@ -11951,7 +11988,8 @@ defaults.forEach(([name, combo]) => {{
         dominant = dominant,
         accent = accent,
         site_mode_lc = site_mode.to_ascii_lowercase(),
-        startup_mode = startup_mode
+        startup_mode = startup_mode,
+        default_browser_button = default_browser_button
     )
 }
 
