@@ -1385,6 +1385,8 @@ impl App {
             let _ = std::process::Command::new("notepad")
                 .arg(path.to_string_lossy().as_ref())
                 .spawn();
+        } else if message == "settings:make-default" {
+            make_aster_default_browser();
         } else if let Some(value) = message.strip_prefix("settings:site-mode:") {
             match value {
                 "auto" => self.set_site_mode(SiteMode::Auto),
@@ -4027,6 +4029,7 @@ impl App {
                 StartupMode::HomePage => "home",
                 StartupMode::LastSession => "last",
             },
+            is_aster_default_browser(),
         );
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = "aster:settings".to_string();
@@ -5491,8 +5494,12 @@ impl App {
                 self.paint_download_toast(hdc, rect);
             }
 
-            if self.show_default_bubble && sidebar_width >= 240 {
-                self.paint_default_bubble(hdc);
+            if self.show_default_bubble {
+                let width_f = sidebar_width as f32;
+                let alpha = (((width_f - 120.0) / 120.0).clamp(0.0, 1.0) * 255.0) as u8;
+                if alpha > 0 {
+                    self.paint_default_bubble(hdc, alpha);
+                }
             }
         }
     }
@@ -5536,10 +5543,6 @@ impl App {
             return None;
         }
         let rect = client_rect(self.hwnd);
-        let sidebar_width = self.sidebar_width();
-        if sidebar_width < 240 {
-            return None;
-        }
         let left = 12;
         let right = left + 224;
         Some(RECT {
@@ -5570,7 +5573,7 @@ impl App {
         })
     }
 
-    fn paint_default_bubble(&self, hdc: HDC) {
+    fn paint_default_bubble(&self, hdc: HDC, alpha: u8) {
         let Some(rect) = self.default_bubble_rect() else {
             return;
         };
@@ -5578,33 +5581,93 @@ impl App {
         let height = rect.bottom - rect.top;
 
         unsafe {
-            // 1. Create a rounded region for clipping
-            let rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
-            let _ = SelectClipRgn(hdc, Some(rgn));
-
-            // 2. Draw semi-transparent rounded slate-grey background (#25252b, i.e., 0x2b2525 at 90% opacity = 230 constant alpha)
+            // Create a memory DC compatible with hdc to draw the entire bubble offscreen
             let mem_dc = CreateCompatibleDC(Some(hdc));
             if !mem_dc.is_invalid() {
                 let bitmap = CreateCompatibleBitmap(hdc, width, height);
                 if !bitmap.is_invalid() {
                     let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+
+                    // Use viewport origin shift so all existing coordinate variables can remain unchanged
+                    let _ = SetViewportOrgEx(mem_dc, -rect.left, -rect.top, None);
+
+                    // 1. Draw rounded slate-grey background onto mem_dc (clipped to round region in local coordinates)
+                    let rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+                    let _ = SelectClipRgn(mem_dc, Some(rgn));
                     fill_rect(
                         mem_dc,
                         RECT {
-                            left: 0,
-                            top: 0,
-                            right: width,
-                            bottom: height,
+                            left: rect.left,
+                            top: rect.top,
+                            right: rect.right,
+                            bottom: rect.bottom,
                         },
                         self.secondary_color,
                     );
-                    
+                    let _ = SelectClipRgn(mem_dc, None);
+                    let _ = DeleteObject(HGDIOBJ(rgn.0));
+
+                    // 2. Draw outline around the bubble with accent color
+                    draw_outline(mem_dc, rect, self.accent_color, 16);
+
+                    // 3. Draw close button
+                    let close_rect = self.default_bubble_close_rect().unwrap();
+                    let is_close_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleClose);
+                    if is_close_hovered {
+                        fill_round_rect(mem_dc, close_rect, COLOR_SURFACE_HOVER, 6);
+                    }
+                    draw_icon_glyph(mem_dc, &self.fonts.toolbar_icon, "\u{E8BB}", close_rect, if is_close_hovered { 0xffffff } else { COLOR_MUTED });
+
+                    // 4. Draw messages
+                    let line1_rect = RECT {
+                        left: rect.left + 14,
+                        top: rect.top + 10,
+                        right: rect.right - 36,
+                        bottom: rect.top + 28,
+                    };
+                    draw_text(mem_dc, &self.fonts.body, "Make Aster default browser?", line1_rect, COLOR_TEXT);
+
+                    let line2_rect = RECT {
+                        left: rect.left + 14,
+                        top: rect.top + 28,
+                        right: rect.right - 36,
+                        bottom: rect.top + 46,
+                    };
+                    draw_text(mem_dc, &self.fonts.small, "For a faster web experience.", line2_rect, COLOR_MUTED);
+
+                    // 5. Draw primary action button
+                    let btn_rect = self.default_bubble_button_rect().unwrap();
+                    let is_btn_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
+                    let btn_bg = if is_btn_hovered {
+                        self.accent_color
+                    } else {
+                        0x343434
+                    };
+                    let btn_fg = if is_btn_hovered {
+                        0x000000
+                    } else {
+                        0xffffff
+                    };
+                    fill_round_rect(mem_dc, btn_rect, btn_bg, 8);
+                    if !is_btn_hovered {
+                        draw_outline(mem_dc, btn_rect, 0x454545, 8);
+                    }
+                    draw_centered_text(mem_dc, &self.fonts.body, "Set as Default", btn_rect, btn_fg);
+
+                    // Reset viewport origin before alpha blending onto the destination
+                    let _ = SetViewportOrgEx(mem_dc, 0, 0, None);
+
+                    // Select a rounded clip region on the destination hdc to cleanly truncate corners
+                    let dest_rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+                    let _ = SelectClipRgn(hdc, Some(dest_rgn));
+
                     let blend = BLENDFUNCTION {
                         BlendOp: AC_SRC_OVER as u8,
                         BlendFlags: 0,
-                        SourceConstantAlpha: 255, // 100%
+                        SourceConstantAlpha: alpha,
                         AlphaFormat: 0,
                     };
+
                     let _ = AlphaBlend(
                         hdc,
                         rect.left,
@@ -5618,62 +5681,16 @@ impl App {
                         height,
                         blend,
                     );
+
+                    // Restore clipping region on hdc and clean up resources
+                    let _ = SelectClipRgn(hdc, None);
+                    let _ = DeleteObject(HGDIOBJ(dest_rgn.0));
+
                     let _ = SelectObject(mem_dc, old_bitmap);
                     let _ = DeleteObject(HGDIOBJ(bitmap.0));
                 }
                 let _ = DeleteDC(mem_dc);
             }
-
-            // Restore clipping region and delete region object
-            let _ = SelectClipRgn(hdc, None);
-            let _ = DeleteObject(HGDIOBJ(rgn.0));
-
-            // 3. Draw a subtle 1px border around the bubble with the accent color
-            draw_outline(hdc, rect, self.accent_color, 16);
-
-            // 4. Draw interactive close "×" button in the top-right corner
-            let close_rect = self.default_bubble_close_rect().unwrap();
-            let is_close_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleClose);
-            if is_close_hovered {
-                fill_round_rect(hdc, close_rect, COLOR_SURFACE_HOVER, 6);
-            }
-            draw_icon_glyph(hdc, &self.fonts.toolbar_icon, "\u{E8BB}", close_rect, if is_close_hovered { 0xffffff } else { COLOR_MUTED });
-
-            // 5. Draw the insisting promo message on two lines
-            let line1_rect = RECT {
-                left: rect.left + 14,
-                top: rect.top + 10,
-                right: rect.right - 36,
-                bottom: rect.top + 28,
-            };
-            draw_text(hdc, &self.fonts.body, "Make Aster default browser?", line1_rect, COLOR_TEXT);
-
-            let line2_rect = RECT {
-                left: rect.left + 14,
-                top: rect.top + 28,
-                right: rect.right - 36,
-                bottom: rect.top + 46,
-            };
-            draw_text(hdc, &self.fonts.small, "For a faster web experience.", line2_rect, COLOR_MUTED);
-
-            // 6. Draw themed "Set as Default" CTA button at the bottom
-            let btn_rect = self.default_bubble_button_rect().unwrap();
-            let is_btn_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
-            let btn_bg = if is_btn_hovered {
-                self.accent_color
-            } else {
-                0x343434
-            };
-            let btn_fg = if is_btn_hovered {
-                0x000000
-            } else {
-                0xffffff
-            };
-            fill_round_rect(hdc, btn_rect, btn_bg, 8);
-            if !is_btn_hovered {
-                draw_outline(hdc, btn_rect, 0x454545, 8);
-            }
-            draw_centered_text(hdc, &self.fonts.body, "Set as Default", btn_rect, btn_fg);
         }
     }
 
@@ -6980,6 +6997,7 @@ impl App {
                 if point_in_rect(x, y, close_rect) {
                     self.show_default_bubble = false;
                     self.default_bubble_dismissed = true;
+                    self.set_sidebar_mode(SidebarMode::Hidden);
                     self.save_state();
                     self.refresh();
                     return;
@@ -10153,11 +10171,15 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 if is_default {
                     if app.show_default_bubble {
                         app.show_default_bubble = false;
+                        app.set_sidebar_mode(SidebarMode::Hidden);
                         app.refresh();
                     }
                 } else if !app.default_bubble_dismissed && !app.show_default_bubble {
                     app.show_default_bubble = true;
                     app.refresh();
+                }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
+                    app.load_settings_page(index);
                 }
             });
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
@@ -10168,11 +10190,15 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 if is_default {
                     if app.show_default_bubble {
                         app.show_default_bubble = false;
+                        app.set_sidebar_mode(SidebarMode::Hidden);
                         app.refresh();
                     }
                 } else if !app.default_bubble_dismissed && !app.show_default_bubble {
                     app.show_default_bubble = true;
                     app.refresh();
+                }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
+                    app.load_settings_page(index);
                 }
 
                 if app.renaming_folder_id.is_some() {
@@ -11800,10 +11826,22 @@ fn menu_item_with_subtitle(id: usize, label: &str, sublabel: &str) -> OverlayMen
     }
 }
 
-fn settings_page_html(dominant_color: u32, secondary_color: u32, accent_color: u32, site_mode: &str, startup_mode: &str) -> String {
+fn settings_page_html(
+    dominant_color: u32,
+    secondary_color: u32,
+    accent_color: u32,
+    site_mode: &str,
+    startup_mode: &str,
+    is_default: bool,
+) -> String {
     let dominant = colorref_to_css(dominant_color);
     let secondary = colorref_to_css(secondary_color);
     let accent = colorref_to_css(accent_color);
+    let default_browser_button = if is_default {
+        r#"<button class="action-btn" id="makeDefaultBtn" disabled style="opacity: 0.6; cursor: not-allowed;">Aster is default</button>"#
+    } else {
+        r#"<button class="action-btn" id="makeDefaultBtn">Set as default</button>"#
+    };
     format!(
         r##"<!doctype html>
 <html>
@@ -11853,9 +11891,10 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 </nav>
 <main>
 <section id="general" class="active">
-<h2>General</h2><p class="lead">Startup behavior.</p>
+<h2>General</h2><p class="lead">Startup behavior and preferences.</p>
 <div class="group">
 <div class="row"><div><div class="title">Startup page</div><div class="hint">Choose what opens when Aster starts.</div></div><select id="startupMode"><option value="home">Home page</option><option value="last">Last session</option></select></div>
+<div class="row"><div><div class="title">Default browser</div><div class="hint">Make Aster your default web browser.</div></div>{default_browser_button}</div>
 </div>
 </section>
 <section id="appearance">
@@ -11915,6 +11954,8 @@ document.querySelectorAll(".reset-btn").forEach((btn) => {{
   }};
 }});
 document.getElementById("openStateFile").onclick = () => post("settings:open-state-file");
+const makeDefaultBtn = document.getElementById("makeDefaultBtn");
+if (makeDefaultBtn) makeDefaultBtn.onclick = () => post("settings:make-default");
 const defaults = [
   ["Navigate", "Ctrl+L"], ["Bookmark site", "Ctrl+D"], ["Find in page", "Ctrl+F"], ["New tab", "Ctrl+T"],
   ["Close tab", "Ctrl+W"], ["Reload", "Ctrl+R"], ["Reset zoom", "Ctrl+0"], ["Zoom in", "Ctrl++"],
@@ -11951,7 +11992,8 @@ defaults.forEach(([name, combo]) => {{
         dominant = dominant,
         accent = accent,
         site_mode_lc = site_mode.to_ascii_lowercase(),
-        startup_mode = startup_mode
+        startup_mode = startup_mode,
+        default_browser_button = default_browser_button
     )
 }
 
