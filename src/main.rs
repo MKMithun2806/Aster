@@ -10,12 +10,23 @@ use std::{
     sync::mpsc,
 };
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose, Engine as _};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
     core::PWSTR,
     core::*,
     Win32::{
-        Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{
+            LocalFree, COLORREF, E_POINTER, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT, POINT, RECT,
+            WPARAM,
+        },
         Graphics::Dwm::{
             DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR,
             DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -36,6 +47,7 @@ use windows::{
             CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
             WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
         },
+        Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
         System::{Com::*, LibraryLoader},
         UI::{
             Controls::{EM_SETMARGINS, EM_SETSEL, MARGINS},
@@ -340,6 +352,124 @@ impl HistorySortMode {
             _ => Self::Latest,
         }
     }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PortableBookmark {
+    title: String,
+    url: String,
+    #[serde(default)]
+    folder: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    created_at: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PortableHistoryEntry {
+    title: String,
+    url: String,
+    #[serde(default = "default_visit_count")]
+    visit_count: u32,
+    #[serde(default)]
+    last_visit_time: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PortableCookie {
+    name: String,
+    value: String,
+    domain: String,
+    #[serde(default = "default_cookie_path")]
+    path: String,
+    #[serde(default)]
+    expires: Option<f64>,
+    #[serde(default)]
+    secure: bool,
+    #[serde(default)]
+    http_only: bool,
+    #[serde(default)]
+    same_site: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct AsterDataExport {
+    #[serde(default)]
+    app: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    exported_at: u64,
+    #[serde(default)]
+    bookmarks: Vec<PortableBookmark>,
+    #[serde(default)]
+    history: Vec<PortableHistoryEntry>,
+    #[serde(default)]
+    cookies: Vec<PortableCookie>,
+}
+
+#[derive(Deserialize)]
+struct ImportUploadFile {
+    name: String,
+    #[serde(default)]
+    path: String,
+    content: String,
+}
+
+#[derive(Default)]
+struct ImportStats {
+    bookmarks: usize,
+    history: usize,
+    cookies: usize,
+    accounts: usize,
+    skipped: usize,
+    errors: Vec<String>,
+}
+
+impl ImportStats {
+    fn absorb(&mut self, other: ImportStats) {
+        self.bookmarks += other.bookmarks;
+        self.history += other.history;
+        self.cookies += other.cookies;
+        self.accounts += other.accounts;
+        self.skipped += other.skipped;
+        self.errors.extend(other.errors);
+    }
+
+    fn message(&self) -> String {
+        let mut parts = Vec::new();
+        if self.bookmarks > 0 {
+            parts.push(format!("{} bookmarks", self.bookmarks));
+        }
+        if self.history > 0 {
+            parts.push(format!("{} history entries", self.history));
+        }
+        if self.cookies > 0 {
+            parts.push(format!("{} session cookies", self.cookies));
+        }
+        if self.accounts > 0 {
+            parts.push(format!("{} account cookies", self.accounts));
+        }
+        if parts.is_empty() && self.errors.is_empty() {
+            parts.push("No new data found".to_string());
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} duplicates skipped", self.skipped));
+        }
+        if !self.errors.is_empty() {
+            parts.push(format!("{} files need attention", self.errors.len()));
+        }
+        format!("Import complete: {}.", parts.join(", "))
+    }
+}
+
+fn default_visit_count() -> u32 {
+    1
+}
+
+fn default_cookie_path() -> String {
+    "/".to_string()
 }
 
 fn current_timestamp() -> u64 {
@@ -681,6 +811,7 @@ struct App {
     site_mode: SiteMode,
     history_sort_mode: HistorySortMode,
     history_visit_sort_desc: bool,
+    import_export_notice: Option<String>,
     startup_mode: StartupMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -853,6 +984,7 @@ impl App {
             site_mode: SiteMode::Auto,
             history_sort_mode: HistorySortMode::Latest,
             history_visit_sort_desc: true,
+            import_export_notice: None,
             startup_mode: StartupMode::LastSession,
             settings_open: false,
             mode_menu_open: false,
@@ -1448,6 +1580,13 @@ impl App {
                     }
                 }
             }
+        } else if let Some(raw) = message.strip_prefix("settings:import-files:") {
+            let stats = self.import_uploaded_files(raw);
+            self.import_export_notice = Some(stats.message());
+            self.reload_settings_pages();
+        } else if message == "settings:clear-import-notice" {
+            self.import_export_notice = None;
+            self.reload_settings_pages();
         } else if let Some(value) = message.strip_prefix("history:sort:") {
             self.history_sort_mode = HistorySortMode::from_str(value);
             self.reload_history_pages();
@@ -4167,7 +4306,629 @@ impl App {
         }
     }
 
+    fn reload_settings_pages(&mut self) {
+        let indexes: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                if tab.url == "aster:settings" {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for index in indexes {
+            self.load_settings_page(index);
+        }
+    }
+
+    fn portable_bookmarks(&self) -> Vec<PortableBookmark> {
+        self.bookmarks
+            .iter()
+            .map(|bookmark| PortableBookmark {
+                title: bookmark.title.clone(),
+                url: bookmark.url.clone(),
+                folder: bookmark
+                    .folder_id
+                    .and_then(|id| self.bookmark_folders.iter().find(|folder| folder.id == id))
+                    .map(|folder| folder.name.clone())
+                    .unwrap_or_default(),
+                tags: bookmark.tags.clone(),
+                created_at: bookmark.created_at,
+            })
+            .collect()
+    }
+
+    fn portable_history(&self) -> Vec<PortableHistoryEntry> {
+        self.visited_sites
+            .iter()
+            .map(|site| PortableHistoryEntry {
+                title: site.title.clone(),
+                url: site.url.clone(),
+                visit_count: site.visit_count.max(1),
+                last_visit_time: site.last_visit_time,
+            })
+            .collect()
+    }
+
+    fn cookie_manager(&self) -> Option<ICoreWebView2CookieManager> {
+        let tab = self.tabs.get(self.active).or_else(|| self.tabs.first())?;
+        unsafe {
+            let webview2 = tab.webview.cast::<ICoreWebView2_2>().ok()?;
+            webview2.CookieManager().ok()
+        }
+    }
+
+    fn export_cookies(&self) -> Vec<PortableCookie> {
+        let Some(manager) = self.cookie_manager() else {
+            return Vec::new();
+        };
+        let cookies = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let output = cookies.clone();
+        let result = GetCookiesCompletedHandler::wait_for_async_operation(
+            Box::new(move |handler| unsafe {
+                let uri = CoTaskMemPWSTR::from("");
+                manager
+                    .GetCookies(*uri.as_ref().as_pcwstr(), &handler)
+                    .map_err(webview2_com::Error::WindowsError)
+            }),
+            Box::new(move |error_code, list| {
+                error_code?;
+                if let Some(list) = list {
+                    unsafe {
+                        let mut count = 0u32;
+                        let _ = list.Count(&mut count);
+                        for index in 0..count {
+                            if let Ok(cookie) = list.GetValueAtIndex(index) {
+                                if let Some(portable) = portable_cookie_from_webview(&cookie) {
+                                    output.borrow_mut().push(portable);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }),
+        );
+        if result.is_err() {
+            return Vec::new();
+        }
+        let exported = cookies.borrow().clone();
+        exported
+    }
+
+    fn aster_export_json(&self) -> String {
+        let export = AsterDataExport {
+            app: "Aster".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            exported_at: current_timestamp(),
+            bookmarks: self.portable_bookmarks(),
+            history: self.portable_history(),
+            cookies: self.export_cookies(),
+        };
+        serde_json::to_string_pretty(&export).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn bookmarks_export_html(&self) -> String {
+        let mut html = String::from(
+            "<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>Bookmarks</TITLE>\n<H1>Bookmarks</H1>\n<DL><p>\n",
+        );
+        for bookmark in &self.bookmarks {
+            html.push_str(&format!(
+                "    <DT><A HREF=\"{}\" ADD_DATE=\"{}\">{}</A>\n",
+                html_escape_attr(&bookmark.url),
+                bookmark.created_at,
+                html_escape_text(&bookmark.title)
+            ));
+        }
+        html.push_str("</DL><p>\n");
+        html
+    }
+
+    fn import_uploaded_files(&mut self, raw: &str) -> ImportStats {
+        let uploads: Vec<ImportUploadFile> = match serde_json::from_str(raw) {
+            Ok(files) => files,
+            Err(error) => {
+                let mut stats = ImportStats::default();
+                stats
+                    .errors
+                    .push(format!("Could not read dropped files: {error}"));
+                return stats;
+            }
+        };
+        let mut decoded = Vec::new();
+        for upload in uploads {
+            match decode_upload_content(&upload.content) {
+                Ok(bytes) => decoded.push((upload, bytes)),
+                Err(error) => {
+                    let mut stats = ImportStats::default();
+                    stats
+                        .errors
+                        .push(format!("{} could not be decoded: {error}", upload.name));
+                    return stats;
+                }
+            }
+        }
+
+        let chromium_key = decoded
+            .iter()
+            .find_map(|(_, bytes)| extract_chromium_profile_key(bytes));
+        let mut total = ImportStats::default();
+        for (upload, bytes) in decoded {
+            if extract_chromium_profile_key(&bytes).is_some() {
+                continue;
+            }
+            let mut stats = if looks_like_sqlite(&upload.name, &bytes) {
+                self.import_sqlite_data(&upload.name, &upload.path, &bytes, chromium_key.as_deref())
+            } else if looks_like_html(&upload.name, &bytes) {
+                self.import_bookmarks_html(&bytes)
+            } else {
+                self.import_json_data(&upload.name, &bytes)
+            };
+            if stats.bookmarks == 0
+                && stats.history == 0
+                && stats.cookies == 0
+                && stats.errors.is_empty()
+            {
+                stats.errors.push(format!(
+                    "{} did not contain supported browser data",
+                    upload.name
+                ));
+            }
+            total.absorb(stats);
+        }
+        self.save_state();
+        total
+    }
+
+    fn import_json_data(&mut self, name: &str, bytes: &[u8]) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            stats.errors.push(format!("{name} is not valid JSON"));
+            return stats;
+        };
+
+        if value.get("bookmarks").is_some()
+            || value.get("history").is_some()
+            || value.get("cookies").is_some()
+        {
+            match serde_json::from_value::<AsterDataExport>(value.clone()) {
+                Ok(export) => {
+                    stats.absorb(self.merge_portable_bookmarks(export.bookmarks));
+                    stats.absorb(self.merge_portable_history(export.history));
+                    stats.absorb(self.import_portable_cookies(export.cookies));
+                    return stats;
+                }
+                Err(error) => {
+                    stats.errors.push(format!(
+                        "{name} looked like an Aster export but failed: {error}"
+                    ));
+                    return stats;
+                }
+            }
+        }
+
+        let mut bookmarks = Vec::new();
+        collect_bookmarks_from_json(&value, "", &mut bookmarks);
+        if !bookmarks.is_empty() {
+            stats.absorb(self.merge_portable_bookmarks(bookmarks));
+        }
+
+        let mut history = Vec::new();
+        collect_history_from_json(&value, &mut history);
+        if !history.is_empty() {
+            stats.absorb(self.merge_portable_history(history));
+        }
+
+        let mut cookies = Vec::new();
+        collect_cookies_from_json(&value, &mut cookies);
+        if !cookies.is_empty() {
+            stats.absorb(self.import_portable_cookies(cookies));
+        }
+        stats
+    }
+
+    fn import_bookmarks_html(&mut self, bytes: &[u8]) -> ImportStats {
+        let Ok(raw) = std::str::from_utf8(bytes) else {
+            let mut stats = ImportStats::default();
+            stats
+                .errors
+                .push("Bookmark HTML was not UTF-8 text".to_string());
+            return stats;
+        };
+        self.merge_portable_bookmarks(parse_bookmark_html(raw))
+    }
+
+    fn import_sqlite_data(
+        &mut self,
+        name: &str,
+        path_hint: &str,
+        bytes: &[u8],
+        chromium_key: Option<&[u8]>,
+    ) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let temp_path = sqlite_temp_path(name, path_hint);
+        if let Err(error) = fs::write(&temp_path, bytes) {
+            stats.errors.push(format!(
+                "{name} could not be staged for SQLite import: {error}"
+            ));
+            return stats;
+        }
+
+        let result = (|| -> std::result::Result<ImportStats, String> {
+            let connection = Connection::open(&temp_path).map_err(|error| error.to_string())?;
+            let tables = sqlite_table_names(&connection);
+            let mut found = ImportStats::default();
+            if tables.iter().any(|table| table == "urls") {
+                found.absorb(self.import_chromium_history(&connection, name));
+            }
+            if tables.iter().any(|table| table == "moz_places") {
+                found.absorb(self.import_firefox_history(&connection, name));
+            }
+            if tables.iter().any(|table| table == "cookies") {
+                found.absorb(self.import_chromium_cookies(&connection, name, chromium_key));
+            }
+            if tables.iter().any(|table| table == "moz_cookies") {
+                found.absorb(self.import_firefox_cookies(&connection, name));
+            }
+            Ok(found)
+        })();
+
+        let _ = fs::remove_file(&temp_path);
+        match result {
+            Ok(found) => found,
+            Err(error) => {
+                stats.errors.push(format!(
+                    "{name} could not be parsed as browser SQLite: {error}"
+                ));
+                stats
+            }
+        }
+    }
+
+    fn import_chromium_history(&mut self, connection: &Connection, name: &str) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let mut statement = match connection.prepare(
+            "SELECT url, COALESCE(title,''), COALESCE(visit_count,1), COALESCE(last_visit_time,0) FROM urls",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{name} history table could not be read: {error}"));
+                return stats;
+            }
+        };
+        let rows = statement.query_map([], |row| {
+            Ok(PortableHistoryEntry {
+                url: row.get::<_, String>(0)?,
+                title: row.get::<_, String>(1)?,
+                visit_count: row.get::<_, u32>(2).unwrap_or(1),
+                last_visit_time: chrome_time_to_unix_secs(row.get::<_, i64>(3).unwrap_or(0)),
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let history = rows.filter_map(|row| row.ok()).collect();
+                stats.absorb(self.merge_portable_history(history));
+            }
+            Err(error) => stats
+                .errors
+                .push(format!("{name} history rows could not be read: {error}")),
+        }
+        stats
+    }
+
+    fn import_firefox_history(&mut self, connection: &Connection, name: &str) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let mut statement = match connection.prepare(
+            "SELECT url, COALESCE(title,''), COALESCE(visit_count,1), COALESCE(last_visit_date,0) FROM moz_places WHERE url IS NOT NULL",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{name} places table could not be read: {error}"));
+                return stats;
+            }
+        };
+        let rows = statement.query_map([], |row| {
+            let last_visit = row.get::<_, i64>(3).unwrap_or(0);
+            Ok(PortableHistoryEntry {
+                url: row.get::<_, String>(0)?,
+                title: row.get::<_, String>(1)?,
+                visit_count: row.get::<_, u32>(2).unwrap_or(1),
+                last_visit_time: if last_visit > 0 {
+                    (last_visit / 1_000_000).max(0) as u64
+                } else {
+                    current_timestamp()
+                },
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let history = rows.filter_map(|row| row.ok()).collect();
+                stats.absorb(self.merge_portable_history(history));
+            }
+            Err(error) => stats
+                .errors
+                .push(format!("{name} places rows could not be read: {error}")),
+        }
+        stats
+    }
+
+    fn import_chromium_cookies(
+        &mut self,
+        connection: &Connection,
+        name: &str,
+        chromium_key: Option<&[u8]>,
+    ) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let mut statement = match connection.prepare(
+            "SELECT host_key, name, path, COALESCE(expires_utc,0), COALESCE(is_secure,0), COALESCE(is_httponly,0), COALESCE(samesite,0), COALESCE(value,''), encrypted_value FROM cookies",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{name} cookies table could not be read: {error}"));
+                return stats;
+            }
+        };
+        let rows = statement.query_map([], |row| {
+            let encrypted = row.get::<_, Vec<u8>>(8).unwrap_or_default();
+            let mut value = row.get::<_, String>(7).unwrap_or_default();
+            if value.is_empty() {
+                value = chromium_key
+                    .and_then(|key| decrypt_chromium_cookie(&encrypted, key).ok())
+                    .or_else(|| {
+                        dpapi_decrypt(&encrypted)
+                            .ok()
+                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                    })
+                    .unwrap_or_default();
+            }
+            Ok(PortableCookie {
+                domain: row.get::<_, String>(0)?,
+                name: row.get::<_, String>(1)?,
+                path: row.get::<_, String>(2).unwrap_or_else(|_| "/".to_string()),
+                expires: Some(chrome_time_to_unix_secs(row.get::<_, i64>(3).unwrap_or(0)) as f64),
+                secure: row.get::<_, i32>(4).unwrap_or(0) != 0,
+                http_only: row.get::<_, i32>(5).unwrap_or(0) != 0,
+                same_site: same_site_from_chromium(row.get::<_, i32>(6).unwrap_or(0)),
+                value,
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let cookies = rows.filter_map(|row| row.ok()).collect();
+                stats.absorb(self.import_portable_cookies(cookies));
+            }
+            Err(error) => stats
+                .errors
+                .push(format!("{name} cookie rows could not be read: {error}")),
+        }
+        if chromium_key.is_none() && stats.cookies == 0 {
+            stats.errors.push(format!(
+                "{name} contains encrypted Chromium cookies. Drop the matching Local State file with it to import account sessions."
+            ));
+        }
+        stats
+    }
+
+    fn import_firefox_cookies(&mut self, connection: &Connection, name: &str) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let mut statement = match connection.prepare(
+            "SELECT host, name, value, path, COALESCE(expiry,0), COALESCE(isSecure,0), COALESCE(isHttpOnly,0), COALESCE(sameSite,0) FROM moz_cookies",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{name} cookies table could not be read: {error}"));
+                return stats;
+            }
+        };
+        let rows = statement.query_map([], |row| {
+            Ok(PortableCookie {
+                domain: row.get::<_, String>(0)?,
+                name: row.get::<_, String>(1)?,
+                value: row.get::<_, String>(2)?,
+                path: row.get::<_, String>(3).unwrap_or_else(|_| "/".to_string()),
+                expires: Some(row.get::<_, i64>(4).unwrap_or(0).max(0) as f64),
+                secure: row.get::<_, i32>(5).unwrap_or(0) != 0,
+                http_only: row.get::<_, i32>(6).unwrap_or(0) != 0,
+                same_site: same_site_from_firefox(row.get::<_, i32>(7).unwrap_or(0)),
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let cookies = rows.filter_map(|row| row.ok()).collect();
+                stats.absorb(self.import_portable_cookies(cookies));
+            }
+            Err(error) => stats
+                .errors
+                .push(format!("{name} cookie rows could not be read: {error}")),
+        }
+        stats
+    }
+
+    fn merge_portable_bookmarks(&mut self, bookmarks: Vec<PortableBookmark>) -> ImportStats {
+        let mut stats = ImportStats::default();
+        self.ensure_default_bookmark_folder();
+        for bookmark in bookmarks {
+            let url = normalize_address(&bookmark.url);
+            if url.starts_with("aster:") || url.trim().is_empty() {
+                stats.skipped += 1;
+                continue;
+            }
+            if self.bookmark_index_for_url(&url).is_some() {
+                stats.skipped += 1;
+                continue;
+            }
+            let folder_id = self.folder_id_for_imported_bookmark(&bookmark.folder);
+            let id = self.next_bookmark_id;
+            self.next_bookmark_id += 1;
+            let order = self.allocate_sidebar_order();
+            self.bookmarks.push(Bookmark {
+                id,
+                folder_id,
+                title: if bookmark.title.trim().is_empty() {
+                    label_for_url(&url)
+                } else {
+                    bookmark.title
+                },
+                url,
+                tags: bookmark.tags,
+                created_at: if bookmark.created_at == 0 {
+                    current_timestamp()
+                } else {
+                    bookmark.created_at
+                },
+                sidebar_order: order,
+            });
+            stats.bookmarks += 1;
+        }
+        stats
+    }
+
+    fn folder_id_for_imported_bookmark(&mut self, folder_name: &str) -> Option<usize> {
+        let name = folder_name.trim();
+        if name.is_empty() {
+            return self.bookmark_folders.first().map(|folder| folder.id);
+        }
+        if let Some(folder) = self
+            .bookmark_folders
+            .iter()
+            .find(|folder| folder.parent_id.is_none() && folder.name.eq_ignore_ascii_case(name))
+        {
+            return Some(folder.id);
+        }
+        let id = self.next_bookmark_folder_id;
+        self.next_bookmark_folder_id += 1;
+        let order = self.allocate_sidebar_order();
+        self.bookmark_folders.push(BookmarkFolder {
+            id,
+            parent_id: None,
+            name: name.to_string(),
+            sidebar_order: order,
+        });
+        Some(id)
+    }
+
+    fn merge_portable_history(&mut self, history: Vec<PortableHistoryEntry>) -> ImportStats {
+        let mut stats = ImportStats::default();
+        for entry in history {
+            let url = normalize_address(&entry.url);
+            if url.trim().is_empty() || url.starts_with("aster:") {
+                stats.skipped += 1;
+                continue;
+            }
+            let norm = normalize_url_for_dedup(&url);
+            let title = if entry.title.trim().is_empty() {
+                label_for_url(&url)
+            } else {
+                entry.title
+            };
+            if let Some(existing) = self
+                .visited_sites
+                .iter_mut()
+                .find(|site| normalize_url_for_dedup(&site.url) == norm)
+            {
+                existing.visit_count = existing.visit_count.max(entry.visit_count.max(1));
+                existing.last_visit_time = existing.last_visit_time.max(entry.last_visit_time);
+                if existing.title.trim().is_empty() {
+                    existing.title = title;
+                }
+                stats.skipped += 1;
+            } else {
+                self.visited_sites.push(VisitedSite {
+                    title,
+                    url,
+                    visit_count: entry.visit_count.max(1),
+                    last_visit_time: if entry.last_visit_time == 0 {
+                        current_timestamp()
+                    } else {
+                        entry.last_visit_time
+                    },
+                });
+                stats.history += 1;
+            }
+        }
+        if self.visited_sites.len() > 1000 {
+            self.visited_sites.sort_by_key(|site| site.last_visit_time);
+            let drain = self.visited_sites.len() - 1000;
+            self.visited_sites.drain(0..drain);
+        }
+        stats
+    }
+
+    fn import_portable_cookies(&mut self, cookies: Vec<PortableCookie>) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let Some(manager) = self.cookie_manager() else {
+            if !cookies.is_empty() {
+                stats
+                    .errors
+                    .push("No active browser profile was available for cookie import".to_string());
+            }
+            return stats;
+        };
+        unsafe {
+            for portable in cookies {
+                if portable.name.trim().is_empty()
+                    || portable.domain.trim().is_empty()
+                    || portable.value.is_empty()
+                {
+                    stats.skipped += 1;
+                    continue;
+                }
+                let name = CoTaskMemPWSTR::from(portable.name.as_str());
+                let value = CoTaskMemPWSTR::from(portable.value.as_str());
+                let domain = CoTaskMemPWSTR::from(portable.domain.as_str());
+                let path = CoTaskMemPWSTR::from(if portable.path.trim().is_empty() {
+                    "/"
+                } else {
+                    portable.path.as_str()
+                });
+                match manager.CreateCookie(
+                    *name.as_ref().as_pcwstr(),
+                    *value.as_ref().as_pcwstr(),
+                    *domain.as_ref().as_pcwstr(),
+                    *path.as_ref().as_pcwstr(),
+                ) {
+                    Ok(cookie) => {
+                        if let Some(expires) = portable.expires {
+                            if expires > 0.0 {
+                                let _ = cookie.SetExpires(expires);
+                            }
+                        }
+                        let _ = cookie.SetIsSecure(portable.secure);
+                        let _ = cookie.SetIsHttpOnly(portable.http_only);
+                        let _ = cookie.SetSameSite(same_site_to_webview(&portable.same_site));
+                        if manager.AddOrUpdateCookie(&cookie).is_ok() {
+                            if is_account_cookie(&portable) {
+                                stats.accounts += 1;
+                            }
+                            stats.cookies += 1;
+                        } else {
+                            stats.skipped += 1;
+                        }
+                    }
+                    Err(error) => stats.errors.push(format!(
+                        "Cookie {} for {} could not be created: {error}",
+                        portable.name, portable.domain
+                    )),
+                }
+            }
+        }
+        stats
+    }
+
     fn load_settings_page(&mut self, index: usize) {
+        let export_json = self.aster_export_json();
+        let bookmarks_html = self.bookmarks_export_html();
         let html = settings_page_html(
             self.dominant_color,
             self.secondary_color,
@@ -4178,6 +4939,9 @@ impl App {
                 StartupMode::LastSession => "last",
             },
             is_aster_default_browser(),
+            &export_json,
+            &bookmarks_html,
+            self.import_export_notice.as_deref().unwrap_or(""),
         );
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = "aster:settings".to_string();
@@ -12060,6 +12824,454 @@ fn open_in_file_explorer(file_path: &str) {
     }
 }
 
+fn decode_upload_content(content: &str) -> std::result::Result<Vec<u8>, String> {
+    let payload = content
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(content)
+        .trim();
+    general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|error| error.to_string())
+}
+
+fn looks_like_sqlite(name: &str, bytes: &[u8]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    bytes.starts_with(b"SQLite format 3")
+        || lower.ends_with(".sqlite")
+        || lower.ends_with(".sqlite3")
+        || lower.ends_with(".db")
+        || lower == "history"
+        || lower == "cookies"
+        || lower.ends_with("\\history")
+        || lower.ends_with("\\cookies")
+        || lower.contains("places.sqlite")
+}
+
+fn looks_like_html(name: &str, bytes: &[u8]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".html")
+        || lower.ends_with(".htm")
+        || std::str::from_utf8(bytes)
+            .map(|text| text.to_ascii_lowercase().contains("netscape-bookmark-file"))
+            .unwrap_or(false)
+}
+
+fn sqlite_temp_path(name: &str, path_hint: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let raw_name = Path::new(path_hint)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(name);
+    let safe_name: String = raw_name
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    path.push(format!(
+        "aster-import-{}-{}-{}.sqlite",
+        std::process::id(),
+        current_timestamp(),
+        safe_name
+    ));
+    path
+}
+
+fn sqlite_table_names(connection: &Connection) -> Vec<String> {
+    let Ok(mut statement) =
+        connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+fn chrome_time_to_unix_secs(value: i64) -> u64 {
+    const CHROME_EPOCH_OFFSET_MICROS: i64 = 11_644_473_600_i64 * 1_000_000;
+    if value <= CHROME_EPOCH_OFFSET_MICROS {
+        0
+    } else {
+        ((value - CHROME_EPOCH_OFFSET_MICROS) / 1_000_000) as u64
+    }
+}
+
+fn same_site_from_chromium(value: i32) -> String {
+    match value {
+        1 => "lax",
+        2 => "strict",
+        _ => "none",
+    }
+    .to_string()
+}
+
+fn same_site_from_firefox(value: i32) -> String {
+    match value {
+        1 => "lax",
+        2 => "strict",
+        _ => "none",
+    }
+    .to_string()
+}
+
+fn same_site_from_webview(value: COREWEBVIEW2_COOKIE_SAME_SITE_KIND) -> String {
+    if value == COREWEBVIEW2_COOKIE_SAME_SITE_KIND_LAX {
+        "lax".to_string()
+    } else if value == COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT {
+        "strict".to_string()
+    } else {
+        "none".to_string()
+    }
+}
+
+fn same_site_to_webview(value: &str) -> COREWEBVIEW2_COOKIE_SAME_SITE_KIND {
+    match value.to_ascii_lowercase().as_str() {
+        "lax" => COREWEBVIEW2_COOKIE_SAME_SITE_KIND_LAX,
+        "strict" => COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT,
+        _ => COREWEBVIEW2_COOKIE_SAME_SITE_KIND_NONE,
+    }
+}
+
+fn dpapi_decrypt(bytes: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    if bytes.is_empty() {
+        return Err("empty encrypted payload".to_string());
+    }
+    unsafe {
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: bytes.len() as u32,
+            pbData: bytes.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        CryptUnprotectData(&input, None, None, None, None, 0, &mut output)
+            .map_err(|error| error.to_string())?;
+        let result = if output.pbData.is_null() || output.cbData == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
+        };
+        let _ = LocalFree(Some(HLOCAL(output.pbData as _)));
+        Ok(result)
+    }
+}
+
+fn extract_chromium_profile_key(bytes: &[u8]) -> Option<Vec<u8>> {
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    let encrypted_key = value
+        .get("os_crypt")?
+        .get("encrypted_key")?
+        .as_str()
+        .filter(|key| !key.is_empty())?;
+    let mut decoded = general_purpose::STANDARD.decode(encrypted_key).ok()?;
+    if decoded.starts_with(b"DPAPI") {
+        decoded.drain(0..5);
+    }
+    dpapi_decrypt(&decoded).ok()
+}
+
+fn decrypt_chromium_cookie(bytes: &[u8], key: &[u8]) -> std::result::Result<String, String> {
+    if bytes.is_empty() {
+        return Err("empty encrypted cookie".to_string());
+    }
+    if (bytes.starts_with(b"v10") || bytes.starts_with(b"v11")) && bytes.len() > 15 {
+        let cipher = Aes256Gcm::new_from_slice(key).map_err(|error| error.to_string())?;
+        let nonce = Nonce::from_slice(&bytes[3..15]);
+        let decrypted = cipher
+            .decrypt(nonce, &bytes[15..])
+            .map_err(|error| error.to_string())?;
+        String::from_utf8(decrypted).map_err(|error| error.to_string())
+    } else {
+        let decrypted = dpapi_decrypt(bytes)?;
+        String::from_utf8(decrypted).map_err(|error| error.to_string())
+    }
+}
+
+fn portable_cookie_from_webview(cookie: &ICoreWebView2Cookie) -> Option<PortableCookie> {
+    unsafe {
+        let mut raw = PWSTR::null();
+        cookie.Name(&mut raw).ok()?;
+        let name = take_pwstr(raw);
+        cookie.Value(&mut raw).ok()?;
+        let value = take_pwstr(raw);
+        cookie.Domain(&mut raw).ok()?;
+        let domain = take_pwstr(raw);
+        cookie.Path(&mut raw).ok()?;
+        let path = take_pwstr(raw);
+
+        let mut expires = 0.0f64;
+        let _ = cookie.Expires(&mut expires);
+        let mut session = BOOL(0);
+        let _ = cookie.IsSession(&mut session);
+        let mut secure = BOOL(0);
+        let _ = cookie.IsSecure(&mut secure);
+        let mut http_only = BOOL(0);
+        let _ = cookie.IsHttpOnly(&mut http_only);
+        let mut same_site = COREWEBVIEW2_COOKIE_SAME_SITE_KIND_NONE;
+        let _ = cookie.SameSite(&mut same_site);
+
+        Some(PortableCookie {
+            name,
+            value,
+            domain,
+            path,
+            expires: if session.as_bool() {
+                None
+            } else {
+                Some(expires)
+            },
+            secure: secure.as_bool(),
+            http_only: http_only.as_bool(),
+            same_site: same_site_from_webview(same_site),
+        })
+    }
+}
+
+fn is_account_cookie(cookie: &PortableCookie) -> bool {
+    let domain = cookie.domain.to_ascii_lowercase();
+    if !(domain.contains("google.") || domain.contains("accounts.google.")) {
+        return false;
+    }
+    matches!(
+        cookie.name.as_str(),
+        "SID"
+            | "HSID"
+            | "SSID"
+            | "APISID"
+            | "SAPISID"
+            | "__Secure-1PSID"
+            | "__Secure-3PSID"
+            | "__Secure-1PSIDTS"
+            | "__Secure-3PSIDTS"
+            | "LSID"
+            | "ACCOUNT_CHOOSER"
+    )
+}
+
+fn collect_bookmarks_from_json(value: &Value, folder: &str, out: &mut Vec<PortableBookmark>) {
+    match value {
+        Value::Object(map) => {
+            let name = map
+                .get("name")
+                .or_else(|| map.get("title"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let url = map
+                .get("url")
+                .or_else(|| map.get("uri"))
+                .and_then(Value::as_str);
+            if let Some(url) = url {
+                if !url.trim().is_empty() {
+                    out.push(PortableBookmark {
+                        title: if name.trim().is_empty() {
+                            label_for_url(url)
+                        } else {
+                            name.to_string()
+                        },
+                        url: url.to_string(),
+                        folder: folder.to_string(),
+                        tags: Vec::new(),
+                        created_at: current_timestamp(),
+                    });
+                }
+            }
+            let next_folder = if url.is_none() && !name.trim().is_empty() {
+                name
+            } else {
+                folder
+            };
+            for child in map.values() {
+                collect_bookmarks_from_json(child, next_folder, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_bookmarks_from_json(item, folder, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_history_from_json(value: &Value, out: &mut Vec<PortableHistoryEntry>) {
+    match value {
+        Value::Object(map) => {
+            let has_history_shape = map.contains_key("visit_count")
+                || map.contains_key("visitCount")
+                || map.contains_key("last_visit_time")
+                || map.contains_key("lastVisitTime")
+                || map.contains_key("last_visit_date");
+            if has_history_shape {
+                if let Some(url) = map.get("url").and_then(Value::as_str) {
+                    let title = map
+                        .get("title")
+                        .or_else(|| map.get("name"))
+                        .and_then(Value::as_str)
+                        .map(|title| title.to_string())
+                        .unwrap_or_else(|| label_for_url(url));
+                    out.push(PortableHistoryEntry {
+                        title,
+                        url: url.to_string(),
+                        visit_count: map
+                            .get("visit_count")
+                            .or_else(|| map.get("visitCount"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1)
+                            .max(1) as u32,
+                        last_visit_time: map
+                            .get("last_visit_time")
+                            .or_else(|| map.get("lastVisitTime"))
+                            .or_else(|| map.get("last_visit_date"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or_else(current_timestamp),
+                    });
+                }
+            }
+            for child in map.values() {
+                collect_history_from_json(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_history_from_json(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_cookies_from_json(value: &Value, out: &mut Vec<PortableCookie>) {
+    match value {
+        Value::Object(map) => {
+            let domain = map
+                .get("domain")
+                .or_else(|| map.get("host"))
+                .or_else(|| map.get("host_key"))
+                .and_then(Value::as_str);
+            let name = map.get("name").and_then(Value::as_str);
+            let value_text = map.get("value").and_then(Value::as_str);
+            if let (Some(domain), Some(name), Some(value_text)) = (domain, name, value_text) {
+                out.push(PortableCookie {
+                    name: name.to_string(),
+                    value: value_text.to_string(),
+                    domain: domain.to_string(),
+                    path: map
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/")
+                        .to_string(),
+                    expires: map
+                        .get("expires")
+                        .or_else(|| map.get("expirationDate"))
+                        .or_else(|| map.get("expiry"))
+                        .and_then(Value::as_f64),
+                    secure: map
+                        .get("secure")
+                        .or_else(|| map.get("isSecure"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    http_only: map
+                        .get("http_only")
+                        .or_else(|| map.get("httpOnly"))
+                        .or_else(|| map.get("isHttpOnly"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    same_site: map
+                        .get("same_site")
+                        .or_else(|| map.get("sameSite"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("none")
+                        .to_string(),
+                });
+            }
+            for child in map.values() {
+                collect_cookies_from_json(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_cookies_from_json(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_bookmark_html(raw: &str) -> Vec<PortableBookmark> {
+    let mut bookmarks = Vec::new();
+    let lower = raw.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(rel_start) = lower[cursor..].find("<a ") {
+        let start = cursor + rel_start;
+        let Some(rel_end) = lower[start..].find('>') else {
+            break;
+        };
+        let tag_end = start + rel_end;
+        let tag = &raw[start..=tag_end];
+        let Some(href) = html_attr(tag, "href") else {
+            cursor = tag_end + 1;
+            continue;
+        };
+        let Some(rel_close) = lower[tag_end..].find("</a>") else {
+            break;
+        };
+        let close = tag_end + rel_close;
+        let title = html_unescape(raw[tag_end + 1..close].trim());
+        bookmarks.push(PortableBookmark {
+            title: if title.is_empty() {
+                label_for_url(&href)
+            } else {
+                title
+            },
+            url: html_unescape(&href),
+            folder: String::new(),
+            tags: Vec::new(),
+            created_at: current_timestamp(),
+        });
+        cursor = close + 4;
+    }
+    bookmarks
+}
+
+fn html_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let needle = format!("{attr}=");
+    let pos = lower.find(&needle)? + needle.len();
+    let bytes = tag.as_bytes();
+    let quote = bytes.get(pos).copied().unwrap_or(b' ');
+    if quote == b'"' || quote == b'\'' {
+        let start = pos + 1;
+        let end = tag[start..].find(quote as char)? + start;
+        Some(tag[start..end].to_string())
+    } else {
+        let end = tag[pos..]
+            .find(|ch: char| ch.is_whitespace() || ch == '>')
+            .map(|offset| pos + offset)
+            .unwrap_or(tag.len());
+        Some(tag[pos..end].to_string())
+    }
+}
+
+fn html_unescape(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn html_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn html_escape_attr(value: &str) -> String {
+    html_escape_text(value).replace('"', "&quot;")
+}
+
 fn menu_item(id: usize, label: &str) -> OverlayMenuItem {
     OverlayMenuItem {
         id,
@@ -12083,10 +13295,23 @@ fn settings_page_html(
     site_mode: &str,
     startup_mode: &str,
     is_default: bool,
+    export_json: &str,
+    bookmarks_html: &str,
+    import_notice: &str,
 ) -> String {
     let dominant = colorref_to_css(dominant_color);
     let secondary = colorref_to_css(secondary_color);
     let accent = colorref_to_css(accent_color);
+    let export_json_literal = js_string_literal(export_json);
+    let bookmarks_html_literal = js_string_literal(bookmarks_html);
+    let import_notice_html = if import_notice.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="notice" id="importNotice"><span>{}</span><button class="notice-close" id="clearImportNotice">Close</button></div>"#,
+            html_escape_text(import_notice)
+        )
+    };
     let default_browser_button = if is_default {
         r#"<button class="action-btn" id="makeDefaultBtn" disabled style="opacity: 0.6; cursor: not-allowed;">Aster is default</button>"#
     } else {
@@ -12128,6 +13353,18 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 .action-btn:hover {{ background: var(--panel); }}
 .pill {{ display: inline-flex; align-items: center; gap: 8px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }}
+.stack {{ display: grid; gap: 12px; }}
+.actions {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
+.dropzone {{ border: 1px dashed color-mix(in srgb, var(--accent), var(--line) 55%); border-radius: 8px; padding: 18px; background: color-mix(in srgb, var(--panel), #000 14%); min-width: min(420px, 100%); transition: border-color .16s ease, background .16s ease; }}
+.dropzone.dragging {{ border-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 90%); }}
+.drop-title {{ font-weight: 600; }}
+.drop-hint {{ color: var(--muted); font-size: 12px; margin-top: 4px; max-width: 540px; }}
+.notice {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid color-mix(in srgb, var(--accent), var(--line) 58%); background: color-mix(in srgb, var(--accent), transparent 90%); border-radius: 8px; padding: 11px 13px; margin: 0 0 14px; }}
+.notice-close {{ color: var(--muted); border: 0; background: transparent; cursor: pointer; }}
+.notice-close:hover {{ color: var(--text); }}
+.file-input {{ display: none; }}
+.status {{ color: var(--muted); font-size: 12px; min-height: 18px; }}
+@media (max-width: 760px) {{ .row {{ grid-template-columns: minmax(0, 1fr); }} .actions {{ justify-content: stretch; }} .actions .action-btn {{ flex: 1; }} }}
 </style>
 </head>
 <body>
@@ -12162,8 +13399,11 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 </section>
 <section id="privacy">
 <h2>Privacy</h2><p class="lead">Site data and browsing controls.</p>
+{import_notice_html}
 <div class="group">
 <div class="row"><div><div class="title">Browser data</div><div class="hint">View your saved bookmarks, tabs, and settings.</div></div><button class="action-btn" id="openStateFile">Open aster-state</button></div>
+<div class="row"><div><div class="title">Import from another browser</div><div class="hint">Drop bookmark JSON/HTML, history SQLite, cookies SQLite, Aster exports, or a matching Chromium Local State file for account sessions.</div></div><div class="stack"><div class="dropzone" id="importDrop"><div class="drop-title">Drop browser data files here</div><div class="drop-hint">Works with Chrome, Edge, Firefox, and Aster export files. Drop multiple files together when sessions need a profile key.</div></div><div class="actions"><button class="action-btn" id="chooseImport">Choose files</button></div><input class="file-input" id="importInput" type="file" multiple><div class="status" id="importStatus"></div></div></div>
+<div class="row"><div><div class="title">Export data</div><div class="hint">Aster data restores bookmarks, history, and sessions in Aster. Bookmarks HTML can be imported by other browsers.</div></div><div class="actions"><button class="action-btn" id="exportAsterData">Export Aster data</button><button class="action-btn" id="exportBookmarkHtml">Export bookmarks HTML</button></div></div>
 </div>
 </section>
 </main>
@@ -12206,6 +13446,67 @@ document.querySelectorAll(".reset-btn").forEach((btn) => {{
 document.getElementById("openStateFile").onclick = () => post("settings:open-state-file");
 const makeDefaultBtn = document.getElementById("makeDefaultBtn");
 if (makeDefaultBtn) makeDefaultBtn.onclick = () => post("settings:make-default");
+const asterExport = {export_json_literal};
+const bookmarkExport = {bookmarks_html_literal};
+const importStatus = document.getElementById("importStatus");
+const clearImportNotice = document.getElementById("clearImportNotice");
+if (clearImportNotice) clearImportNotice.onclick = () => post("settings:clear-import-notice");
+function dateStamp() {{
+  return new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+}}
+function downloadText(filename, mime, text) {{
+  const blob = new Blob([text], {{ type: mime }});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 800);
+}}
+document.getElementById("exportAsterData").onclick = () => downloadText(`aster-data-${{dateStamp()}}.json`, "application/json", asterExport);
+document.getElementById("exportBookmarkHtml").onclick = () => downloadText(`aster-bookmarks-${{dateStamp()}}.html`, "text/html", bookmarkExport);
+const importDrop = document.getElementById("importDrop");
+const importInput = document.getElementById("importInput");
+document.getElementById("chooseImport").onclick = () => importInput.click();
+importInput.onchange = () => importFiles(importInput.files);
+["dragenter", "dragover"].forEach((name) => importDrop.addEventListener(name, (event) => {{
+  event.preventDefault();
+  importDrop.classList.add("dragging");
+}}));
+["dragleave", "drop"].forEach((name) => importDrop.addEventListener(name, (event) => {{
+  event.preventDefault();
+  if (name === "drop") importFiles(event.dataTransfer.files);
+  importDrop.classList.remove("dragging");
+}}));
+function readFileData(file) {{
+  return new Promise((resolve, reject) => {{
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",").pop() || "");
+    reader.onerror = () => reject(reader.error || new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  }});
+}}
+async function importFiles(files) {{
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  importStatus.textContent = `Preparing ${{list.length}} file${{list.length === 1 ? "" : "s"}}...`;
+  try {{
+    const payload = [];
+    for (const file of list) {{
+      payload.push({{
+        name: file.name,
+        path: file.webkitRelativePath || file.name,
+        content: await readFileData(file)
+      }});
+    }}
+    importStatus.textContent = "Importing...";
+    post("settings:import-files:" + JSON.stringify(payload));
+  }} catch (error) {{
+    importStatus.textContent = error && error.message ? error.message : "Import failed";
+  }}
+}}
 const defaults = [
   ["Navigate", "Ctrl+L"], ["Bookmark site", "Ctrl+D"], ["Find in page", "Ctrl+F"], ["New tab", "Ctrl+T"],
   ["Close tab", "Ctrl+W"], ["Reload", "Ctrl+R"], ["Reset zoom", "Ctrl+0"], ["Zoom in", "Ctrl++"],
@@ -13302,5 +14603,40 @@ mod tests {
             strip_google_transient_params("https://github.com/"),
             "https://github.com/"
         );
+    }
+
+    #[test]
+    fn test_collect_bookmarks_from_json() {
+        let raw = serde_json::json!({
+            "roots": {
+                "bookmark_bar": {
+                    "name": "Bookmarks bar",
+                    "children": [
+                        { "type": "url", "name": "Aster", "url": "https://aster.example" }
+                    ]
+                }
+            }
+        });
+        let mut bookmarks = Vec::new();
+        collect_bookmarks_from_json(&raw, "", &mut bookmarks);
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].title, "Aster");
+        assert_eq!(bookmarks[0].folder, "Bookmarks bar");
+    }
+
+    #[test]
+    fn test_parse_bookmark_html() {
+        let raw = r#"<!DOCTYPE NETSCAPE-Bookmark-file-1><DL><p><DT><A HREF="https://example.com?a=1&amp;b=2">Example &amp; Co</A></DL><p>"#;
+        let bookmarks = parse_bookmark_html(raw);
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].url, "https://example.com?a=1&b=2");
+        assert_eq!(bookmarks[0].title, "Example & Co");
+    }
+
+    #[test]
+    fn test_chrome_time_to_unix_secs() {
+        let unix = 1_700_000_000u64;
+        let chrome = 11_644_473_600_i64 * 1_000_000 + unix as i64 * 1_000_000;
+        assert_eq!(chrome_time_to_unix_secs(chrome), unix);
     }
 }
