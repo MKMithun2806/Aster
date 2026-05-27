@@ -1,6 +1,6 @@
 [package]
 name = "aster"
-version = "0.2.0-beta"
+version = "1.0.0-beta"
 authors = ["Mohammed Ahyan <ahyan4529@gmail.com>"]
 license = "MIT"
 edition = "2021"
