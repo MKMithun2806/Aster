@@ -93,6 +93,8 @@ const BACKGROUND_TIMER_ID: usize = 45;
 const LOADING_TIMER_ID: usize = 46;
 const TOPBAR_TIMER_ID: usize = 47;
 const DOWNLOAD_TIMER_ID: usize = 48;
+const SPLIT_MAX_PANES: usize = 4;
+const SPLIT_GAP: i32 = 6;
 const STATE_FILE: &str = ".aster-state";
 const FOCUS_EDIT_MSG: u32 = WM_APP + 1;
 const WM_COPYDATA: u32 = 0x004A;
@@ -135,6 +137,12 @@ const MENU_ADDRESS_ZOOM_RESET: usize = 3803;
 const MENU_ADDRESS_ZOOM_IN: usize = 3804;
 const MENU_ADDRESS_CLEAR_RELOAD: usize = 3805;
 const MENU_BOOKMARK_OPEN_BASE: usize = 3900;
+const MENU_TAB_SPLIT_WITH_ACTIVE: usize = 4000;
+const MENU_TAB_SPLIT_NEXT: usize = 4001;
+const MENU_TAB_UNSPLIT: usize = 4002;
+const MENU_TAB_SPLIT_HORIZONTAL: usize = 4003;
+const MENU_TAB_SPLIT_VERTICAL: usize = 4004;
+const MENU_TAB_SPLIT_GRID: usize = 4005;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
 
@@ -272,6 +280,7 @@ struct Tab {
     folder_id: Option<usize>,
     pinned: bool,
     pinned_url: Option<String>,
+    split_group_id: Option<usize>,
     sidebar_order: u64,
     title: String,
     url: String,
@@ -288,6 +297,35 @@ struct Tab {
     unloaded: bool,
     is_sleeping: bool,
     is_loading: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitLayout {
+    Horizontal,
+    Vertical,
+    Grid,
+}
+
+struct SplitGroup {
+    id: usize,
+    workspace_id: usize,
+    tab_ids: Vec<usize>,
+    layout: SplitLayout,
+    active_tab_id: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitDropZone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SplitDropTarget {
+    target_tab_id: usize,
+    zone: SplitDropZone,
 }
 
 struct ClosedTab {
@@ -542,6 +580,7 @@ struct DragState {
 enum SidebarRow {
     Label(SidebarLabel),
     Folder(usize),
+    SplitGroup(usize),
     Tab(usize),
     TabGhost(usize),
 }
@@ -587,6 +626,8 @@ enum HoverTarget {
     FindPrev,
     FindNext,
     FindClose,
+    SplitLayout,
+    SplitUnsplit,
     MinButton,
     MaxButton,
     CloseButton,
@@ -770,9 +811,11 @@ struct App {
     bookmark_folders: Vec<BookmarkFolder>,
     bookmarks: Vec<Bookmark>,
     tabs: Vec<Tab>,
+    split_groups: Vec<SplitGroup>,
     active_workspace: usize,
     active: usize,
     next_id: usize,
+    next_split_group_id: usize,
     next_workspace_id: usize,
     next_folder_id: usize,
     next_bookmark_id: usize,
@@ -819,6 +862,7 @@ struct App {
     drag_state: Option<DragState>,
     drag_ghost: RefCell<Option<DragGhost>>,
     drop_target: Option<DropTarget>,
+    split_drop_target: Option<SplitDropTarget>,
     background_cache: RefCell<Option<BackgroundBitmap>>,
     visited_sites: Vec<VisitedSite>,
     command_open: bool,
@@ -938,9 +982,11 @@ impl App {
             bookmark_folders: Vec::new(),
             bookmarks: Vec::new(),
             tabs: Vec::new(),
+            split_groups: Vec::new(),
             active_workspace: 1,
             active: 0,
             next_id: 1,
+            next_split_group_id: 1,
             next_workspace_id: 2,
             next_folder_id: 1,
             next_bookmark_id: 1,
@@ -992,6 +1038,7 @@ impl App {
             drag_state: None,
             drag_ghost: RefCell::new(None),
             drop_target: Some(DropTarget::None),
+            split_drop_target: None,
             background_cache: RefCell::new(None),
             visited_sites: Vec::new(),
             closed_tabs: Vec::new(),
@@ -1650,6 +1697,32 @@ impl App {
             "Go forward" => self.go_forward(),
             "Switch tab above" => self.switch_tab_above(),
             "Switch tab below" => self.switch_tab_below(),
+            "Split horizontal" => {
+                if self.active_split_group_id().is_some() {
+                    self.set_active_split_layout(SplitLayout::Horizontal);
+                } else if let Some(index) = self.active_tab_index() {
+                    self.split_tab_with_active(index, SplitLayout::Horizontal);
+                }
+            }
+            "Split vertical" => {
+                if self.active_split_group_id().is_some() {
+                    self.set_active_split_layout(SplitLayout::Vertical);
+                } else if let Some(index) = self.active_tab_index() {
+                    self.split_tab_with_active(index, SplitLayout::Vertical);
+                }
+            }
+            "Split grid" => {
+                if self.active_split_group_id().is_some() {
+                    self.set_active_split_layout(SplitLayout::Grid);
+                } else if let Some(index) = self.active_tab_index() {
+                    self.split_tab_with_active(index, SplitLayout::Grid);
+                }
+            }
+            "Unsplit tabs" => {
+                if let Some(group_id) = self.active_split_group_id() {
+                    self.unsplit_group(group_id);
+                }
+            }
             "Toggle fullscreen" => self.toggle_fullscreen(),
             _ => {}
         }
@@ -1697,6 +1770,7 @@ impl App {
             folder_id,
             pinned,
             pinned_url: if pinned { Some(url.to_string()) } else { None },
+            split_group_id: None,
             sidebar_order,
             title: "New Tab".to_string(),
             url: url.to_string(),
@@ -1778,6 +1852,332 @@ impl App {
         })
     }
 
+    fn tab_index_by_id(&self, tab_id: usize) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == tab_id)
+    }
+
+    fn split_group_index(&self, group_id: usize) -> Option<usize> {
+        self.split_groups
+            .iter()
+            .position(|group| group.id == group_id)
+    }
+
+    fn split_group(&self, group_id: usize) -> Option<&SplitGroup> {
+        self.split_groups.iter().find(|group| group.id == group_id)
+    }
+
+    fn split_group_active_index(&self, group_id: usize) -> Option<usize> {
+        let group = self.split_group(group_id)?;
+        self.tab_index_by_id(group.active_tab_id).or_else(|| {
+            group
+                .tab_ids
+                .iter()
+                .find_map(|tab_id| self.tab_index_by_id(*tab_id))
+        })
+    }
+
+    fn split_group_for_tab_id(&self, tab_id: usize) -> Option<usize> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.split_group_id)
+    }
+
+    fn visible_tab_ids_for_index(&self, index: usize) -> Vec<usize> {
+        let Some(tab) = self.tabs.get(index) else {
+            return Vec::new();
+        };
+        if let Some(group_id) = tab.split_group_id {
+            if let Some(group) = self.split_group(group_id) {
+                return group
+                    .tab_ids
+                    .iter()
+                    .copied()
+                    .filter(|tab_id| {
+                        self.tabs.iter().any(|candidate| {
+                            candidate.id == *tab_id && candidate.workspace_id == tab.workspace_id
+                        })
+                    })
+                    .collect();
+            }
+        }
+        vec![tab.id]
+    }
+
+    #[allow(dead_code)]
+    fn sanitize_split_groups(&mut self) {
+        let mut surviving_groups = Vec::new();
+        for mut group in self.split_groups.drain(..) {
+            group.tab_ids.retain(|tab_id| {
+                self.tabs
+                    .iter()
+                    .any(|tab| tab.id == *tab_id && tab.workspace_id == group.workspace_id)
+            });
+            if group.tab_ids.len() >= 2 {
+                if !group.tab_ids.contains(&group.active_tab_id) {
+                    group.active_tab_id = group.tab_ids[0];
+                }
+                surviving_groups.push(group);
+            } else {
+                for tab in &mut self.tabs {
+                    if tab.split_group_id == Some(group.id) {
+                        tab.split_group_id = None;
+                    }
+                }
+            }
+        }
+        self.split_groups = surviving_groups;
+    }
+
+    fn detach_tab_from_split_by_id(&mut self, tab_id: usize) {
+        let Some(group_id) = self.split_group_for_tab_id(tab_id) else {
+            return;
+        };
+        if let Some(group_index) = self.split_group_index(group_id) {
+            let remaining = {
+                let group = &mut self.split_groups[group_index];
+                group.tab_ids.retain(|id| *id != tab_id);
+                if group.active_tab_id == tab_id {
+                    if let Some(next) = group.tab_ids.first().copied() {
+                        group.active_tab_id = next;
+                    }
+                }
+                group.tab_ids.clone()
+            };
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.split_group_id = None;
+            }
+            if remaining.len() < 2 {
+                for id in remaining {
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                        tab.split_group_id = None;
+                    }
+                }
+                self.split_groups.remove(group_index);
+            }
+        }
+    }
+
+    fn unsplit_group(&mut self, group_id: usize) {
+        if let Some(index) = self.split_group_index(group_id) {
+            let tab_ids = self.split_groups[index].tab_ids.clone();
+            for tab_id in tab_ids {
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.split_group_id = None;
+                }
+            }
+            self.split_groups.remove(index);
+            self.layout();
+            self.save_state();
+            self.refresh();
+        }
+    }
+
+    fn active_split_group_id(&self) -> Option<usize> {
+        self.active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.split_group_id)
+    }
+
+    fn set_active_split_layout(&mut self, layout: SplitLayout) {
+        if let Some(group_id) = self.active_split_group_id() {
+            if let Some(group) = self
+                .split_groups
+                .iter_mut()
+                .find(|group| group.id == group_id)
+            {
+                group.layout = layout;
+                self.layout();
+                self.save_state();
+                self.refresh();
+            }
+        }
+    }
+
+    fn cycle_active_split_layout(&mut self) {
+        let next = self
+            .active_split_group_id()
+            .and_then(|group_id| self.split_group(group_id))
+            .map(|group| match group.layout {
+                SplitLayout::Horizontal => SplitLayout::Vertical,
+                SplitLayout::Vertical => SplitLayout::Grid,
+                SplitLayout::Grid => SplitLayout::Horizontal,
+            });
+        if let Some(layout) = next {
+            self.set_active_split_layout(layout);
+        }
+    }
+
+    fn split_tab_with_active(&mut self, index: usize, layout: SplitLayout) {
+        let Some(active_index) = self.active_tab_index() else {
+            return;
+        };
+        let target_index = if index == active_index {
+            self.active_workspace_tabs()
+                .into_iter()
+                .find(|candidate| *candidate != active_index)
+        } else {
+            Some(index)
+        };
+        let Some(target_index) = target_index else {
+            return;
+        };
+        let zone = match layout {
+            SplitLayout::Horizontal => SplitDropZone::Right,
+            SplitLayout::Vertical => SplitDropZone::Bottom,
+            SplitLayout::Grid => SplitDropZone::Right,
+        };
+        let Some(target_tab_id) = self.tabs.get(active_index).map(|tab| tab.id) else {
+            return;
+        };
+        let drop = SplitDropTarget {
+            target_tab_id,
+            zone,
+        };
+        self.apply_split_drop(target_index, drop, Some(layout));
+    }
+
+    fn apply_split_drop(
+        &mut self,
+        source_index: usize,
+        target: SplitDropTarget,
+        forced_layout: Option<SplitLayout>,
+    ) {
+        if source_index >= self.tabs.len() {
+            return;
+        }
+        let source_tab_id = self.tabs[source_index].id;
+        if source_tab_id == target.target_tab_id {
+            return;
+        }
+        let Some(target_index) = self.tab_index_by_id(target.target_tab_id) else {
+            return;
+        };
+        let target_workspace = self.tabs[target_index].workspace_id;
+        let target_folder = self.tabs[target_index].folder_id;
+        let target_pinned = self.tabs[target_index].pinned;
+        let target_group_id = self.tabs[target_index].split_group_id;
+        let source_group_id = self.split_group_for_tab_id(source_tab_id);
+
+        if source_group_id.is_some() && source_group_id == target_group_id {
+            let Some(group_id) = source_group_id else {
+                return;
+            };
+            let Some(group_index) = self.split_group_index(group_id) else {
+                return;
+            };
+            let group = &mut self.split_groups[group_index];
+            if let Some(layout) = forced_layout {
+                group.layout = layout;
+            } else {
+                group.layout = match target.zone {
+                    SplitDropZone::Left | SplitDropZone::Right => SplitLayout::Horizontal,
+                    SplitDropZone::Top | SplitDropZone::Bottom => SplitLayout::Vertical,
+                };
+            }
+            group.tab_ids.retain(|id| *id != source_tab_id);
+            let target_pos = group
+                .tab_ids
+                .iter()
+                .position(|id| *id == target.target_tab_id)
+                .unwrap_or(0);
+            let insert_at = match target.zone {
+                SplitDropZone::Left | SplitDropZone::Top => target_pos,
+                SplitDropZone::Right | SplitDropZone::Bottom => target_pos + 1,
+            }
+            .min(group.tab_ids.len());
+            group.tab_ids.insert(insert_at, source_tab_id);
+            group.active_tab_id = source_tab_id;
+            self.switch_to(source_index, true);
+            self.save_state();
+            self.refresh();
+            return;
+        }
+
+        if target_group_id
+            .and_then(|group_id| self.split_group(group_id))
+            .map(|group| group.tab_ids.len() >= SPLIT_MAX_PANES)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.detach_tab_from_split_by_id(source_tab_id);
+
+        let group_id = if let Some(group_id) = target_group_id {
+            group_id
+        } else {
+            let group_id = self.next_split_group_id;
+            self.next_split_group_id += 1;
+            self.split_groups.push(SplitGroup {
+                id: group_id,
+                workspace_id: target_workspace,
+                tab_ids: vec![target.target_tab_id],
+                layout: forced_layout.unwrap_or(match target.zone {
+                    SplitDropZone::Left | SplitDropZone::Right => SplitLayout::Horizontal,
+                    SplitDropZone::Top | SplitDropZone::Bottom => SplitLayout::Vertical,
+                }),
+                active_tab_id: target.target_tab_id,
+            });
+            if let Some(tab) = self.tabs.get_mut(target_index) {
+                tab.split_group_id = Some(group_id);
+            }
+            group_id
+        };
+
+        let Some(group_index) = self.split_group_index(group_id) else {
+            return;
+        };
+        if self.split_groups[group_index].tab_ids.len() >= SPLIT_MAX_PANES {
+            return;
+        }
+
+        let source_sidebar_order = self.allocate_sidebar_order();
+        if let Some(tab) = self.tabs.get_mut(source_index) {
+            tab.workspace_id = target_workspace;
+            tab.folder_id = target_folder;
+            tab.pinned = target_pinned;
+            tab.pinned_url = if target_pinned {
+                Some(tab.url.clone())
+            } else {
+                None
+            };
+            tab.split_group_id = Some(group_id);
+            tab.sidebar_order = source_sidebar_order;
+        }
+
+        let group = &mut self.split_groups[group_index];
+        group.workspace_id = target_workspace;
+        if let Some(layout) = forced_layout {
+            group.layout = layout;
+        } else {
+            group.layout = match target.zone {
+                SplitDropZone::Left | SplitDropZone::Right => SplitLayout::Horizontal,
+                SplitDropZone::Top | SplitDropZone::Bottom => SplitLayout::Vertical,
+            };
+        }
+        group.tab_ids.retain(|id| *id != source_tab_id);
+        let target_pos = group
+            .tab_ids
+            .iter()
+            .position(|id| *id == target.target_tab_id)
+            .unwrap_or(0);
+        let insert_at = match target.zone {
+            SplitDropZone::Left | SplitDropZone::Top => target_pos,
+            SplitDropZone::Right | SplitDropZone::Bottom => target_pos + 1,
+        }
+        .min(group.tab_ids.len());
+        group.tab_ids.insert(insert_at, source_tab_id);
+        group.active_tab_id = source_tab_id;
+
+        if let Some(source_index) = self.tab_index_by_id(source_tab_id) {
+            self.active_workspace = target_workspace;
+            self.switch_to(source_index, true);
+        }
+        self.save_state();
+        self.refresh();
+    }
+
     fn set_workspace_active_tab(&mut self, workspace_id: usize, tab_id: usize) {
         if let Some((_, active_tab)) = self
             .workspace_active_tabs
@@ -1851,10 +2251,21 @@ impl App {
     fn active_workspace_tabs(&self) -> Vec<usize> {
         self.sidebar_rows()
             .into_iter()
-            .filter_map(|row| match row {
-                SidebarRow::Tab(index) => Some(index),
-                SidebarRow::TabGhost(_) => None,
-                _ => None,
+            .flat_map(|row| match row {
+                SidebarRow::Tab(index) => vec![index],
+                SidebarRow::SplitGroup(group_id) => self
+                    .split_group(group_id)
+                    .map(|group| {
+                        group
+                            .tab_ids
+                            .iter()
+                            .filter_map(|tab_id| self.tab_index_by_id(*tab_id))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                SidebarRow::TabGhost(_) | SidebarRow::Folder(_) | SidebarRow::Label(_) => {
+                    Vec::new()
+                }
             })
             .collect()
     }
@@ -2069,6 +2480,22 @@ impl App {
                 .find(|folder| folder.id == folder_id)
                 .map(|folder| folder.sidebar_order)
                 .unwrap_or(u64::MAX),
+            SidebarRow::SplitGroup(group_id) => self
+                .split_group(group_id)
+                .map(|group| {
+                    group
+                        .tab_ids
+                        .iter()
+                        .filter_map(|tab_id| {
+                            self.tabs
+                                .iter()
+                                .find(|tab| tab.id == *tab_id)
+                                .map(|tab| tab.sidebar_order)
+                        })
+                        .min()
+                        .unwrap_or(u64::MAX)
+                })
+                .unwrap_or(u64::MAX),
             SidebarRow::Tab(tab_index) => self
                 .tabs
                 .get(tab_index)
@@ -2086,6 +2513,31 @@ impl App {
     fn sorted_sidebar_rows(&self, mut rows: Vec<SidebarRow>) -> Vec<SidebarRow> {
         rows.sort_by_key(|row| self.row_sidebar_order(*row));
         rows
+    }
+
+    fn coalesce_split_rows(&self, rows: Vec<SidebarRow>) -> Vec<SidebarRow> {
+        let mut seen_groups = Vec::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row {
+                SidebarRow::Tab(index) => {
+                    let group_id = self.tabs.get(index).and_then(|tab| tab.split_group_id);
+                    if let Some(group_id) = group_id {
+                        if !seen_groups.contains(&group_id) {
+                            seen_groups.push(group_id);
+                            out.push(SidebarRow::SplitGroup(group_id));
+                        }
+                    } else {
+                        out.push(row);
+                    }
+                }
+                SidebarRow::TabGhost(_) => out.push(row),
+                SidebarRow::Folder(_) | SidebarRow::Label(_) | SidebarRow::SplitGroup(_) => {
+                    out.push(row)
+                }
+            }
+        }
+        out
     }
 
     fn root_section_rows(&self, pinned: bool) -> Vec<SidebarRow> {
@@ -2108,7 +2560,7 @@ impl App {
                     && tab.folder_id.is_none()
             })
             .map(|(index, _)| SidebarRow::Tab(index));
-        self.sorted_sidebar_rows(folders.chain(tabs).collect())
+        self.coalesce_split_rows(self.sorted_sidebar_rows(folders.chain(tabs).collect()))
     }
 
     fn assign_row_sidebar_order(&mut self, row: SidebarRow, sidebar_order: u64) {
@@ -2125,6 +2577,17 @@ impl App {
             SidebarRow::Tab(tab_index) => {
                 if let Some(tab) = self.tabs.get_mut(tab_index) {
                     tab.sidebar_order = sidebar_order;
+                }
+            }
+            SidebarRow::SplitGroup(group_id) => {
+                let tab_ids = self
+                    .split_group(group_id)
+                    .map(|group| group.tab_ids.clone())
+                    .unwrap_or_default();
+                for (offset, tab_id) in tab_ids.into_iter().enumerate() {
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                        tab.sidebar_order = sidebar_order + offset as u64;
+                    }
                 }
             }
             SidebarRow::TabGhost(_) => {}
@@ -2186,7 +2649,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let child_tabs = child_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.sorted_sidebar_rows(child_folders.chain(child_tabs).collect()) {
+        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
+            child_folders.chain(child_tabs).collect(),
+        )) {
             rows.push(row);
             if let SidebarRow::Folder(child_folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == child_folder_id) {
@@ -2234,8 +2699,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let loose_pinned_tabs = loose_pinned_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.sorted_sidebar_rows(root_pinned_folders.chain(loose_pinned_tabs).collect())
-        {
+        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
+            root_pinned_folders.chain(loose_pinned_tabs).collect(),
+        )) {
             pinned_rows.push(row);
             if let SidebarRow::Folder(folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
@@ -2269,7 +2735,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let loose_tabs = loose_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.sorted_sidebar_rows(root_unpinned_folders.chain(loose_tabs).collect()) {
+        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
+            root_unpinned_folders.chain(loose_tabs).collect(),
+        )) {
             unpinned_rows.push(row);
             if let SidebarRow::Folder(folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
@@ -2298,6 +2766,21 @@ impl App {
                                 SidebarRow::Tab(idx) => {
                                     !self.is_tab_in_folder_subtree(idx, from_folder_id)
                                 }
+                                SidebarRow::SplitGroup(group_id) => self
+                                    .split_group(group_id)
+                                    .map(|group| {
+                                        !group.tab_ids.iter().any(|tab_id| {
+                                            self.tab_index_by_id(*tab_id)
+                                                .map(|idx| {
+                                                    self.is_tab_in_folder_subtree(
+                                                        idx,
+                                                        from_folder_id,
+                                                    )
+                                                })
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                    .unwrap_or(true),
                                 SidebarRow::TabGhost(_) => false,
                                 SidebarRow::Label(_) => true,
                             })
@@ -2345,6 +2828,18 @@ impl App {
                             .into_iter()
                             .filter(|row| match *row {
                                 SidebarRow::Tab(idx) => duplicate_drag || idx != from_tab_index,
+                                SidebarRow::SplitGroup(group_id) => {
+                                    let from_tab_id =
+                                        self.tabs.get(from_tab_index).map(|tab| tab.id);
+                                    duplicate_drag
+                                        || self
+                                            .split_group(group_id)
+                                            .zip(from_tab_id)
+                                            .map(|(group, tab_id)| {
+                                                !group.tab_ids.contains(&tab_id)
+                                            })
+                                            .unwrap_or(true)
+                                }
                                 SidebarRow::TabGhost(_) => false,
                                 _ => true,
                             })
@@ -2422,6 +2917,7 @@ impl App {
             y += match skipped {
                 SidebarRow::Label(_) => 24,
                 SidebarRow::Folder(_) => 36,
+                SidebarRow::SplitGroup(_) => 50,
                 SidebarRow::Tab(_) | SidebarRow::TabGhost(_) => 44,
             };
         }
@@ -2429,6 +2925,7 @@ impl App {
             let height = match row {
                 SidebarRow::Label(_) => 24,
                 SidebarRow::Folder(_) => 36,
+                SidebarRow::SplitGroup(_) => 50,
                 SidebarRow::Tab(_) | SidebarRow::TabGhost(_) => 44,
             };
             if y + height > bottom_limit {
@@ -2446,6 +2943,33 @@ impl App {
             y += height;
         }
         rects
+    }
+
+    fn sidebar_row_contains_tab(&self, row: SidebarRow, index: usize) -> bool {
+        match row {
+            SidebarRow::Tab(row_index) => row_index == index,
+            SidebarRow::SplitGroup(group_id) => {
+                let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) else {
+                    return false;
+                };
+                self.split_group(group_id)
+                    .map(|group| group.tab_ids.contains(&tab_id))
+                    .unwrap_or(false)
+            }
+            SidebarRow::Label(_) | SidebarRow::Folder(_) | SidebarRow::TabGhost(_) => false,
+        }
+    }
+
+    fn sidebar_row_rect_for_tab(&self, index: usize) -> Option<RECT> {
+        self.sidebar_row_rects()
+            .into_iter()
+            .find_map(|(row, rect)| {
+                if self.sidebar_row_contains_tab(row, index) {
+                    Some(rect)
+                } else {
+                    None
+                }
+            })
     }
 
     fn topbar_pushed_height(&self) -> i32 {
@@ -2567,6 +3091,9 @@ impl App {
             if point_in_rect(x, y, rect) {
                 return match row {
                     SidebarRow::Folder(id) => Some(SidebarHit::Folder(id)),
+                    SidebarRow::SplitGroup(group_id) => {
+                        self.split_group_active_index(group_id).map(SidebarHit::Tab)
+                    }
                     SidebarRow::Tab(index) => Some(SidebarHit::Tab(index)),
                     SidebarRow::TabGhost(_) | SidebarRow::Label(_) => None,
                 };
@@ -2586,6 +3113,7 @@ impl App {
         self.bookmark_folders.clear();
         self.bookmarks.clear();
         self.tabs.clear();
+        self.split_groups.clear();
         self.workspace_active_tabs.clear();
         self.visited_sites.clear();
         self.custom_keybinds.clear();
@@ -3963,36 +4491,38 @@ impl App {
         }
         let workspace_id = self.tabs[index].workspace_id;
         self.active_workspace = workspace_id;
-        let mut needs_reload = false;
-        if let Some(tab) = self.tabs.get_mut(index) {
-            if wake_up {
+        let visible_tab_ids = self.visible_tab_ids_for_index(index);
+        let mut reloads: Vec<(usize, String)> = Vec::new();
+        for tab in &mut self.tabs {
+            let visible =
+                tab.workspace_id == workspace_id && visible_tab_ids.iter().any(|id| *id == tab.id);
+            if wake_up && visible {
                 if tab.is_sleeping {
-                    needs_reload = true;
+                    let url_to_load = tab.pinned_url.clone().unwrap_or_else(|| tab.url.clone());
+                    reloads.push((tab.id, url_to_load));
                     tab.is_sleeping = false;
                 }
                 tab.unloaded = false;
             }
-            if !tab.unloaded {
-                unsafe {
-                    let _ = WindowsAndMessaging::ShowWindow(
-                        tab.child_hwnd,
-                        WindowsAndMessaging::SW_SHOW,
-                    );
-                }
-            } else {
-                unsafe {
-                    let _ = WindowsAndMessaging::ShowWindow(
-                        tab.child_hwnd,
-                        WindowsAndMessaging::SW_HIDE,
-                    );
-                }
+            unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(
+                    tab.child_hwnd,
+                    if visible && !tab.unloaded {
+                        WindowsAndMessaging::SW_SHOW
+                    } else {
+                        WindowsAndMessaging::SW_HIDE
+                    },
+                );
+                let _ = tab.controller.SetIsVisible(visible && !tab.unloaded);
             }
         }
-        for (i, tab) in self.tabs.iter().enumerate() {
-            unsafe {
-                let _ = tab
-                    .controller
-                    .SetIsVisible(i == index && tab.workspace_id == workspace_id && !tab.unloaded);
+        if let Some(group_id) = self.tabs[index].split_group_id {
+            if let Some(group) = self
+                .split_groups
+                .iter_mut()
+                .find(|group| group.id == group_id)
+            {
+                group.active_tab_id = self.tabs[index].id;
             }
         }
         self.active = index;
@@ -4010,9 +4540,11 @@ impl App {
                 }
             }
         }
-        if needs_reload {
-            let tab = &self.tabs[index];
-            let url_to_load = tab.pinned_url.clone().unwrap_or_else(|| tab.url.clone());
+        for (tab_id, url_to_load) in reloads {
+            let Some(tab_index) = self.tab_index_by_id(tab_id) else {
+                continue;
+            };
+            let tab = &self.tabs[tab_index];
             let url_w = to_wide(&url_to_load);
             unsafe {
                 let _ = tab.webview.Navigate(PCWSTR(url_w.as_ptr()));
@@ -4069,6 +4601,8 @@ impl App {
         if self.tabs.is_empty() || index >= self.tabs.len() {
             return;
         }
+        let closing_tab_id = self.tabs[index].id;
+        self.detach_tab_from_split_by_id(closing_tab_id);
 
         if !self.tabs[index].pinned {
             let tab = &self.tabs[index];
@@ -5516,6 +6050,47 @@ impl App {
         }
     }
 
+    fn split_toolbar_rect(&self) -> Option<RECT> {
+        self.active_split_group_id()?;
+        if self.fullscreen {
+            return None;
+        }
+        let (min_btn, _, _) = self.window_button_rects();
+        let address = self.address_pill_rect();
+        let y = self.topbar_y();
+        let right = min_btn.left - 12;
+        let left = (right - 88).max(address.right + 10);
+        if right - left < 72 {
+            return None;
+        }
+        Some(RECT {
+            left,
+            top: y + 14,
+            right,
+            bottom: y + 44,
+        })
+    }
+
+    fn split_layout_button_rect(&self) -> Option<RECT> {
+        let toolbar = self.split_toolbar_rect()?;
+        Some(RECT {
+            left: toolbar.left + 4,
+            top: toolbar.top + 3,
+            right: toolbar.left + 32,
+            bottom: toolbar.bottom - 3,
+        })
+    }
+
+    fn split_unsplit_button_rect(&self) -> Option<RECT> {
+        let toolbar = self.split_toolbar_rect()?;
+        Some(RECT {
+            left: toolbar.right - 32,
+            top: toolbar.top + 3,
+            right: toolbar.right - 4,
+            bottom: toolbar.bottom - 3,
+        })
+    }
+
     fn window_button_rects(&self) -> (RECT, RECT, RECT) {
         let rect = client_rect(self.hwnd);
         let y = self.topbar_y();
@@ -5762,6 +6337,291 @@ impl App {
         1.0
     }
 
+    fn web_content_bounds(&self) -> RECT {
+        let rect = client_rect(self.hwnd);
+        let sidebar_width = self.sidebar_width();
+        let pushed_left = sidebar_width;
+        if self.fullscreen {
+            RECT {
+                left: 0,
+                top: 0,
+                right: rect.right,
+                bottom: rect.bottom,
+            }
+        } else {
+            match self.sidebar_mode {
+                SidebarMode::Hidden => {
+                    if self.sidebar_target >= SIDEBAR_EXPANDED {
+                        match self.sidebar_expand_mode {
+                            SidebarMode::Overlay => RECT {
+                                left: 0,
+                                top: self.topbar_pushed_height(),
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                            SidebarMode::Pushed => RECT {
+                                left: pushed_left,
+                                top: self.topbar_pushed_height(),
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                            _ => RECT {
+                                left: HOVER_ZONE,
+                                top: self.topbar_pushed_height(),
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                        }
+                    } else {
+                        RECT {
+                            left: 0,
+                            top: self.topbar_pushed_height(),
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        }
+                    }
+                }
+                SidebarMode::Overlay => RECT {
+                    left: 0,
+                    top: self.topbar_pushed_height(),
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                SidebarMode::Pushed => RECT {
+                    left: pushed_left,
+                    top: self.topbar_pushed_height(),
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+            }
+        }
+    }
+
+    fn split_layout_rects_for(&self, bounds: RECT, layout: SplitLayout, count: usize) -> Vec<RECT> {
+        let count = count.clamp(1, SPLIT_MAX_PANES);
+        let width = (bounds.right - bounds.left).max(1);
+        let height = (bounds.bottom - bounds.top).max(1);
+        match layout {
+            SplitLayout::Horizontal => {
+                let total_gap = SPLIT_GAP * (count as i32 - 1).max(0);
+                let pane_width = (width - total_gap).max(count as i32) / count as i32;
+                (0..count)
+                    .map(|i| {
+                        let left = bounds.left + i as i32 * (pane_width + SPLIT_GAP);
+                        let right = if i + 1 == count {
+                            bounds.right
+                        } else {
+                            left + pane_width
+                        };
+                        RECT {
+                            left,
+                            top: bounds.top,
+                            right,
+                            bottom: bounds.bottom,
+                        }
+                    })
+                    .collect()
+            }
+            SplitLayout::Vertical => {
+                let total_gap = SPLIT_GAP * (count as i32 - 1).max(0);
+                let pane_height = (height - total_gap).max(count as i32) / count as i32;
+                (0..count)
+                    .map(|i| {
+                        let top = bounds.top + i as i32 * (pane_height + SPLIT_GAP);
+                        let bottom = if i + 1 == count {
+                            bounds.bottom
+                        } else {
+                            top + pane_height
+                        };
+                        RECT {
+                            left: bounds.left,
+                            top,
+                            right: bounds.right,
+                            bottom,
+                        }
+                    })
+                    .collect()
+            }
+            SplitLayout::Grid => {
+                let cols = match count {
+                    1 => 1,
+                    2 => 2,
+                    _ => 2,
+                };
+                let rows = ((count + cols - 1) / cols).max(1);
+                let total_gap_x = SPLIT_GAP * (cols as i32 - 1).max(0);
+                let total_gap_y = SPLIT_GAP * (rows as i32 - 1).max(0);
+                let pane_width = (width - total_gap_x).max(cols as i32) / cols as i32;
+                let pane_height = (height - total_gap_y).max(rows as i32) / rows as i32;
+                (0..count)
+                    .map(|i| {
+                        let col = i % cols;
+                        let row = i / cols;
+                        let left = bounds.left + col as i32 * (pane_width + SPLIT_GAP);
+                        let top = bounds.top + row as i32 * (pane_height + SPLIT_GAP);
+                        RECT {
+                            left,
+                            top,
+                            right: if col + 1 == cols {
+                                bounds.right
+                            } else {
+                                left + pane_width
+                            },
+                            bottom: if row + 1 == rows {
+                                bounds.bottom
+                            } else {
+                                top + pane_height
+                            },
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn active_pane_rects(&self, bounds: RECT) -> Vec<(usize, RECT)> {
+        let Some(active_index) = self.active_tab_index() else {
+            return Vec::new();
+        };
+        let Some(active_tab) = self.tabs.get(active_index) else {
+            return Vec::new();
+        };
+        if let Some(group_id) = active_tab.split_group_id {
+            if let Some(group) = self.split_group(group_id) {
+                let rects =
+                    self.split_layout_rects_for(bounds, group.layout, group.tab_ids.len());
+                return group
+                    .tab_ids
+                    .iter()
+                    .copied()
+                    .zip(rects.into_iter())
+                    .collect();
+            }
+        }
+        vec![(active_tab.id, bounds)]
+    }
+
+    fn shrink_rect_for_split_preview(&self, rect: RECT, zone: SplitDropZone) -> RECT {
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
+        match zone {
+            SplitDropZone::Left => RECT {
+                left: rect.left + (width * 34 / 100).max(96),
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            SplitDropZone::Right => RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right - (width * 34 / 100).max(96),
+                bottom: rect.bottom,
+            },
+            SplitDropZone::Top => RECT {
+                left: rect.left,
+                top: rect.top + (height * 34 / 100).max(96),
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            SplitDropZone::Bottom => RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom - (height * 34 / 100).max(96),
+            },
+        }
+    }
+
+    fn split_placeholder_rect(&self) -> Option<RECT> {
+        let target = self.split_drop_target?;
+        let bounds = self.web_content_bounds();
+        let pane = self
+            .active_pane_rects(bounds)
+            .into_iter()
+            .find(|(tab_id, _)| *tab_id == target.target_tab_id)
+            .map(|(_, rect)| rect)?;
+        let shrunken = self.shrink_rect_for_split_preview(pane, target.zone);
+        Some(match target.zone {
+            SplitDropZone::Left => RECT {
+                left: pane.left,
+                top: pane.top,
+                right: shrunken.left - SPLIT_GAP,
+                bottom: pane.bottom,
+            },
+            SplitDropZone::Right => RECT {
+                left: shrunken.right + SPLIT_GAP,
+                top: pane.top,
+                right: pane.right,
+                bottom: pane.bottom,
+            },
+            SplitDropZone::Top => RECT {
+                left: pane.left,
+                top: pane.top,
+                right: pane.right,
+                bottom: shrunken.top - SPLIT_GAP,
+            },
+            SplitDropZone::Bottom => RECT {
+                left: pane.left,
+                top: shrunken.bottom + SPLIT_GAP,
+                right: pane.right,
+                bottom: pane.bottom,
+            },
+        })
+    }
+
+    fn split_drop_zone_for_point(&self, rect: RECT, x: i32, y: i32) -> SplitDropZone {
+        let left = (x - rect.left).abs();
+        let right = (rect.right - x).abs();
+        let top = (y - rect.top).abs();
+        let bottom = (rect.bottom - y).abs();
+        let mut best = (left, SplitDropZone::Left);
+        if right < best.0 {
+            best = (right, SplitDropZone::Right);
+        }
+        if top < best.0 {
+            best = (top, SplitDropZone::Top);
+        }
+        if bottom < best.0 {
+            best = (bottom, SplitDropZone::Bottom);
+        }
+        best.1
+    }
+
+    fn calculate_split_drop_target(&self, x: i32, y: i32) -> Option<SplitDropTarget> {
+        let drag = self.drag_state?;
+        if !drag.active {
+            return None;
+        }
+        let DragSource::Tab(source_index) = drag.source else {
+            return None;
+        };
+        let source_tab_id = self.tabs.get(source_index).map(|tab| tab.id)?;
+        let bounds = self.web_content_bounds();
+        if !point_in_rect(x, y, bounds) {
+            return None;
+        }
+        for (target_tab_id, rect) in self.active_pane_rects(bounds) {
+            if !point_in_rect(x, y, rect) || target_tab_id == source_tab_id {
+                continue;
+            }
+            let target_group_len = self
+                .split_group_for_tab_id(target_tab_id)
+                .and_then(|group_id| self.split_group(group_id))
+                .map(|group| group.tab_ids.len())
+                .unwrap_or(1);
+            let same_group = self.split_group_for_tab_id(source_tab_id)
+                == self.split_group_for_tab_id(target_tab_id);
+            if target_group_len >= SPLIT_MAX_PANES && !same_group {
+                return None;
+            }
+            return Some(SplitDropTarget {
+                target_tab_id,
+                zone: self.split_drop_zone_for_point(rect, x, y),
+            });
+        }
+        None
+    }
+
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
         unsafe {
@@ -5825,61 +6685,7 @@ impl App {
         }
 
         let sidebar_width = self.sidebar_width();
-        let pushed_left = sidebar_width;
-        let bounds = if self.fullscreen {
-            RECT {
-                left: 0,
-                top: 0,
-                right: rect.right,
-                bottom: rect.bottom,
-            }
-        } else {
-            match self.sidebar_mode {
-                SidebarMode::Hidden => {
-                    if self.sidebar_target >= SIDEBAR_EXPANDED {
-                        match self.sidebar_expand_mode {
-                            SidebarMode::Overlay => RECT {
-                                left: 0,
-                                top: self.topbar_pushed_height(),
-                                right: rect.right,
-                                bottom: rect.bottom,
-                            },
-                            SidebarMode::Pushed => RECT {
-                                left: pushed_left,
-                                top: self.topbar_pushed_height(),
-                                right: rect.right,
-                                bottom: rect.bottom,
-                            },
-                            _ => RECT {
-                                left: HOVER_ZONE,
-                                top: self.topbar_pushed_height(),
-                                right: rect.right,
-                                bottom: rect.bottom,
-                            },
-                        }
-                    } else {
-                        RECT {
-                            left: 0,
-                            top: self.topbar_pushed_height(),
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        }
-                    }
-                }
-                SidebarMode::Overlay => RECT {
-                    left: 0,
-                    top: self.topbar_pushed_height(),
-                    right: rect.right,
-                    bottom: rect.bottom,
-                },
-                SidebarMode::Pushed => RECT {
-                    left: pushed_left,
-                    top: self.topbar_pushed_height(),
-                    right: rect.right,
-                    bottom: rect.bottom,
-                },
-            }
-        };
+        let bounds = self.web_content_bounds();
         let last = self.last_bounds_rect.get();
         let size_changed = bounds.left != last.left
             || bounds.right != last.right
@@ -5903,18 +6709,34 @@ impl App {
         let was_clipped = self.last_clip_width.get() != 0.0 || self.last_clip_top.get() != 0.0;
         let should_clear =
             (!needs_clipping || (sidebar_width <= 0 && self.topbar_height <= 0.0)) && was_clipped;
-        for (i, tab) in self.tabs.iter().enumerate() {
+        let active_panes = self.active_pane_rects(bounds);
+        for tab in self.tabs.iter() {
             unsafe {
-                let is_active = Some(i) == self.active_tab_index();
-                if is_active {
-                    let _ = tab.controller.SetBounds(bounds);
+                let pane_rect = active_panes
+                    .iter()
+                    .find(|(tab_id, _)| *tab_id == tab.id)
+                    .map(|(_, rect)| *rect);
+                let is_visible = pane_rect.is_some()
+                    && tab.workspace_id == self.active_workspace
+                    && !tab.unloaded;
+                if let Some(mut tab_bounds) = pane_rect {
+                    if self
+                        .split_drop_target
+                        .map(|target| target.target_tab_id == tab.id)
+                        .unwrap_or(false)
+                    {
+                        if let Some(target) = self.split_drop_target {
+                            tab_bounds = self.shrink_rect_for_split_preview(tab_bounds, target.zone);
+                        }
+                    }
+                    let _ = tab.controller.SetBounds(tab_bounds);
                     let _ = WindowsAndMessaging::SetWindowPos(
                         tab.child_hwnd,
                         None,
-                        bounds.left,
-                        bounds.top,
-                        bounds.right - bounds.left,
-                        bounds.bottom - bounds.top,
+                        tab_bounds.left,
+                        tab_bounds.top,
+                        tab_bounds.right - tab_bounds.left,
+                        tab_bounds.bottom - tab_bounds.top,
                         WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOACTIVATE,
                     );
                 }
@@ -5934,7 +6756,7 @@ impl App {
                 } else if should_clear {
                     let _ = SetWindowRgn(tab.child_hwnd, None, true);
                 }
-                let _ = tab.controller.SetIsVisible(is_active && !tab.unloaded);
+                let _ = tab.controller.SetIsVisible(is_visible);
             }
         }
         unsafe {
@@ -6289,6 +7111,9 @@ impl App {
                 }
             }
 
+            self.paint_split_toolbar(hdc);
+            self.paint_split_drop_overlay(hdc);
+
             if sidebar_width > 92 {
                 self.paint_workspace_header(hdc);
                 let has_pinned = self
@@ -6325,6 +7150,9 @@ impl App {
                         SidebarRow::Label(label) => self.paint_sidebar_label(hdc, label, row_rect),
                         SidebarRow::Folder(folder_id) => {
                             self.paint_folder_row(hdc, folder_id, row_rect)
+                        }
+                        SidebarRow::SplitGroup(group_id) => {
+                            self.paint_split_group_row(hdc, group_id, row_rect)
                         }
                         SidebarRow::Tab(index) => {
                             if let Some(tab) = self.tabs.get(index) {
@@ -7872,6 +8700,88 @@ impl App {
         }
     }
 
+    fn paint_split_drop_overlay(&self, hdc: HDC) {
+        unsafe {
+            let Some(rect) = self.split_placeholder_rect() else {
+                return;
+            };
+            if rect.right <= rect.left || rect.bottom <= rect.top {
+                return;
+            }
+            let inset = RECT {
+                left: rect.left + 10,
+                top: rect.top + 10,
+                right: rect.right - 10,
+                bottom: rect.bottom - 10,
+            };
+            fill_round_rect(hdc, inset, self.secondary_color, 12);
+            draw_outline(hdc, inset, self.accent_color, 12);
+            let label = match self.split_drop_target.map(|target| target.zone) {
+                Some(SplitDropZone::Left) => "Split left",
+                Some(SplitDropZone::Right) => "Split right",
+                Some(SplitDropZone::Top) => "Split top",
+                Some(SplitDropZone::Bottom) => "Split bottom",
+                None => "Split",
+            };
+            draw_centered_text(hdc, &self.fonts.body, label, inset, COLOR_TEXT);
+        }
+    }
+
+    fn paint_split_toolbar(&self, hdc: HDC) {
+        unsafe {
+            let Some(toolbar) = self.split_toolbar_rect() else {
+                return;
+            };
+            fill_round_rect(hdc, toolbar, self.secondary_color, 10);
+            draw_outline(hdc, toolbar, COLOR_BORDER, 10);
+            if let Some(layout_button) = self.split_layout_button_rect() {
+                if self.hover_target == Some(HoverTarget::SplitLayout) {
+                    fill_round_rect(hdc, layout_button, COLOR_SURFACE_HOVER, 8);
+                }
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.toolbar_icon,
+                    glyph(0xE9F9).as_str(),
+                    layout_button,
+                    COLOR_TEXT,
+                );
+            }
+            if let Some(group_id) = self.active_split_group_id() {
+                if let Some(group) = self.split_group(group_id) {
+                    let label = match group.layout {
+                        SplitLayout::Horizontal => "H",
+                        SplitLayout::Vertical => "V",
+                        SplitLayout::Grid => "G",
+                    };
+                    draw_centered_text(
+                        hdc,
+                        &self.fonts.small,
+                        label,
+                        RECT {
+                            left: toolbar.left + 36,
+                            top: toolbar.top,
+                            right: toolbar.right - 36,
+                            bottom: toolbar.bottom,
+                        },
+                        COLOR_MUTED,
+                    );
+                }
+            }
+            if let Some(unsplit_button) = self.split_unsplit_button_rect() {
+                if self.hover_target == Some(HoverTarget::SplitUnsplit) {
+                    fill_round_rect(hdc, unsplit_button, COLOR_SURFACE_HOVER, 8);
+                }
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.toolbar_icon,
+                    glyph(0xE711).as_str(),
+                    unsplit_button,
+                    COLOR_TEXT,
+                );
+            }
+        }
+    }
+
     fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab, item: RECT, force_ghost: bool) {
         unsafe {
             let mut item = item;
@@ -7961,6 +8871,142 @@ impl App {
                         close_color,
                     );
                 }
+            }
+        }
+    }
+
+    fn paint_split_group_row(&self, hdc: HDC, group_id: usize, item: RECT) {
+        unsafe {
+            let Some(group) = self.split_group(group_id) else {
+                return;
+            };
+            let active_index = self.split_group_active_index(group_id);
+            let active = active_index.and_then(|index| self.tabs.get(index));
+            let title = group
+                .tab_ids
+                .iter()
+                .filter_map(|tab_id| {
+                    self.tabs
+                        .iter()
+                        .find(|tab| tab.id == *tab_id)
+                        .map(|tab| {
+                            if tab.title.trim().is_empty() {
+                                label_for_url(&tab.url)
+                            } else {
+                                tab.title.clone()
+                            }
+                        })
+                })
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let title = if title.trim().is_empty() {
+                "Split View".to_string()
+            } else {
+                title
+            };
+            let is_active = group.tab_ids.iter().any(|tab_id| {
+                self.tabs
+                    .get(self.active)
+                    .map(|tab| tab.id == *tab_id)
+                    .unwrap_or(false)
+            });
+            let is_hovered = active_index
+                .map(|index| self.hover_tab == Some(index))
+                .unwrap_or(false);
+            let row = item;
+            if is_active || is_hovered {
+                fill_round_rect(hdc, row, self.secondary_color, 10);
+            }
+            let accent = RECT {
+                left: row.left + 8,
+                top: row.top + 8,
+                right: row.left + 12,
+                bottom: row.bottom - 8,
+            };
+            fill_round_rect(hdc, accent, self.accent_color, 3);
+            let icon_rect = RECT {
+                left: row.left + 20,
+                top: row.top + 9,
+                right: row.left + 42,
+                bottom: row.top + 31,
+            };
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.toolbar_icon,
+                glyph(0xE9F9).as_str(),
+                icon_rect,
+                COLOR_TEXT,
+            );
+            draw_text(
+                hdc,
+                &self.fonts.body,
+                &title,
+                RECT {
+                    left: row.left + 48,
+                    top: row.top + 2,
+                    right: row.right - 42,
+                    bottom: row.top + 29,
+                },
+                if is_active { COLOR_TEXT } else { COLOR_MUTED },
+            );
+            let subtitle = format!(
+                "{} panes - {}",
+                group.tab_ids.len(),
+                match group.layout {
+                    SplitLayout::Horizontal => "horizontal",
+                    SplitLayout::Vertical => "vertical",
+                    SplitLayout::Grid => "grid",
+                }
+            );
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                &subtitle,
+                RECT {
+                    left: row.left + 48,
+                    top: row.top + 25,
+                    right: row.right - 42,
+                    bottom: row.bottom,
+                },
+                COLOR_MUTED,
+            );
+            if let Some(tab) = active {
+                if tab.audio_playing || tab.muted {
+                    let audio_icon = if tab.muted {
+                        glyph(0xE74F)
+                    } else {
+                        glyph(0xE767)
+                    };
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.toolbar_icon,
+                        audio_icon.as_str(),
+                        self.tab_audio_rect(row),
+                        if tab.muted { COLOR_MUTED } else { COLOR_TEXT },
+                    );
+                }
+            }
+            if is_hovered {
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.icon,
+                    glyph(0xE711).as_str(),
+                    RECT {
+                        left: row.right - 30,
+                        top: row.top + 12,
+                        right: row.right - 8,
+                        bottom: row.top + 34,
+                    },
+                    if active_index
+                        .map(|index| self.hover_close == Some(index))
+                        .unwrap_or(false)
+                    {
+                        COLOR_TEXT
+                    } else {
+                        COLOR_MUTED
+                    },
+                );
             }
         }
     }
@@ -8168,6 +9214,22 @@ impl App {
             return;
         }
 
+        if let Some(rect) = self.split_layout_button_rect() {
+            if point_in_rect(x, y, rect) {
+                self.cycle_active_split_layout();
+                return;
+            }
+        }
+
+        if let Some(rect) = self.split_unsplit_button_rect() {
+            if point_in_rect(x, y, rect) {
+                if let Some(group_id) = self.active_split_group_id() {
+                    self.unsplit_group(group_id);
+                }
+                return;
+            }
+        }
+
         if self.find_open {
             if point_in_rect(x, y, self.find_prev_rect()) {
                 self.run_find_script(-1);
@@ -8220,13 +9282,7 @@ impl App {
                     }
                 }
                 SidebarHit::Tab(index) => {
-                    let row =
-                        self.sidebar_row_rects()
-                            .into_iter()
-                            .find_map(|(row, rect)| match row {
-                                SidebarRow::Tab(row_index) if row_index == index => Some(rect),
-                                _ => None,
-                            });
+                    let row = self.sidebar_row_rect_for_tab(index);
                     if let Some(row) = row {
                         if self
                             .tabs
@@ -8341,6 +9397,20 @@ impl App {
                     },
                 ));
                 labels.push((MENU_TAB_DUPLICATE, "Duplicate Tab".to_string()));
+                if tab.split_group_id.is_some() {
+                    labels.push((MENU_TAB_UNSPLIT, "Unsplit Tab".to_string()));
+                    labels.push((MENU_TAB_SPLIT_HORIZONTAL, "Horizontal Layout".to_string()));
+                    labels.push((MENU_TAB_SPLIT_VERTICAL, "Vertical Layout".to_string()));
+                    labels.push((MENU_TAB_SPLIT_GRID, "Grid Layout".to_string()));
+                } else if self
+                    .active_tab_index()
+                    .map(|active| active != index)
+                    .unwrap_or(false)
+                {
+                    labels.push((MENU_TAB_SPLIT_WITH_ACTIVE, "Split With Active".to_string()));
+                } else if self.active_workspace_tabs().len() > 1 {
+                    labels.push((MENU_TAB_SPLIT_NEXT, "Split With Next Tab".to_string()));
+                }
                 labels.push((MENU_WORKSPACE_NEW_FOLDER, "New Folder".to_string()));
                 if tab.folder_id.is_some() {
                     labels.push((MENU_TAB_REMOVE_FOLDER, "Remove From Folder".to_string()));
@@ -8635,11 +9705,20 @@ impl App {
             | MENU_TAB_DUPLICATE
             | MENU_TAB_CLOSE
             | MENU_TAB_DELETE_PIN
+            | MENU_TAB_SPLIT_WITH_ACTIVE
+            | MENU_TAB_SPLIT_NEXT
+            | MENU_TAB_UNSPLIT
+            | MENU_TAB_SPLIT_HORIZONTAL
+            | MENU_TAB_SPLIT_VERTICAL
+            | MENU_TAB_SPLIT_GRID
                 if matches!(hit, SidebarHit::Tab(_)) =>
             {
                 if let SidebarHit::Tab(index) = hit {
                     match id {
                         MENU_TAB_PIN => {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                            }
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.pinned = true;
                                 tab.pinned_url = Some(tab.url.clone());
@@ -8647,18 +9726,73 @@ impl App {
                             }
                         }
                         MENU_TAB_UNPIN => {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                            }
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.pinned = false;
                                 tab.pinned_url = None;
                             }
                         }
                         MENU_TAB_REMOVE_FOLDER => {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                            }
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.folder_id = None;
                             }
                         }
                         MENU_TAB_DUPLICATE => {
                             let _ = self.duplicate_tab(index, true);
+                        }
+                        MENU_TAB_SPLIT_WITH_ACTIVE | MENU_TAB_SPLIT_NEXT => {
+                            self.split_tab_with_active(index, SplitLayout::Horizontal);
+                        }
+                        MENU_TAB_UNSPLIT => {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                                self.layout();
+                                self.refresh();
+                            }
+                        }
+                        MENU_TAB_SPLIT_HORIZONTAL => {
+                            if let Some(group_id) =
+                                self.tabs.get(index).and_then(|tab| tab.split_group_id)
+                            {
+                                if let Some(group) =
+                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                {
+                                    group.layout = SplitLayout::Horizontal;
+                                }
+                                self.layout();
+                                self.refresh();
+                            }
+                        }
+                        MENU_TAB_SPLIT_VERTICAL => {
+                            if let Some(group_id) =
+                                self.tabs.get(index).and_then(|tab| tab.split_group_id)
+                            {
+                                if let Some(group) =
+                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                {
+                                    group.layout = SplitLayout::Vertical;
+                                }
+                                self.layout();
+                                self.refresh();
+                            }
+                        }
+                        MENU_TAB_SPLIT_GRID => {
+                            if let Some(group_id) =
+                                self.tabs.get(index).and_then(|tab| tab.split_group_id)
+                            {
+                                if let Some(group) =
+                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                {
+                                    group.layout = SplitLayout::Grid;
+                                }
+                                self.layout();
+                                self.refresh();
+                            }
                         }
                         MENU_TAB_CLOSE => self.close_tab(index),
                         MENU_TAB_DELETE_PIN => self.delete_pin(index),
@@ -8679,6 +9813,9 @@ impl App {
                             .collect();
                         let offset = id - MENU_TAB_MOVE_FOLDER_BASE;
                         if let Some(folder_id) = folders.get(offset).copied() {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                            }
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.pinned = false;
                                 tab.folder_id = Some(folder_id);
@@ -8765,11 +9902,13 @@ impl App {
         let old_mode_menu = self.mode_menu_open;
         let old_hovering = self.hovering_sidebar;
         let old_drop_target = self.drop_target;
+        let old_split_drop_target = self.split_drop_target;
         self.hover_close = None;
         self.hover_tab = None;
         self.hover_folder = None;
         self.hover_target = None;
         self.drop_target = Some(DropTarget::None);
+        self.split_drop_target = None;
 
         if self.show_default_bubble && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
@@ -8875,6 +10014,18 @@ impl App {
                     self.hover_target = Some(HoverTarget::Reload);
                 } else if point_in_rect(x, y, self.address_menu_rect()) {
                     self.hover_target = Some(HoverTarget::AddressMenu);
+                } else if self
+                    .split_layout_button_rect()
+                    .map(|rect| point_in_rect(x, y, rect))
+                    .unwrap_or(false)
+                {
+                    self.hover_target = Some(HoverTarget::SplitLayout);
+                } else if self
+                    .split_unsplit_button_rect()
+                    .map(|rect| point_in_rect(x, y, rect))
+                    .unwrap_or(false)
+                {
+                    self.hover_target = Some(HoverTarget::SplitUnsplit);
                 } else if point_in_rect(x, y, self.address_pill_rect()) {
                     self.hover_target = Some(HoverTarget::Address);
                 } else if point_in_rect(x, y, self.settings_rect()) {
@@ -8955,6 +10106,7 @@ impl App {
         }
 
         if self.drag_state.as_ref().map(|d| d.active).unwrap_or(false) {
+            let split_target = self.calculate_split_drop_target(x, y);
             // Temporarily disable drag preview so that calculate_drop_target
             // sees the raw (non-preview) sidebar layout, where the pinned
             // section divider is at its true position. Without this, the
@@ -8964,9 +10116,17 @@ impl App {
                 d.active = false;
             }
             self.drop_target = Some(self.calculate_drop_target(x, y));
+            self.split_drop_target = split_target;
+            if self.split_drop_target.is_some() {
+                self.drop_target = Some(DropTarget::None);
+            }
             if let Some(ref mut d) = self.drag_state {
                 d.active = true;
             }
+        }
+
+        if old_split_drop_target != self.split_drop_target {
+            self.layout();
         }
 
         if !self.animating_sidebar
@@ -8976,7 +10136,8 @@ impl App {
                 || old_target != self.hover_target
                 || old_mode_menu != self.mode_menu_open
                 || old_hovering != self.hovering_sidebar
-                || old_drop_target != self.drop_target)
+                || old_drop_target != self.drop_target
+                || old_split_drop_target != self.split_drop_target)
         {
             self.refresh();
         }
@@ -8987,11 +10148,7 @@ impl App {
             return;
         }
         if let Some(SidebarHit::Tab(index)) = self.hit_sidebar(x, y) {
-            if let Some((_, row)) = self
-                .sidebar_row_rects()
-                .into_iter()
-                .find(|(row, _)| matches!(row, SidebarRow::Tab(row_index) if *row_index == index))
-            {
+            if let Some(row) = self.sidebar_row_rect_for_tab(index) {
                 let audio_hit = self
                     .tabs
                     .get(index)
@@ -9043,16 +10200,20 @@ impl App {
         }
         if !drag.active {
             self.drop_target = Some(DropTarget::None);
+            self.split_drop_target = None;
             return false;
         }
         let duplicate = matches!(drag.source, DragSource::Tab(_))
             && unsafe { (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
         self.handle_drop(drag.source, x, y, duplicate);
         self.drop_target = Some(DropTarget::None);
+        self.split_drop_target = None;
+        self.layout();
         true
     }
     fn handle_drop(&mut self, source: DragSource, _x: i32, _y: i32, duplicate_tab: bool) {
         let target = self.drop_target.unwrap_or(DropTarget::None);
+        let split_target = self.split_drop_target;
 
         match source {
             DragSource::Tab(mut from_index) => {
@@ -9064,6 +10225,18 @@ impl App {
                         return;
                     };
                     from_index = new_index;
+                }
+                if let Some(split_target) = split_target {
+                    self.apply_split_drop(from_index, split_target, None);
+                    return;
+                }
+                if let Some(tab_id) = self.tabs.get(from_index).map(|tab| tab.id) {
+                    self.detach_tab_from_split_by_id(tab_id);
+                    if let Some(index) = self.tab_index_by_id(tab_id) {
+                        from_index = index;
+                    } else {
+                        return;
+                    }
                 }
                 let dragged_workspace = self.tabs[from_index].workspace_id;
 
@@ -9301,6 +10474,30 @@ impl App {
                             DropTarget::RootAfter {
                                 pinned: tab_pinned,
                                 row: Some(SidebarRow::Tab(index)),
+                            }
+                        }
+                    }
+                    SidebarRow::SplitGroup(group_id) => {
+                        let tab_pinned = self
+                            .split_group(group_id)
+                            .and_then(|group| group.tab_ids.first().copied())
+                            .and_then(|tab_id| self.tab_index_by_id(tab_id))
+                            .and_then(|index| self.tabs.get(index))
+                            .map(|tab| tab.pinned)
+                            .unwrap_or(false);
+                        if y < (rect.top + rect.bottom) / 2 {
+                            if tab_pinned && previous_root_row(&rows, idx, true).is_none() {
+                                DropTarget::PinnedSection
+                            } else {
+                                DropTarget::RootAfter {
+                                    pinned: tab_pinned,
+                                    row: previous_root_row(&rows, idx, tab_pinned),
+                                }
+                            }
+                        } else {
+                            DropTarget::RootAfter {
+                                pinned: tab_pinned,
+                                row: Some(SidebarRow::SplitGroup(group_id)),
                             }
                         }
                     }
@@ -10831,6 +12028,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     let address = app.address_pill_rect();
                     let find_bar = app.find_bar_rect();
                     let (min_btn, max_btn, close_btn) = app.window_button_rects();
+                    let split_layout = app.split_layout_button_rect();
+                    let split_unsplit = app.split_unsplit_button_rect();
 
                     if point_in_rect(pt.x, pt.y, logo)
                         || point_in_rect(pt.x, pt.y, new_tab)
@@ -10838,6 +12037,12 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         || point_in_rect(pt.x, pt.y, forward)
                         || point_in_rect(pt.x, pt.y, reload)
                         || point_in_rect(pt.x, pt.y, address)
+                        || split_layout
+                            .map(|rect| point_in_rect(pt.x, pt.y, rect))
+                            .unwrap_or(false)
+                        || split_unsplit
+                            .map(|rect| point_in_rect(pt.x, pt.y, rect))
+                            .unwrap_or(false)
                         || (app.find_open && point_in_rect(pt.x, pt.y, find_bar))
                         || point_in_rect(pt.x, pt.y, min_btn)
                         || point_in_rect(pt.x, pt.y, max_btn)
@@ -11299,6 +12504,32 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
             0x53 if alt => {
                 app.switch_tab_below();
             }
+            0x48 if ctrl && alt => {
+                if app.active_split_group_id().is_some() {
+                    app.set_active_split_layout(SplitLayout::Horizontal);
+                } else if let Some(index) = app.active_tab_index() {
+                    app.split_tab_with_active(index, SplitLayout::Horizontal);
+                }
+            }
+            0x56 if ctrl && alt => {
+                if app.active_split_group_id().is_some() {
+                    app.set_active_split_layout(SplitLayout::Vertical);
+                } else if let Some(index) = app.active_tab_index() {
+                    app.split_tab_with_active(index, SplitLayout::Vertical);
+                }
+            }
+            0x47 if ctrl && alt => {
+                if app.active_split_group_id().is_some() {
+                    app.set_active_split_layout(SplitLayout::Grid);
+                } else if let Some(index) = app.active_tab_index() {
+                    app.split_tab_with_active(index, SplitLayout::Grid);
+                }
+            }
+            0x55 if ctrl && alt => {
+                if let Some(group_id) = app.active_split_group_id() {
+                    app.unsplit_group(group_id);
+                }
+            }
             code if code == VK_F5.0 as u32 => app.reload(),
             code if code == VK_F11.0 as u32 => app.toggle_fullscreen(),
             _ => {}
@@ -11314,6 +12545,7 @@ fn is_aster_shortcut(key: u32) -> bool {
         matches!(key, 0x44 | 0x46 | 0x4C | 0x53 | 0x54 | 0x57 | 0x52 | 0x30 | 0x60 | 0xBB | 0x6B | 0xBD | 0x6D if ctrl)
             || (key == 0x5A && ctrl && shift)
             || matches!(key, 0x25 | 0x27 | 0x41 | 0x44 | 0x57 | 0x53 if alt)
+            || matches!(key, 0x47 | 0x48 | 0x55 | 0x56 if ctrl && alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
     }
@@ -11336,6 +12568,10 @@ fn default_action_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> Opt
         0x27 | 0x44 if alt => Some("Go forward"),
         0x57 if alt => Some("Switch tab above"),
         0x53 if alt => Some("Switch tab below"),
+        0x48 if ctrl && alt => Some("Split horizontal"),
+        0x56 if ctrl && alt => Some("Split vertical"),
+        0x47 if ctrl && alt => Some("Split grid"),
+        0x55 if ctrl && alt => Some("Unsplit tabs"),
         code if code == VK_F5.0 as u32 => Some("Reload"),
         code if code == VK_F11.0 as u32 => Some("Toggle fullscreen"),
         _ => None,
@@ -14279,6 +15515,7 @@ fn previous_root_row(
         .take_while(|(row, _)| pinned || !matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
         .find_map(|(row, _)| match *row {
             SidebarRow::Folder(folder_id) => Some(SidebarRow::Folder(folder_id)),
+            SidebarRow::SplitGroup(group_id) => Some(SidebarRow::SplitGroup(group_id)),
             SidebarRow::Tab(tab_index) => Some(SidebarRow::Tab(tab_index)),
             SidebarRow::TabGhost(_) | SidebarRow::Label(_) => None,
         })
