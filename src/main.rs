@@ -93,7 +93,6 @@ struct COPYDATASTRUCT {
     pub lpData: *mut std::ffi::c_void,
 }
 
-
 thread_local! {
     static WITH_APP_GUARD: Cell<bool> = const { Cell::new(false) };
 }
@@ -312,9 +311,35 @@ struct HistoryEntry {
 
 #[derive(Clone, Debug)]
 struct VisitedSite {
+    title: String,
     url: String,
     visit_count: u32,
     last_visit_time: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistorySortMode {
+    Latest,
+    Oldest,
+    MostVisited,
+}
+
+impl HistorySortMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Oldest => "oldest",
+            Self::MostVisited => "most_visited",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "oldest" => Self::Oldest,
+            "most_visited" => Self::MostVisited,
+            _ => Self::Latest,
+        }
+    }
 }
 
 fn current_timestamp() -> u64 {
@@ -418,6 +443,7 @@ enum HoverTarget {
     Forward,
     Reload,
     Settings,
+    HistoryPage,
     SettingsPage,
     ModeRow,
     ModeAuto,
@@ -562,6 +588,7 @@ struct UiFonts {
     small: HFONT,
     icon: HFONT,
     toolbar_icon: HFONT,
+    nav_icon: HFONT,
     url: HFONT,
 }
 
@@ -572,6 +599,7 @@ impl Drop for UiFonts {
             let _ = DeleteObject(HGDIOBJ(self.small.0));
             let _ = DeleteObject(HGDIOBJ(self.icon.0));
             let _ = DeleteObject(HGDIOBJ(self.toolbar_icon.0));
+            let _ = DeleteObject(HGDIOBJ(self.nav_icon.0));
             let _ = DeleteObject(HGDIOBJ(self.url.0));
         }
     }
@@ -651,6 +679,8 @@ struct App {
     accent_color: u32,
     custom_keybinds: Vec<(String, String)>,
     site_mode: SiteMode,
+    history_sort_mode: HistorySortMode,
+    history_visit_sort_desc: bool,
     startup_mode: StartupMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -729,6 +759,7 @@ impl App {
             small: create_font(12, 400)?,
             icon: create_font_with_face(18, 400, w!("Segoe Fluent Icons"))?,
             toolbar_icon: create_font_with_face(15, 400, w!("Segoe Fluent Icons"))?,
+            nav_icon: create_font_with_face(18, 400, w!("Segoe Fluent Icons"))?,
             url: create_font_with_face(13, 400, w!("Segoe UI Variable Text"))?,
         };
         let brushes = UiBrushes {
@@ -820,6 +851,8 @@ impl App {
             accent_color: COLOR_ACCENT,
             custom_keybinds: Vec::new(),
             site_mode: SiteMode::Auto,
+            history_sort_mode: HistorySortMode::Latest,
+            history_visit_sort_desc: true,
             startup_mode: StartupMode::LastSession,
             settings_open: false,
             mode_menu_open: false,
@@ -868,7 +901,7 @@ impl App {
         app.default_bubble_dismissed = false;
         app.show_default_bubble = !is_aster_default_browser();
         app.save_state();
-        
+
         let args: Vec<String> = std::env::args().collect();
         let mut startup_url = None;
         if args.len() > 1 {
@@ -890,14 +923,14 @@ impl App {
                 app.switch_to(index, true);
             }
         }
-        
+
         if app.tabs.is_empty() {
             let _ = app.create_tab(DEFAULT_URL);
             if let Some(index) = app.active_tab_index() {
                 app.switch_to(index, true);
             }
         }
-        
+
         app.ensure_default_bookmark_folder();
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
@@ -1415,6 +1448,17 @@ impl App {
                     }
                 }
             }
+        } else if let Some(value) = message.strip_prefix("history:sort:") {
+            self.history_sort_mode = HistorySortMode::from_str(value);
+            self.reload_history_pages();
+        } else if let Some(value) = message.strip_prefix("history:visit-direction:") {
+            self.history_visit_sort_desc = value != "asc";
+            self.reload_history_pages();
+        } else if let Some(value) = message.strip_prefix("history:open:") {
+            let url = percent_decode(value);
+            if !url.trim().is_empty() {
+                let _ = self.create_tab(&url);
+            }
         }
         self.save_state();
         self.refresh();
@@ -1544,6 +1588,8 @@ impl App {
         }
         if url == "aster:settings" {
             self.load_settings_page(index);
+        } else if url == "aster:history" {
+            self.load_history_page(index);
         } else {
             let wide = CoTaskMemPWSTR::from(url);
             unsafe {
@@ -2528,7 +2574,13 @@ impl App {
                         .get(3)
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or_else(|| current_timestamp());
+                    let title = parts
+                        .get(4)
+                        .filter(|title| !title.trim().is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| label_for_url(&url));
                     self.visited_sites.push(VisitedSite {
+                        title,
                         url,
                         visit_count,
                         last_visit_time,
@@ -2547,18 +2599,18 @@ impl App {
                     }
                 }
                 "setting" if parts.len() >= 3 => match parts[1].as_str() {
-                "dominant_color" => {
-                    if let Ok(color) = parts[2].parse::<u32>() {
-                        self.dominant_color = color;
+                    "dominant_color" => {
+                        if let Ok(color) = parts[2].parse::<u32>() {
+                            self.dominant_color = color;
+                        }
                     }
-                }
-                "secondary_color" => {
-                    if let Ok(color) = parts[2].parse::<u32>() {
-                        self.secondary_color = color;
-                        self.recreate_secondary_brush();
+                    "secondary_color" => {
+                        if let Ok(color) = parts[2].parse::<u32>() {
+                            self.secondary_color = color;
+                            self.recreate_secondary_brush();
+                        }
                     }
-                }
-                "accent_color" => {
+                    "accent_color" => {
                         if let Ok(color) = parts[2].parse::<u32>() {
                             self.accent_color = color;
                         }
@@ -2569,6 +2621,12 @@ impl App {
                             "light" => SiteMode::Light,
                             _ => SiteMode::Auto,
                         };
+                    }
+                    "history_sort_mode" => {
+                        self.history_sort_mode = HistorySortMode::from_str(&parts[2]);
+                    }
+                    "history_visit_sort_desc" => {
+                        self.history_visit_sort_desc = parts[2] != "asc";
                     }
                     "startup_mode" => {
                         self.startup_mode = match parts[2].as_str() {
@@ -2691,7 +2749,10 @@ impl App {
         let mut lines = Vec::new();
         lines.push(format!("active_workspace\t{}", self.active_workspace));
         lines.push(format!("setting\tdominant_color\t{}", self.dominant_color));
-        lines.push(format!("setting\tsecondary_color\t{}", self.secondary_color));
+        lines.push(format!(
+            "setting\tsecondary_color\t{}",
+            self.secondary_color
+        ));
         lines.push(format!("setting\taccent_color\t{}", self.accent_color));
         lines.push(format!(
             "setting\tsite_mode\t{}",
@@ -2699,6 +2760,18 @@ impl App {
                 SiteMode::Auto => "auto",
                 SiteMode::Dark => "dark",
                 SiteMode::Light => "light",
+            }
+        ));
+        lines.push(format!(
+            "setting\thistory_sort_mode\t{}",
+            self.history_sort_mode.as_str()
+        ));
+        lines.push(format!(
+            "setting\thistory_visit_sort_desc\t{}",
+            if self.history_visit_sort_desc {
+                "desc"
+            } else {
+                "asc"
             }
         ));
         lines.push(format!(
@@ -2710,7 +2783,11 @@ impl App {
         ));
         lines.push(format!(
             "setting\tdefault_bubble_dismissed\t{}",
-            if self.default_bubble_dismissed { "1" } else { "0" }
+            if self.default_bubble_dismissed {
+                "1"
+            } else {
+                "0"
+            }
         ));
         for (action, combo) in &self.custom_keybinds {
             lines.push(format!(
@@ -2793,10 +2870,11 @@ impl App {
         }
         for site in self.visited_sites.iter().take(500) {
             lines.push(format!(
-                "suggestion\t{}\t{}\t{}",
+                "suggestion\t{}\t{}\t{}\t{}",
                 escape_state(&site.url),
                 site.visit_count,
-                site.last_visit_time
+                site.last_visit_time,
+                escape_state(&site.title)
             ));
         }
         let _ = fs::write(state_path(), lines.join("\n"));
@@ -3549,6 +3627,7 @@ impl App {
     }
 
     fn update_tab_title(&mut self, tab_id: usize, title: String) {
+        let mut visited_update = None;
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             if tab.is_sleeping {
                 return;
@@ -3559,6 +3638,19 @@ impl App {
                 if let Some(entry) = tab.history.get_mut(tab.history_cursor) {
                     entry.title = tab.title.clone();
                 }
+                if !tab.url.trim().is_empty() && !tab.url.starts_with("aster:") {
+                    visited_update = Some((tab.url.clone(), tab.title.clone()));
+                }
+            }
+        }
+        if let Some((url, title)) = visited_update {
+            let norm_url = normalize_url_for_dedup(&url);
+            if let Some(site) = self
+                .visited_sites
+                .iter_mut()
+                .find(|item| normalize_url_for_dedup(&item.url) == norm_url)
+            {
+                site.title = title;
             }
         }
         self.save_state();
@@ -3640,7 +3732,7 @@ impl App {
                         tab.history_cursor = tab.history_cursor.saturating_sub(drain);
                     }
                 }
-                suggestion = Some(tab.url.clone());
+                suggestion = Some((tab.url.clone(), tab.title.clone()));
             }
             if Some(index) == active_index {
                 if tab.unloaded {
@@ -3650,8 +3742,8 @@ impl App {
                 }
             }
         }
-        if let Some(url) = suggestion {
-            self.remember_suggestion(url);
+        if let Some((url, title)) = suggestion {
+            self.remember_suggestion(url, title);
         }
         self.save_state();
         self.refresh();
@@ -3689,13 +3781,18 @@ impl App {
         self.refresh();
     }
 
-    fn remember_suggestion(&mut self, url: String) {
+    fn remember_suggestion(&mut self, url: String, title: String) {
         let value = url.trim();
-        if value.is_empty() || value == "about:blank" {
+        if value.is_empty() || value == "about:blank" || value.starts_with("aster:") {
             return;
         }
         let now = current_timestamp();
         let norm_value = normalize_url_for_dedup(value);
+        let title = if title.trim().is_empty() || title == "New Tab" {
+            label_for_url(value)
+        } else {
+            title.trim().to_string()
+        };
         if let Some(site) = self
             .visited_sites
             .iter_mut()
@@ -3703,11 +3800,13 @@ impl App {
         {
             site.visit_count += 1;
             site.last_visit_time = now;
+            site.title = title;
             if value.len() < site.url.len() {
                 site.url = value.to_string();
             }
         } else {
             self.visited_sites.push(VisitedSite {
+                title,
                 url: value.to_string(),
                 visit_count: 1,
                 last_visit_time: now,
@@ -3997,6 +4096,10 @@ impl App {
         let _ = self.create_tab("aster:settings");
     }
 
+    fn open_history_page(&mut self) {
+        let _ = self.create_tab("aster:history");
+    }
+
     fn navigate_active(&mut self, url: &str) {
         let Some(index) = self.active_tab_index() else {
             let _ = self.create_tab(url);
@@ -4004,6 +4107,10 @@ impl App {
         };
         if url == "aster:settings" {
             self.load_settings_page(index);
+            return;
+        }
+        if url == "aster:history" {
+            self.load_history_page(index);
             return;
         }
         if let Some(tab) = self.tabs.get_mut(index) {
@@ -4017,6 +4124,47 @@ impl App {
         }
         self.save_state();
         self.refresh();
+    }
+
+    fn load_history_page(&mut self, index: usize) {
+        let html = history_page_html(
+            self.dominant_color,
+            self.secondary_color,
+            self.accent_color,
+            self.history_sort_mode,
+            self.history_visit_sort_desc,
+            &self.visited_sites,
+        );
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.url = "aster:history".to_string();
+            tab.title = "Aster History".to_string();
+            tab.favicon_bitmap = render_glyph_favicon(18, 0xE81C, &self.fonts.icon, COLOR_ACCENT);
+            unsafe {
+                let html = CoTaskMemPWSTR::from(html.as_str());
+                let _ = tab.webview.NavigateToString(*html.as_ref().as_pcwstr());
+            }
+            set_window_text(self.address_hwnd, "aster:history");
+        }
+        self.save_state();
+        self.refresh();
+    }
+
+    fn reload_history_pages(&mut self) {
+        let indexes: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                if tab.url == "aster:history" {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for index in indexes {
+            self.load_history_page(index);
+        }
     }
 
     fn load_settings_page(&mut self, index: usize) {
@@ -4542,7 +4690,7 @@ impl App {
         let bottom = settings.top - 8;
         RECT {
             left: 12,
-            top: bottom - 108,
+            top: bottom - 152,
             right: 196,
             bottom,
         }
@@ -4559,6 +4707,16 @@ impl App {
     }
 
     fn settings_page_row_rect(&self) -> RECT {
+        let row = self.history_page_row_rect();
+        RECT {
+            left: row.left,
+            top: row.bottom + 8,
+            right: row.right,
+            bottom: row.bottom + 44,
+        }
+    }
+
+    fn history_page_row_rect(&self) -> RECT {
         let row = self.mode_row_rect();
         RECT {
             left: row.left,
@@ -4715,6 +4873,7 @@ impl App {
                     true
                 } else {
                     site.url.to_ascii_lowercase().contains(&query)
+                        || site.title.to_ascii_lowercase().contains(&query)
                         || extract_search_query(&site.url)
                             .map(|q| q.to_ascii_lowercase().contains(&query))
                             .unwrap_or(false)
@@ -4739,7 +4898,12 @@ impl App {
             {
                 continue;
             }
-            rows.push((None, label_for_url(&site.url), site.url.clone()));
+            let title = if site.title.trim().is_empty() {
+                label_for_url(&site.url)
+            } else {
+                site.title.clone()
+            };
+            rows.push((None, title, site.url.clone()));
         }
 
         // 4. If there is a query, sort the results to prioritize prefix matches
@@ -5135,14 +5299,14 @@ impl App {
                 back,
                 IconKind::Back,
                 self.hover_target == Some(HoverTarget::Back),
-                &self.fonts.toolbar_icon,
+                &self.fonts.nav_icon,
             );
             draw_toolbar_icon_button(
                 hdc,
                 forward,
                 IconKind::Forward,
                 self.hover_target == Some(HoverTarget::Forward),
-                &self.fonts.toolbar_icon,
+                &self.fonts.nav_icon,
             );
             draw_toolbar_icon_button(
                 hdc,
@@ -5593,7 +5757,14 @@ impl App {
                     let _ = SetViewportOrgEx(mem_dc, -rect.left, -rect.top, None);
 
                     // 1. Draw rounded slate-grey background onto mem_dc (clipped to round region in local coordinates)
-                    let rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+                    let rgn = CreateRoundRectRgn(
+                        rect.left,
+                        rect.top,
+                        rect.right + 1,
+                        rect.bottom + 1,
+                        16,
+                        16,
+                    );
                     let _ = SelectClipRgn(mem_dc, Some(rgn));
                     fill_rect(
                         mem_dc,
@@ -5613,11 +5784,22 @@ impl App {
 
                     // 3. Draw close button
                     let close_rect = self.default_bubble_close_rect().unwrap();
-                    let is_close_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleClose);
+                    let is_close_hovered =
+                        self.hover_target == Some(HoverTarget::DefaultBubbleClose);
                     if is_close_hovered {
                         fill_round_rect(mem_dc, close_rect, COLOR_SURFACE_HOVER, 6);
                     }
-                    draw_icon_glyph(mem_dc, &self.fonts.toolbar_icon, "\u{E8BB}", close_rect, if is_close_hovered { 0xffffff } else { COLOR_MUTED });
+                    draw_icon_glyph(
+                        mem_dc,
+                        &self.fonts.toolbar_icon,
+                        "\u{E8BB}",
+                        close_rect,
+                        if is_close_hovered {
+                            0xffffff
+                        } else {
+                            COLOR_MUTED
+                        },
+                    );
 
                     // 4. Draw messages
                     let line1_rect = RECT {
@@ -5626,7 +5808,13 @@ impl App {
                         right: rect.right - 36,
                         bottom: rect.top + 28,
                     };
-                    draw_text(mem_dc, &self.fonts.body, "Make Aster default browser?", line1_rect, COLOR_TEXT);
+                    draw_text(
+                        mem_dc,
+                        &self.fonts.body,
+                        "Make Aster default browser?",
+                        line1_rect,
+                        COLOR_TEXT,
+                    );
 
                     let line2_rect = RECT {
                         left: rect.left + 14,
@@ -5634,32 +5822,48 @@ impl App {
                         right: rect.right - 36,
                         bottom: rect.top + 46,
                     };
-                    draw_text(mem_dc, &self.fonts.small, "For a faster web experience.", line2_rect, COLOR_MUTED);
+                    draw_text(
+                        mem_dc,
+                        &self.fonts.small,
+                        "For a faster web experience.",
+                        line2_rect,
+                        COLOR_MUTED,
+                    );
 
                     // 5. Draw primary action button
                     let btn_rect = self.default_bubble_button_rect().unwrap();
-                    let is_btn_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
+                    let is_btn_hovered =
+                        self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
                     let btn_bg = if is_btn_hovered {
                         self.accent_color
                     } else {
                         0x343434
                     };
-                    let btn_fg = if is_btn_hovered {
-                        0x000000
-                    } else {
-                        0xffffff
-                    };
+                    let btn_fg = if is_btn_hovered { 0x000000 } else { 0xffffff };
                     fill_round_rect(mem_dc, btn_rect, btn_bg, 8);
                     if !is_btn_hovered {
                         draw_outline(mem_dc, btn_rect, 0x454545, 8);
                     }
-                    draw_centered_text(mem_dc, &self.fonts.body, "Set as Default", btn_rect, btn_fg);
+                    draw_centered_text(
+                        mem_dc,
+                        &self.fonts.body,
+                        "Set as Default",
+                        btn_rect,
+                        btn_fg,
+                    );
 
                     // Reset viewport origin before alpha blending onto the destination
                     let _ = SetViewportOrgEx(mem_dc, 0, 0, None);
 
                     // Select a rounded clip region on the destination hdc to cleanly truncate corners
-                    let dest_rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+                    let dest_rgn = CreateRoundRectRgn(
+                        rect.left,
+                        rect.top,
+                        rect.right + 1,
+                        rect.bottom + 1,
+                        16,
+                        16,
+                    );
                     let _ = SelectClipRgn(hdc, Some(dest_rgn));
 
                     let blend = BLENDFUNCTION {
@@ -5670,17 +5874,7 @@ impl App {
                     };
 
                     let _ = AlphaBlend(
-                        hdc,
-                        rect.left,
-                        rect.top,
-                        width,
-                        height,
-                        mem_dc,
-                        0,
-                        0,
-                        width,
-                        height,
-                        blend,
+                        hdc, rect.left, rect.top, width, height, mem_dc, 0, 0, width, height, blend,
                     );
 
                     // Restore clipping region on hdc and clean up resources
@@ -5799,6 +5993,35 @@ impl App {
                     top: row.top,
                     right: row.right - 6,
                     bottom: row.bottom,
+                },
+                COLOR_MUTED,
+            );
+
+            let history_row = self.history_page_row_rect();
+            if self.hover_target == Some(HoverTarget::HistoryPage) {
+                fill_round_rect(hdc, history_row, COLOR_SURFACE_HOVER, 9);
+            }
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                "History",
+                RECT {
+                    left: history_row.left + 12,
+                    top: history_row.top,
+                    right: history_row.right - 30,
+                    bottom: history_row.bottom,
+                },
+                COLOR_TEXT,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE81C).as_str(),
+                RECT {
+                    left: history_row.right - 28,
+                    top: history_row.top,
+                    right: history_row.right - 6,
+                    bottom: history_row.bottom,
                 },
                 COLOR_MUTED,
             );
@@ -6724,7 +6947,11 @@ impl App {
                         fill_round_rect(
                             hdc,
                             rect,
-                            if active { self.accent_color } else { self.secondary_color },
+                            if active {
+                                self.accent_color
+                            } else {
+                                self.secondary_color
+                            },
                             14,
                         );
                         draw_outline(
@@ -7072,6 +7299,18 @@ impl App {
         }
 
         if self.settings_open {
+            if point_in_rect(x, y, self.history_page_row_rect()) {
+                self.settings_open = false;
+                self.mode_menu_open = false;
+                self.open_history_page();
+                return;
+            }
+            if point_in_rect(x, y, self.settings_page_row_rect()) {
+                self.settings_open = false;
+                self.mode_menu_open = false;
+                self.open_settings_page();
+                return;
+            }
             if self.mode_menu_open {
                 let options = self.mode_options_rect();
                 if point_in_rect(x, y, options) {
@@ -7089,12 +7328,6 @@ impl App {
             }
 
             if point_in_rect(x, y, self.mode_row_rect()) {
-                return;
-            }
-            if point_in_rect(x, y, self.settings_page_row_rect()) {
-                self.settings_open = false;
-                self.mode_menu_open = false;
-                self.open_settings_page();
                 return;
             }
 
@@ -7891,12 +8124,16 @@ impl App {
                         Some(id) => Some(HoverTarget::DownloadIndicator(id)),
                         None => Some(HoverTarget::DownloadOverflow),
                     };
+                } else if self.settings_open && point_in_rect(x, y, self.history_page_row_rect()) {
+                    self.hover_target = Some(HoverTarget::HistoryPage);
+                    self.mode_menu_open = false;
+                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
+                    self.hover_target = Some(HoverTarget::SettingsPage);
+                    self.mode_menu_open = false;
                 } else if self.settings_open && point_in_rect(x, y, self.mode_row_rect()) {
                     self.hover_target = Some(HoverTarget::ModeRow);
                     self.mode_menu_open = true;
-                } else if self.settings_open
-                    && point_in_rect(x, y, self.mode_options_rect())
-                {
+                } else if self.settings_open && point_in_rect(x, y, self.mode_options_rect()) {
                     let options = self.mode_options_rect();
                     let local_y = y - options.top - 8;
                     if local_y >= 0 {
@@ -7907,9 +8144,6 @@ impl App {
                             _ => None,
                         };
                     }
-                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
-                    self.hover_target = Some(HoverTarget::SettingsPage);
-                    self.mode_menu_open = false;
                 }
             }
         }
@@ -8270,9 +8504,7 @@ impl App {
                             .map(|folder| folder.pinned)
                             .unwrap_or(false);
                         if y < rect.top + third {
-                            if folder_pinned
-                                && previous_root_row(&rows, idx, true).is_none()
-                            {
+                            if folder_pinned && previous_root_row(&rows, idx, true).is_none() {
                                 DropTarget::PinnedSection
                             } else {
                                 DropTarget::RootAfter {
@@ -8293,9 +8525,7 @@ impl App {
                         let tab_pinned =
                             self.tabs.get(index).map(|tab| tab.pinned).unwrap_or(false);
                         if y < (rect.top + rect.bottom) / 2 {
-                            if tab_pinned
-                                && previous_root_row(&rows, idx, true).is_none()
-                            {
+                            if tab_pinned && previous_root_row(&rows, idx, true).is_none() {
                                 DropTarget::PinnedSection
                             } else {
                                 DropTarget::RootAfter {
@@ -8832,7 +9062,7 @@ fn main() -> AppResult<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     }
-    
+
     unsafe {
         if let Ok(existing_hwnd) = WindowsAndMessaging::FindWindowW(CLASS_NAME, None) {
             if !existing_hwnd.is_invalid() {
@@ -8846,10 +9076,11 @@ fn main() -> AppResult<()> {
                         }
                     }
                 }
-                
-                let _ = WindowsAndMessaging::ShowWindow(existing_hwnd, WindowsAndMessaging::SW_RESTORE);
+
+                let _ =
+                    WindowsAndMessaging::ShowWindow(existing_hwnd, WindowsAndMessaging::SW_RESTORE);
                 let _ = WindowsAndMessaging::SetForegroundWindow(existing_hwnd);
-                
+
                 if !startup_url.is_empty() {
                     let bytes = startup_url.as_bytes();
                     let cds = COPYDATASTRUCT {
@@ -8873,7 +9104,6 @@ fn main() -> AppResult<()> {
     register_window_class()?;
     let hwnd = create_main_window()?;
     let environment = create_environment()?;
-
 
     let app = Box::new(App::new(hwnd, environment)?);
     unsafe {
@@ -9742,7 +9972,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                             }
                             app.refresh();
                         });
-                        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_RESTORE);
+                        let _ =
+                            WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_RESTORE);
                         let _ = WindowsAndMessaging::SetForegroundWindow(hwnd);
                     }
                 }
@@ -10182,6 +10413,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
                     app.load_settings_page(index);
                 }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:history") {
+                    app.load_history_page(index);
+                }
             });
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
@@ -10200,6 +10434,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 }
                 if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
                     app.load_settings_page(index);
+                }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:history") {
+                    app.load_history_page(index);
                 }
 
                 if app.renaming_folder_id.is_some() {
@@ -10473,7 +10710,10 @@ fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool) {
         let spacing = 6;
         BRUSH_CACHE.with(|cache| {
             let mut c = cache.borrow_mut();
-            let brush = *c.brushes.entry(COLOR_MUTED).or_insert_with(|| solid_brush(COLOR_MUTED));
+            let brush = *c
+                .brushes
+                .entry(COLOR_MUTED)
+                .or_insert_with(|| solid_brush(COLOR_MUTED));
             let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
             let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
             let size = r * 2;
@@ -10674,7 +10914,11 @@ unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64, is_unbo
     draw_text(
         hdc,
         &text_font,
-        if is_unbookmark { "Unbookmarked" } else { "Bookmarked Site!" },
+        if is_unbookmark {
+            "Unbookmarked"
+        } else {
+            "Bookmarked Site!"
+        },
         RECT {
             left: body.left + 52,
             top: body.top,
@@ -11127,8 +11371,8 @@ impl IconKind {
     fn glyph(self) -> &'static str {
         match self {
             Self::Plus => "\u{E710}",
-            Self::Back => "\u{E72B}",
-            Self::Forward => "\u{E72A}",
+            Self::Back => "\u{E76B}",
+            Self::Forward => "\u{E76C}",
             Self::Reload => "\u{E72C}",
         }
     }
@@ -11350,7 +11594,12 @@ fn decode_favicon_stream(stream: &IStream) -> Option<FaviconBitmap> {
     }
 }
 
-fn render_glyph_favicon(size: i32, codepoint: u32, icon_font: &HFONT, color: u32) -> Option<FaviconBitmap> {
+fn render_glyph_favicon(
+    size: i32,
+    codepoint: u32,
+    icon_font: &HFONT,
+    color: u32,
+) -> Option<FaviconBitmap> {
     unsafe {
         let hdc = CreateCompatibleDC(None);
         if hdc.is_invalid() {
@@ -11998,6 +12247,224 @@ defaults.forEach(([name, combo]) => {{
     )
 }
 
+fn history_entries_json(entries: &[VisitedSite]) -> String {
+    let items = entries
+        .iter()
+        .filter(|entry| !entry.url.trim().is_empty())
+        .map(|entry| {
+            let title = if entry.title.trim().is_empty() {
+                label_for_url(&entry.url)
+            } else {
+                entry.title.clone()
+            };
+            format!(
+                "{{\"title\":{},\"url\":{},\"visitCount\":{},\"lastVisitTime\":{}}}",
+                js_string_literal(&title),
+                js_string_literal(&entry.url),
+                entry.visit_count,
+                entry.last_visit_time
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", items)
+}
+
+fn history_page_html(
+    dominant_color: u32,
+    secondary_color: u32,
+    accent_color: u32,
+    sort_mode: HistorySortMode,
+    visit_sort_desc: bool,
+    entries: &[VisitedSite],
+) -> String {
+    let dominant = colorref_to_css(dominant_color);
+    let secondary = colorref_to_css(secondary_color);
+    let accent = colorref_to_css(accent_color);
+    let entries_json = history_entries_json(entries);
+    let visit_direction = if visit_sort_desc { "desc" } else { "asc" };
+    let template = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aster History</title>
+<style>
+:root { --accent: __ACCENT__; --bg: __DOMINANT__; --secondary: __SECONDARY__; --panel: __SECONDARY__; --line: #2a2a2a; --text: #f5f5f5; --muted: #a1a1a1; --soft: #151515; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", sans-serif; }
+button, select { font: inherit; }
+.page { min-height: 100vh; padding: 34px clamp(22px, 5vw, 72px); }
+.header { display: flex; align-items: end; justify-content: space-between; gap: 20px; max-width: 1040px; margin: 0 auto 26px; }
+h1 { font-size: 28px; line-height: 1.1; margin: 0 0 7px; font-weight: 650; }
+.lead { color: var(--muted); margin: 0; }
+.controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+select { color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; min-width: 148px; }
+.wrap { max-width: 1040px; margin: 0 auto; }
+.empty { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 28px; color: var(--muted); }
+.year { margin: 28px 0 0; }
+.year-title { color: var(--text); font-size: 20px; font-weight: 650; margin: 0 0 14px; }
+.month { margin: 0 0 20px; }
+.month-title { color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; margin: 18px 0 10px; }
+.day { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; overflow: hidden; margin: 10px 0 14px; }
+.day-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--panel), #000 18%); }
+.day-name { font-weight: 600; }
+.day-count { color: var(--muted); font-size: 12px; }
+.item { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; text-align: left; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--text); padding: 13px 16px; cursor: pointer; }
+.item:first-of-type { border-top: 0; }
+.item:hover, .item:focus-visible { background: color-mix(in srgb, var(--accent), transparent 88%); outline: none; }
+.title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 560; }
+.url { color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; margin-top: 2px; font-size: 12px; }
+.meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 8px; vertical-align: 1px; }
+@media (max-width: 720px) {
+  .header { align-items: stretch; flex-direction: column; }
+  .controls { justify-content: stretch; }
+  select { flex: 1 1 180px; min-width: 0; }
+  .item { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="header">
+    <div>
+      <h1>Aster History</h1>
+      <p class="lead">Visited pages grouped by date.</p>
+    </div>
+    <div class="controls">
+      <select id="sortMode" aria-label="Sort history">
+        <option value="latest">Latest</option>
+        <option value="oldest">Oldest</option>
+        <option value="most_visited">Most visited</option>
+      </select>
+      <select id="visitDirection" aria-label="Most visited direction">
+        <option value="desc">Most visited first</option>
+        <option value="asc">Least visited first</option>
+      </select>
+    </div>
+  </header>
+  <main class="wrap" id="history"></main>
+</div>
+<script>
+const post = (m) => window.chrome?.webview?.postMessage(m);
+const entries = __ENTRIES__;
+const sortMode = document.getElementById("sortMode");
+const visitDirection = document.getElementById("visitDirection");
+sortMode.value = "__SORT_MODE__";
+visitDirection.value = "__VISIT_DIRECTION__";
+function cleanUrl(url) {
+  return String(url || "").replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "");
+}
+function itemTitle(item) {
+  return item.title && item.title !== "New Tab" ? item.title : cleanUrl(item.url);
+}
+function dayLabel(date) {
+  const today = new Date();
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const then = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const diff = Math.round((start - then) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  return date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+}
+function monthLabel(year, month) {
+  return new Date(year, month, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+function visitText(count) {
+  return count === 1 ? "1 visit" : `${count} visits`;
+}
+function sortItems(items) {
+  const mode = sortMode.value;
+  const byVisit = visitDirection.value === "asc" ? 1 : -1;
+  return items.slice().sort((a, b) => {
+    if (mode === "most_visited") {
+      const visits = (a.visitCount - b.visitCount) * byVisit;
+      if (visits !== 0) return visits;
+      return b.lastVisitTime - a.lastVisitTime;
+    }
+    return mode === "oldest"
+      ? a.lastVisitTime - b.lastVisitTime
+      : b.lastVisitTime - a.lastVisitTime;
+  });
+}
+function render() {
+  const root = document.getElementById("history");
+  root.textContent = "";
+  visitDirection.style.display = sortMode.value === "most_visited" ? "" : "none";
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No browsing history yet.";
+    root.appendChild(empty);
+    return;
+  }
+  const grouped = new Map();
+  for (const item of entries) {
+    const date = new Date((item.lastVisitTime || 0) * 1000);
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    const dayKey = `${year}-${month}-${date.getDate()}`;
+    if (!grouped.has(year)) grouped.set(year, new Map());
+    if (!grouped.get(year).has(month)) grouped.get(year).set(month, new Map());
+    if (!grouped.get(year).get(month).has(dayKey)) grouped.get(year).get(month).set(dayKey, { date, items: [] });
+    grouped.get(year).get(month).get(dayKey).items.push(item);
+  }
+  const groupDir = sortMode.value === "oldest" ? 1 : -1;
+  for (const [year, months] of [...grouped.entries()].sort((a, b) => (a[0] - b[0]) * groupDir)) {
+    const yearEl = document.createElement("section");
+    yearEl.className = "year";
+    yearEl.innerHTML = `<h2 class="year-title">${year}</h2>`;
+    for (const [month, days] of [...months.entries()].sort((a, b) => (a[0] - b[0]) * groupDir)) {
+      const monthEl = document.createElement("section");
+      monthEl.className = "month";
+      monthEl.innerHTML = `<h3 class="month-title">${monthLabel(year, month)}</h3>`;
+      for (const day of [...days.values()].sort((a, b) => (a.date - b.date) * groupDir)) {
+        const dayEl = document.createElement("section");
+        dayEl.className = "day";
+        const total = day.items.reduce((sum, item) => sum + item.visitCount, 0);
+        const head = document.createElement("div");
+        head.className = "day-head";
+        head.innerHTML = `<div class="day-name"><span class="dot"></span>${dayLabel(day.date)}</div><div class="day-count">${visitText(total)}</div>`;
+        dayEl.appendChild(head);
+        for (const item of sortItems(day.items)) {
+          const row = document.createElement("button");
+          row.className = "item";
+          row.type = "button";
+          row.innerHTML = `<div><div class="title"></div><div class="url"></div></div><div class="meta">${visitText(item.visitCount)}</div>`;
+          row.querySelector(".title").textContent = itemTitle(item);
+          row.querySelector(".url").textContent = cleanUrl(item.url);
+          row.onclick = () => post("history:open:" + encodeURIComponent(item.url));
+          dayEl.appendChild(row);
+        }
+        monthEl.appendChild(dayEl);
+      }
+      yearEl.appendChild(monthEl);
+    }
+    root.appendChild(yearEl);
+  }
+}
+sortMode.onchange = () => {
+  render();
+  post("history:sort:" + sortMode.value);
+};
+visitDirection.onchange = () => {
+  render();
+  post("history:visit-direction:" + visitDirection.value);
+};
+render();
+</script>
+</body>
+</html>"#;
+    template
+        .replace("__ACCENT__", &accent)
+        .replace("__DOMINANT__", &dominant)
+        .replace("__SECONDARY__", &secondary)
+        .replace("__ENTRIES__", &entries_json)
+        .replace("__SORT_MODE__", sort_mode.as_str())
+        .replace("__VISIT_DIRECTION__", visit_direction)
+}
+
 fn mix_color(from: u32, to: u32, amount: f32) -> u32 {
     let t = amount.clamp(0.0, 1.0);
     let fr = (from & 0xff) as f32;
@@ -12150,6 +12617,9 @@ fn normalize_address(raw: &str) -> String {
     }
     if value.eq_ignore_ascii_case(":settings") || value.eq_ignore_ascii_case("aster:settings") {
         return "aster:settings".to_string();
+    }
+    if value.eq_ignore_ascii_case(":history") || value.eq_ignore_ascii_case("aster:history") {
+        return "aster:history".to_string();
     }
     if value.contains("://") || value.starts_with("about:") {
         value.to_string()
@@ -12613,7 +13083,7 @@ fn is_aster_default_browser() -> bool {
        .arg("/v")
        .arg("ProgId");
     cmd.creation_flags(CREATE_NO_WINDOW);
-    
+
     if let Ok(output) = cmd.output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         stdout.contains("AsterHTML")
@@ -12626,27 +13096,105 @@ fn make_aster_default_browser() {
     use std::os::windows::process::CommandExt;
     if let Ok(exe_path) = std::env::current_exe() {
         let exe_str = exe_path.to_string_lossy();
-        
+
         let keys = vec![
-            ("HKCU\\Software\\Classes\\AsterHTML".to_string(), "".to_string(), "REG_SZ".to_string(), "Aster HTML Document".to_string()),
-            ("HKCU\\Software\\Classes\\AsterHTML".to_string(), "URL Protocol".to_string(), "REG_SZ".to_string(), "".to_string()),
-            ("HKCU\\Software\\Classes\\AsterHTML\\DefaultIcon".to_string(), "".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
-            ("HKCU\\Software\\Classes\\AsterHTML\\shell\\open\\command".to_string(), "".to_string(), "REG_SZ".to_string(), format!("\"{}\" \"%1\"", exe_str)),
-            
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster".to_string(), "".to_string(), "REG_SZ".to_string(), "Aster".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationDescription".to_string(), "REG_SZ".to_string(), "Aster Web Browser".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationIcon".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationName".to_string(), "REG_SZ".to_string(), "Aster".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations".to_string(), ".htm".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations".to_string(), ".html".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations".to_string(), "http".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations".to_string(), "https".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\DefaultIcon".to_string(), "".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\shell\\open\\command".to_string(), "".to_string(), "REG_SZ".to_string(), format!("\"{}\"", exe_str)),
-            
-            ("HKCU\\Software\\RegisteredApplications".to_string(), "Aster".to_string(), "REG_SZ".to_string(), "Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string()),
+            (
+                "HKCU\\Software\\Classes\\AsterHTML".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                "Aster HTML Document".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Classes\\AsterHTML".to_string(),
+                "URL Protocol".to_string(),
+                "REG_SZ".to_string(),
+                "".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Classes\\AsterHTML\\DefaultIcon".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                format!("{},0", exe_str),
+            ),
+            (
+                "HKCU\\Software\\Classes\\AsterHTML\\shell\\open\\command".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                format!("\"{}\" \"%1\"", exe_str),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                "Aster".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(),
+                "ApplicationDescription".to_string(),
+                "REG_SZ".to_string(),
+                "Aster Web Browser".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(),
+                "ApplicationIcon".to_string(),
+                "REG_SZ".to_string(),
+                format!("{},0", exe_str),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(),
+                "ApplicationName".to_string(),
+                "REG_SZ".to_string(),
+                "Aster".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations"
+                    .to_string(),
+                ".htm".to_string(),
+                "REG_SZ".to_string(),
+                "AsterHTML".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations"
+                    .to_string(),
+                ".html".to_string(),
+                "REG_SZ".to_string(),
+                "AsterHTML".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations"
+                    .to_string(),
+                "http".to_string(),
+                "REG_SZ".to_string(),
+                "AsterHTML".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations"
+                    .to_string(),
+                "https".to_string(),
+                "REG_SZ".to_string(),
+                "AsterHTML".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\DefaultIcon".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                format!("{},0", exe_str),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\shell\\open\\command"
+                    .to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                format!("\"{}\"", exe_str),
+            ),
+            (
+                "HKCU\\Software\\RegisteredApplications".to_string(),
+                "Aster".to_string(),
+                "REG_SZ".to_string(),
+                "Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(),
+            ),
         ];
-        
+
         for (key, val_name, val_type, val_data) in keys {
             let mut cmd = std::process::Command::new("reg");
             cmd.arg("add").arg(&key);
@@ -12655,18 +13203,25 @@ fn make_aster_default_browser() {
             } else {
                 cmd.arg("/ve");
             }
-            cmd.arg("/t").arg(&val_type).arg("/d").arg(&val_data).arg("/f");
+            cmd.arg("/t")
+                .arg(&val_type)
+                .arg("/d")
+                .arg(&val_data)
+                .arg("/f");
             cmd.creation_flags(CREATE_NO_WINDOW);
             let _ = cmd.output();
         }
-        
+
         let _ = std::process::Command::new("cmd")
-            .args(&["/c", "start", "ms-settings:defaultapps?registeredAppUser=Aster"])
+            .args(&[
+                "/c",
+                "start",
+                "ms-settings:defaultapps?registeredAppUser=Aster",
+            ])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
 }
-
 
 #[cfg(test)]
 mod tests {
