@@ -1637,6 +1637,10 @@ impl App {
                     }
                 }
             }
+        } else if message == "settings:export:aster" {
+            self.send_settings_export("aster");
+        } else if message == "settings:export:bookmarks" {
+            self.send_settings_export("bookmarks");
         } else if let Some(raw) = message.strip_prefix("settings:import-files:") {
             let stats = self.import_uploaded_files(raw);
             self.import_export_notice = Some(stats.message());
@@ -5058,6 +5062,29 @@ impl App {
         serde_json::to_string_pretty(&export).unwrap_or_else(|_| "{}".to_string())
     }
 
+    fn send_settings_export(&self, kind: &str) {
+        let (mime, payload) = match kind {
+            "aster" => ("application/json", self.aster_export_json()),
+            "bookmarks" => ("text/html", self.bookmarks_export_html()),
+            _ => return,
+        };
+        let script = format!(
+            "window.asterReceiveExport && window.asterReceiveExport({}, {}, {});",
+            js_string_literal(kind),
+            js_string_literal(mime),
+            js_string_literal(&payload)
+        );
+        unsafe {
+            let js = CoTaskMemPWSTR::from(script.as_str());
+            for tab in self.tabs.iter().filter(|tab| tab.url == "aster:settings") {
+                let _ = tab.webview.ExecuteScript(
+                    *js.as_ref().as_pcwstr(),
+                    &ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(()))),
+                );
+            }
+        }
+    }
+
     fn bookmarks_export_html(&self) -> String {
         let mut html = String::from(
             "<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>Bookmarks</TITLE>\n<H1>Bookmarks</H1>\n<DL><p>\n",
@@ -5575,8 +5602,6 @@ impl App {
     }
 
     fn load_settings_page(&mut self, index: usize) {
-        let export_json = self.aster_export_json();
-        let bookmarks_html = self.bookmarks_export_html();
         let html = settings_page_html(
             self.dominant_color,
             self.secondary_color,
@@ -5587,8 +5612,6 @@ impl App {
                 StartupMode::LastSession => "last",
             },
             is_aster_default_browser(),
-            &export_json,
-            &bookmarks_html,
             self.import_export_notice.as_deref().unwrap_or(""),
         );
         if let Some(tab) = self.tabs.get_mut(index) {
@@ -15053,15 +15076,11 @@ fn settings_page_html(
     site_mode: &str,
     startup_mode: &str,
     is_default: bool,
-    export_json: &str,
-    bookmarks_html: &str,
     import_notice: &str,
 ) -> String {
     let dominant = colorref_to_css(dominant_color);
     let secondary = colorref_to_css(secondary_color);
     let accent = colorref_to_css(accent_color);
-    let export_json_literal = js_string_literal(export_json);
-    let bookmarks_html_literal = js_string_literal(bookmarks_html);
     let import_notice_html = if import_notice.trim().is_empty() {
         String::new()
     } else {
@@ -15204,8 +15223,6 @@ document.querySelectorAll(".reset-btn").forEach((btn) => {{
 document.getElementById("openStateFile").onclick = () => post("settings:open-state-file");
 const makeDefaultBtn = document.getElementById("makeDefaultBtn");
 if (makeDefaultBtn) makeDefaultBtn.onclick = () => post("settings:make-default");
-const asterExport = {export_json_literal};
-const bookmarkExport = {bookmarks_html_literal};
 const importStatus = document.getElementById("importStatus");
 const clearImportNotice = document.getElementById("clearImportNotice");
 if (clearImportNotice) clearImportNotice.onclick = () => post("settings:clear-import-notice");
@@ -15223,8 +15240,23 @@ function downloadText(filename, mime, text) {{
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 800);
 }}
-document.getElementById("exportAsterData").onclick = () => downloadText(`aster-data-${{dateStamp()}}.json`, "application/json", asterExport);
-document.getElementById("exportBookmarkHtml").onclick = () => downloadText(`aster-bookmarks-${{dateStamp()}}.html`, "text/html", bookmarkExport);
+window.asterReceiveExport = (kind, mime, text) => {{
+  if (kind === "aster") {{
+    downloadText(`aster-data-${{dateStamp()}}.json`, mime, text);
+    importStatus.textContent = "Aster data export ready.";
+  }} else if (kind === "bookmarks") {{
+    downloadText(`aster-bookmarks-${{dateStamp()}}.html`, mime, text);
+    importStatus.textContent = "Bookmarks export ready.";
+  }}
+}};
+document.getElementById("exportAsterData").onclick = () => {{
+  importStatus.textContent = "Preparing Aster data export...";
+  post("settings:export:aster");
+}};
+document.getElementById("exportBookmarkHtml").onclick = () => {{
+  importStatus.textContent = "Preparing bookmarks export...";
+  post("settings:export:bookmarks");
+}};
 const importDrop = document.getElementById("importDrop");
 const importInput = document.getElementById("importInput");
 document.getElementById("chooseImport").onclick = () => importInput.click();
