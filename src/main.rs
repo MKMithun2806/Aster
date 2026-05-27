@@ -10,12 +10,23 @@ use std::{
     sync::mpsc,
 };
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose, Engine as _};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
     core::PWSTR,
     core::*,
     Win32::{
-        Foundation::{COLORREF, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{
+            LocalFree, COLORREF, E_POINTER, GENERIC_READ, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT,
+            POINT, RECT, WPARAM,
+        },
         Graphics::Dwm::{
             DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR,
             DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -36,7 +47,8 @@ use windows::{
             CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
             WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
         },
-        System::{Com::*, LibraryLoader},
+        Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
+        System::{Com::*, Com::Urlmon::URLDownloadToCacheFileW, LibraryLoader},
         UI::{
             Controls::{EM_SETMARGINS, EM_SETSEL, MARGINS},
             HiDpi,
@@ -81,8 +93,11 @@ const BACKGROUND_TIMER_ID: usize = 45;
 const LOADING_TIMER_ID: usize = 46;
 const TOPBAR_TIMER_ID: usize = 47;
 const DOWNLOAD_TIMER_ID: usize = 48;
+const SPLIT_MAX_PANES: usize = 4;
+const SPLIT_GAP: i32 = 6;
 const STATE_FILE: &str = ".aster-state";
 const FOCUS_EDIT_MSG: u32 = WM_APP + 1;
+const FAVICON_FETCHED_MSG: u32 = WM_APP + 2;
 const WM_COPYDATA: u32 = 0x004A;
 
 #[allow(non_snake_case)]
@@ -92,7 +107,6 @@ struct COPYDATASTRUCT {
     pub cbData: u32,
     pub lpData: *mut std::ffi::c_void,
 }
-
 
 thread_local! {
     static WITH_APP_GUARD: Cell<bool> = const { Cell::new(false) };
@@ -124,6 +138,12 @@ const MENU_ADDRESS_ZOOM_RESET: usize = 3803;
 const MENU_ADDRESS_ZOOM_IN: usize = 3804;
 const MENU_ADDRESS_CLEAR_RELOAD: usize = 3805;
 const MENU_BOOKMARK_OPEN_BASE: usize = 3900;
+const MENU_TAB_SPLIT_WITH_ACTIVE: usize = 4000;
+const MENU_TAB_SPLIT_NEXT: usize = 4001;
+const MENU_TAB_UNSPLIT: usize = 4002;
+const MENU_TAB_SPLIT_HORIZONTAL: usize = 4003;
+const MENU_TAB_SPLIT_VERTICAL: usize = 4004;
+const MENU_TAB_SPLIT_GRID: usize = 4005;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
 
@@ -200,6 +220,11 @@ struct FaviconBitmap {
     height: i32,
 }
 
+struct FaviconFetchResult {
+    host: String,
+    path: String,
+}
+
 impl Drop for FaviconBitmap {
     fn drop(&mut self) {
         unsafe {
@@ -261,6 +286,7 @@ struct Tab {
     folder_id: Option<usize>,
     pinned: bool,
     pinned_url: Option<String>,
+    split_group_id: Option<usize>,
     sidebar_order: u64,
     title: String,
     url: String,
@@ -277,6 +303,35 @@ struct Tab {
     unloaded: bool,
     is_sleeping: bool,
     is_loading: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitLayout {
+    Horizontal,
+    Vertical,
+    Grid,
+}
+
+struct SplitGroup {
+    id: usize,
+    workspace_id: usize,
+    tab_ids: Vec<usize>,
+    layout: SplitLayout,
+    active_tab_id: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitDropZone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SplitDropTarget {
+    target_tab_id: usize,
+    zone: SplitDropZone,
 }
 
 struct ClosedTab {
@@ -312,9 +367,153 @@ struct HistoryEntry {
 
 #[derive(Clone, Debug)]
 struct VisitedSite {
+    title: String,
     url: String,
     visit_count: u32,
     last_visit_time: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistorySortMode {
+    Latest,
+    Oldest,
+    MostVisited,
+}
+
+impl HistorySortMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Oldest => "oldest",
+            Self::MostVisited => "most_visited",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "oldest" => Self::Oldest,
+            "most_visited" => Self::MostVisited,
+            _ => Self::Latest,
+        }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PortableBookmark {
+    title: String,
+    url: String,
+    #[serde(default)]
+    folder: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    created_at: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PortableHistoryEntry {
+    title: String,
+    url: String,
+    #[serde(default = "default_visit_count")]
+    visit_count: u32,
+    #[serde(default)]
+    last_visit_time: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PortableCookie {
+    name: String,
+    value: String,
+    domain: String,
+    #[serde(default = "default_cookie_path")]
+    path: String,
+    #[serde(default)]
+    expires: Option<f64>,
+    #[serde(default)]
+    secure: bool,
+    #[serde(default)]
+    http_only: bool,
+    #[serde(default)]
+    same_site: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct AsterDataExport {
+    #[serde(default)]
+    app: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    exported_at: u64,
+    #[serde(default)]
+    bookmarks: Vec<PortableBookmark>,
+    #[serde(default)]
+    history: Vec<PortableHistoryEntry>,
+    #[serde(default)]
+    cookies: Vec<PortableCookie>,
+}
+
+#[derive(Deserialize)]
+struct ImportUploadFile {
+    name: String,
+    #[serde(default)]
+    path: String,
+    content: String,
+}
+
+#[derive(Default)]
+struct ImportStats {
+    bookmarks: usize,
+    history: usize,
+    cookies: usize,
+    accounts: usize,
+    skipped: usize,
+    errors: Vec<String>,
+}
+
+impl ImportStats {
+    fn absorb(&mut self, other: ImportStats) {
+        self.bookmarks += other.bookmarks;
+        self.history += other.history;
+        self.cookies += other.cookies;
+        self.accounts += other.accounts;
+        self.skipped += other.skipped;
+        self.errors.extend(other.errors);
+    }
+
+    fn message(&self) -> String {
+        let mut parts = Vec::new();
+        if self.bookmarks > 0 {
+            parts.push(format!("{} bookmarks", self.bookmarks));
+        }
+        if self.history > 0 {
+            parts.push(format!("{} history entries", self.history));
+        }
+        if self.cookies > 0 {
+            parts.push(format!("{} session cookies", self.cookies));
+        }
+        if self.accounts > 0 {
+            parts.push(format!("{} account cookies", self.accounts));
+        }
+        if parts.is_empty() && self.errors.is_empty() {
+            parts.push("No new data found".to_string());
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} duplicates skipped", self.skipped));
+        }
+        if !self.errors.is_empty() {
+            parts.push(format!("{} files need attention", self.errors.len()));
+        }
+        format!("Import complete: {}.", parts.join(", "))
+    }
+}
+
+fn default_visit_count() -> u32 {
+    1
+}
+
+fn default_cookie_path() -> String {
+    "/".to_string()
 }
 
 fn current_timestamp() -> u64 {
@@ -387,6 +586,7 @@ struct DragState {
 enum SidebarRow {
     Label(SidebarLabel),
     Folder(usize),
+    SplitGroup(usize),
     Tab(usize),
     TabGhost(usize),
 }
@@ -418,6 +618,7 @@ enum HoverTarget {
     Forward,
     Reload,
     Settings,
+    HistoryPage,
     SettingsPage,
     ModeRow,
     ModeAuto,
@@ -431,6 +632,8 @@ enum HoverTarget {
     FindPrev,
     FindNext,
     FindClose,
+    SplitLayout,
+    SplitUnsplit,
     MinButton,
     MaxButton,
     CloseButton,
@@ -562,6 +765,7 @@ struct UiFonts {
     small: HFONT,
     icon: HFONT,
     toolbar_icon: HFONT,
+    nav_icon: HFONT,
     url: HFONT,
 }
 
@@ -572,6 +776,7 @@ impl Drop for UiFonts {
             let _ = DeleteObject(HGDIOBJ(self.small.0));
             let _ = DeleteObject(HGDIOBJ(self.icon.0));
             let _ = DeleteObject(HGDIOBJ(self.toolbar_icon.0));
+            let _ = DeleteObject(HGDIOBJ(self.nav_icon.0));
             let _ = DeleteObject(HGDIOBJ(self.url.0));
         }
     }
@@ -612,9 +817,13 @@ struct App {
     bookmark_folders: Vec<BookmarkFolder>,
     bookmarks: Vec<Bookmark>,
     tabs: Vec<Tab>,
+    split_groups: Vec<SplitGroup>,
+    favicon_cache: HashMap<String, FaviconBitmap>,
+    pending_favicon_hosts: Vec<String>,
     active_workspace: usize,
     active: usize,
     next_id: usize,
+    next_split_group_id: usize,
     next_workspace_id: usize,
     next_folder_id: usize,
     next_bookmark_id: usize,
@@ -651,6 +860,9 @@ struct App {
     accent_color: u32,
     custom_keybinds: Vec<(String, String)>,
     site_mode: SiteMode,
+    history_sort_mode: HistorySortMode,
+    history_visit_sort_desc: bool,
+    import_export_notice: Option<String>,
     startup_mode: StartupMode,
     settings_open: bool,
     mode_menu_open: bool,
@@ -658,6 +870,7 @@ struct App {
     drag_state: Option<DragState>,
     drag_ghost: RefCell<Option<DragGhost>>,
     drop_target: Option<DropTarget>,
+    split_drop_target: Option<SplitDropTarget>,
     background_cache: RefCell<Option<BackgroundBitmap>>,
     visited_sites: Vec<VisitedSite>,
     command_open: bool,
@@ -729,6 +942,7 @@ impl App {
             small: create_font(12, 400)?,
             icon: create_font_with_face(18, 400, w!("Segoe Fluent Icons"))?,
             toolbar_icon: create_font_with_face(15, 400, w!("Segoe Fluent Icons"))?,
+            nav_icon: create_font_with_face(18, 400, w!("Segoe Fluent Icons"))?,
             url: create_font_with_face(13, 400, w!("Segoe UI Variable Text"))?,
         };
         let brushes = UiBrushes {
@@ -776,9 +990,13 @@ impl App {
             bookmark_folders: Vec::new(),
             bookmarks: Vec::new(),
             tabs: Vec::new(),
+            split_groups: Vec::new(),
+            favicon_cache: HashMap::new(),
+            pending_favicon_hosts: Vec::new(),
             active_workspace: 1,
             active: 0,
             next_id: 1,
+            next_split_group_id: 1,
             next_workspace_id: 2,
             next_folder_id: 1,
             next_bookmark_id: 1,
@@ -820,6 +1038,9 @@ impl App {
             accent_color: COLOR_ACCENT,
             custom_keybinds: Vec::new(),
             site_mode: SiteMode::Auto,
+            history_sort_mode: HistorySortMode::Latest,
+            history_visit_sort_desc: true,
+            import_export_notice: None,
             startup_mode: StartupMode::LastSession,
             settings_open: false,
             mode_menu_open: false,
@@ -827,6 +1048,7 @@ impl App {
             drag_state: None,
             drag_ghost: RefCell::new(None),
             drop_target: Some(DropTarget::None),
+            split_drop_target: None,
             background_cache: RefCell::new(None),
             visited_sites: Vec::new(),
             closed_tabs: Vec::new(),
@@ -868,7 +1090,7 @@ impl App {
         app.default_bubble_dismissed = false;
         app.show_default_bubble = !is_aster_default_browser();
         app.save_state();
-        
+
         let args: Vec<String> = std::env::args().collect();
         let mut startup_url = None;
         if args.len() > 1 {
@@ -890,14 +1112,14 @@ impl App {
                 app.switch_to(index, true);
             }
         }
-        
+
         if app.tabs.is_empty() {
             let _ = app.create_tab(DEFAULT_URL);
             if let Some(index) = app.active_tab_index() {
                 app.switch_to(index, true);
             }
         }
-        
+
         app.ensure_default_bookmark_folder();
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
@@ -1415,6 +1637,24 @@ impl App {
                     }
                 }
             }
+        } else if let Some(raw) = message.strip_prefix("settings:import-files:") {
+            let stats = self.import_uploaded_files(raw);
+            self.import_export_notice = Some(stats.message());
+            self.reload_settings_pages();
+        } else if message == "settings:clear-import-notice" {
+            self.import_export_notice = None;
+            self.reload_settings_pages();
+        } else if let Some(value) = message.strip_prefix("history:sort:") {
+            self.history_sort_mode = HistorySortMode::from_str(value);
+            self.reload_history_pages();
+        } else if let Some(value) = message.strip_prefix("history:visit-direction:") {
+            self.history_visit_sort_desc = value != "asc";
+            self.reload_history_pages();
+        } else if let Some(value) = message.strip_prefix("history:open:") {
+            let url = percent_decode(value);
+            if !url.trim().is_empty() {
+                let _ = self.create_tab(&url);
+            }
         }
         self.save_state();
         self.refresh();
@@ -1467,6 +1707,32 @@ impl App {
             "Go forward" => self.go_forward(),
             "Switch tab above" => self.switch_tab_above(),
             "Switch tab below" => self.switch_tab_below(),
+            "Split horizontal" => {
+                if self.active_split_group_id().is_some() {
+                    self.set_active_split_layout(SplitLayout::Horizontal);
+                } else if let Some(index) = self.active_tab_index() {
+                    self.split_tab_with_active(index, SplitLayout::Horizontal);
+                }
+            }
+            "Split vertical" => {
+                if self.active_split_group_id().is_some() {
+                    self.set_active_split_layout(SplitLayout::Vertical);
+                } else if let Some(index) = self.active_tab_index() {
+                    self.split_tab_with_active(index, SplitLayout::Vertical);
+                }
+            }
+            "Split grid" => {
+                if self.active_split_group_id().is_some() {
+                    self.set_active_split_layout(SplitLayout::Grid);
+                } else if let Some(index) = self.active_tab_index() {
+                    self.split_tab_with_active(index, SplitLayout::Grid);
+                }
+            }
+            "Unsplit tabs" => {
+                if let Some(group_id) = self.active_split_group_id() {
+                    self.unsplit_group(group_id);
+                }
+            }
             "Toggle fullscreen" => self.toggle_fullscreen(),
             _ => {}
         }
@@ -1514,6 +1780,7 @@ impl App {
             folder_id,
             pinned,
             pinned_url: if pinned { Some(url.to_string()) } else { None },
+            split_group_id: None,
             sidebar_order,
             title: "New Tab".to_string(),
             url: url.to_string(),
@@ -1544,6 +1811,8 @@ impl App {
         }
         if url == "aster:settings" {
             self.load_settings_page(index);
+        } else if url == "aster:history" {
+            self.load_history_page(index);
         } else {
             let wide = CoTaskMemPWSTR::from(url);
             unsafe {
@@ -1591,6 +1860,332 @@ impl App {
                 None
             }
         })
+    }
+
+    fn tab_index_by_id(&self, tab_id: usize) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == tab_id)
+    }
+
+    fn split_group_index(&self, group_id: usize) -> Option<usize> {
+        self.split_groups
+            .iter()
+            .position(|group| group.id == group_id)
+    }
+
+    fn split_group(&self, group_id: usize) -> Option<&SplitGroup> {
+        self.split_groups.iter().find(|group| group.id == group_id)
+    }
+
+    fn split_group_active_index(&self, group_id: usize) -> Option<usize> {
+        let group = self.split_group(group_id)?;
+        self.tab_index_by_id(group.active_tab_id).or_else(|| {
+            group
+                .tab_ids
+                .iter()
+                .find_map(|tab_id| self.tab_index_by_id(*tab_id))
+        })
+    }
+
+    fn split_group_for_tab_id(&self, tab_id: usize) -> Option<usize> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.split_group_id)
+    }
+
+    fn visible_tab_ids_for_index(&self, index: usize) -> Vec<usize> {
+        let Some(tab) = self.tabs.get(index) else {
+            return Vec::new();
+        };
+        if let Some(group_id) = tab.split_group_id {
+            if let Some(group) = self.split_group(group_id) {
+                return group
+                    .tab_ids
+                    .iter()
+                    .copied()
+                    .filter(|tab_id| {
+                        self.tabs.iter().any(|candidate| {
+                            candidate.id == *tab_id && candidate.workspace_id == tab.workspace_id
+                        })
+                    })
+                    .collect();
+            }
+        }
+        vec![tab.id]
+    }
+
+    #[allow(dead_code)]
+    fn sanitize_split_groups(&mut self) {
+        let mut surviving_groups = Vec::new();
+        for mut group in self.split_groups.drain(..) {
+            group.tab_ids.retain(|tab_id| {
+                self.tabs
+                    .iter()
+                    .any(|tab| tab.id == *tab_id && tab.workspace_id == group.workspace_id)
+            });
+            if group.tab_ids.len() >= 2 {
+                if !group.tab_ids.contains(&group.active_tab_id) {
+                    group.active_tab_id = group.tab_ids[0];
+                }
+                surviving_groups.push(group);
+            } else {
+                for tab in &mut self.tabs {
+                    if tab.split_group_id == Some(group.id) {
+                        tab.split_group_id = None;
+                    }
+                }
+            }
+        }
+        self.split_groups = surviving_groups;
+    }
+
+    fn detach_tab_from_split_by_id(&mut self, tab_id: usize) {
+        let Some(group_id) = self.split_group_for_tab_id(tab_id) else {
+            return;
+        };
+        if let Some(group_index) = self.split_group_index(group_id) {
+            let remaining = {
+                let group = &mut self.split_groups[group_index];
+                group.tab_ids.retain(|id| *id != tab_id);
+                if group.active_tab_id == tab_id {
+                    if let Some(next) = group.tab_ids.first().copied() {
+                        group.active_tab_id = next;
+                    }
+                }
+                group.tab_ids.clone()
+            };
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.split_group_id = None;
+            }
+            if remaining.len() < 2 {
+                for id in remaining {
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                        tab.split_group_id = None;
+                    }
+                }
+                self.split_groups.remove(group_index);
+            }
+        }
+    }
+
+    fn unsplit_group(&mut self, group_id: usize) {
+        if let Some(index) = self.split_group_index(group_id) {
+            let tab_ids = self.split_groups[index].tab_ids.clone();
+            for tab_id in tab_ids {
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.split_group_id = None;
+                }
+            }
+            self.split_groups.remove(index);
+            self.layout();
+            self.save_state();
+            self.refresh();
+        }
+    }
+
+    fn active_split_group_id(&self) -> Option<usize> {
+        self.active_tab_index()
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.split_group_id)
+    }
+
+    fn set_active_split_layout(&mut self, layout: SplitLayout) {
+        if let Some(group_id) = self.active_split_group_id() {
+            if let Some(group) = self
+                .split_groups
+                .iter_mut()
+                .find(|group| group.id == group_id)
+            {
+                group.layout = layout;
+                self.layout();
+                self.save_state();
+                self.refresh();
+            }
+        }
+    }
+
+    fn cycle_active_split_layout(&mut self) {
+        let next = self
+            .active_split_group_id()
+            .and_then(|group_id| self.split_group(group_id))
+            .map(|group| match group.layout {
+                SplitLayout::Horizontal => SplitLayout::Vertical,
+                SplitLayout::Vertical => SplitLayout::Grid,
+                SplitLayout::Grid => SplitLayout::Horizontal,
+            });
+        if let Some(layout) = next {
+            self.set_active_split_layout(layout);
+        }
+    }
+
+    fn split_tab_with_active(&mut self, index: usize, layout: SplitLayout) {
+        let Some(active_index) = self.active_tab_index() else {
+            return;
+        };
+        let target_index = if index == active_index {
+            self.active_workspace_tabs()
+                .into_iter()
+                .find(|candidate| *candidate != active_index)
+        } else {
+            Some(index)
+        };
+        let Some(target_index) = target_index else {
+            return;
+        };
+        let zone = match layout {
+            SplitLayout::Horizontal => SplitDropZone::Right,
+            SplitLayout::Vertical => SplitDropZone::Bottom,
+            SplitLayout::Grid => SplitDropZone::Right,
+        };
+        let Some(target_tab_id) = self.tabs.get(active_index).map(|tab| tab.id) else {
+            return;
+        };
+        let drop = SplitDropTarget {
+            target_tab_id,
+            zone,
+        };
+        self.apply_split_drop(target_index, drop, Some(layout));
+    }
+
+    fn apply_split_drop(
+        &mut self,
+        source_index: usize,
+        target: SplitDropTarget,
+        forced_layout: Option<SplitLayout>,
+    ) {
+        if source_index >= self.tabs.len() {
+            return;
+        }
+        let source_tab_id = self.tabs[source_index].id;
+        if source_tab_id == target.target_tab_id {
+            return;
+        }
+        let Some(target_index) = self.tab_index_by_id(target.target_tab_id) else {
+            return;
+        };
+        let target_workspace = self.tabs[target_index].workspace_id;
+        let target_folder = self.tabs[target_index].folder_id;
+        let target_pinned = self.tabs[target_index].pinned;
+        let target_group_id = self.tabs[target_index].split_group_id;
+        let source_group_id = self.split_group_for_tab_id(source_tab_id);
+
+        if source_group_id.is_some() && source_group_id == target_group_id {
+            let Some(group_id) = source_group_id else {
+                return;
+            };
+            let Some(group_index) = self.split_group_index(group_id) else {
+                return;
+            };
+            let group = &mut self.split_groups[group_index];
+            if let Some(layout) = forced_layout {
+                group.layout = layout;
+            } else {
+                group.layout = match target.zone {
+                    SplitDropZone::Left | SplitDropZone::Right => SplitLayout::Horizontal,
+                    SplitDropZone::Top | SplitDropZone::Bottom => SplitLayout::Vertical,
+                };
+            }
+            group.tab_ids.retain(|id| *id != source_tab_id);
+            let target_pos = group
+                .tab_ids
+                .iter()
+                .position(|id| *id == target.target_tab_id)
+                .unwrap_or(0);
+            let insert_at = match target.zone {
+                SplitDropZone::Left | SplitDropZone::Top => target_pos,
+                SplitDropZone::Right | SplitDropZone::Bottom => target_pos + 1,
+            }
+            .min(group.tab_ids.len());
+            group.tab_ids.insert(insert_at, source_tab_id);
+            group.active_tab_id = source_tab_id;
+            self.switch_to(source_index, true);
+            self.save_state();
+            self.refresh();
+            return;
+        }
+
+        if target_group_id
+            .and_then(|group_id| self.split_group(group_id))
+            .map(|group| group.tab_ids.len() >= SPLIT_MAX_PANES)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.detach_tab_from_split_by_id(source_tab_id);
+
+        let group_id = if let Some(group_id) = target_group_id {
+            group_id
+        } else {
+            let group_id = self.next_split_group_id;
+            self.next_split_group_id += 1;
+            self.split_groups.push(SplitGroup {
+                id: group_id,
+                workspace_id: target_workspace,
+                tab_ids: vec![target.target_tab_id],
+                layout: forced_layout.unwrap_or(match target.zone {
+                    SplitDropZone::Left | SplitDropZone::Right => SplitLayout::Horizontal,
+                    SplitDropZone::Top | SplitDropZone::Bottom => SplitLayout::Vertical,
+                }),
+                active_tab_id: target.target_tab_id,
+            });
+            if let Some(tab) = self.tabs.get_mut(target_index) {
+                tab.split_group_id = Some(group_id);
+            }
+            group_id
+        };
+
+        let Some(group_index) = self.split_group_index(group_id) else {
+            return;
+        };
+        if self.split_groups[group_index].tab_ids.len() >= SPLIT_MAX_PANES {
+            return;
+        }
+
+        let source_sidebar_order = self.allocate_sidebar_order();
+        if let Some(tab) = self.tabs.get_mut(source_index) {
+            tab.workspace_id = target_workspace;
+            tab.folder_id = target_folder;
+            tab.pinned = target_pinned;
+            tab.pinned_url = if target_pinned {
+                Some(tab.url.clone())
+            } else {
+                None
+            };
+            tab.split_group_id = Some(group_id);
+            tab.sidebar_order = source_sidebar_order;
+        }
+
+        let group = &mut self.split_groups[group_index];
+        group.workspace_id = target_workspace;
+        if let Some(layout) = forced_layout {
+            group.layout = layout;
+        } else {
+            group.layout = match target.zone {
+                SplitDropZone::Left | SplitDropZone::Right => SplitLayout::Horizontal,
+                SplitDropZone::Top | SplitDropZone::Bottom => SplitLayout::Vertical,
+            };
+        }
+        group.tab_ids.retain(|id| *id != source_tab_id);
+        let target_pos = group
+            .tab_ids
+            .iter()
+            .position(|id| *id == target.target_tab_id)
+            .unwrap_or(0);
+        let insert_at = match target.zone {
+            SplitDropZone::Left | SplitDropZone::Top => target_pos,
+            SplitDropZone::Right | SplitDropZone::Bottom => target_pos + 1,
+        }
+        .min(group.tab_ids.len());
+        group.tab_ids.insert(insert_at, source_tab_id);
+        group.active_tab_id = source_tab_id;
+
+        if let Some(source_index) = self.tab_index_by_id(source_tab_id) {
+            self.active_workspace = target_workspace;
+            self.switch_to(source_index, true);
+        }
+        self.save_state();
+        self.refresh();
     }
 
     fn set_workspace_active_tab(&mut self, workspace_id: usize, tab_id: usize) {
@@ -1666,10 +2261,21 @@ impl App {
     fn active_workspace_tabs(&self) -> Vec<usize> {
         self.sidebar_rows()
             .into_iter()
-            .filter_map(|row| match row {
-                SidebarRow::Tab(index) => Some(index),
-                SidebarRow::TabGhost(_) => None,
-                _ => None,
+            .flat_map(|row| match row {
+                SidebarRow::Tab(index) => vec![index],
+                SidebarRow::SplitGroup(group_id) => self
+                    .split_group(group_id)
+                    .map(|group| {
+                        group
+                            .tab_ids
+                            .iter()
+                            .filter_map(|tab_id| self.tab_index_by_id(*tab_id))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                SidebarRow::TabGhost(_) | SidebarRow::Folder(_) | SidebarRow::Label(_) => {
+                    Vec::new()
+                }
             })
             .collect()
     }
@@ -1884,6 +2490,22 @@ impl App {
                 .find(|folder| folder.id == folder_id)
                 .map(|folder| folder.sidebar_order)
                 .unwrap_or(u64::MAX),
+            SidebarRow::SplitGroup(group_id) => self
+                .split_group(group_id)
+                .map(|group| {
+                    group
+                        .tab_ids
+                        .iter()
+                        .filter_map(|tab_id| {
+                            self.tabs
+                                .iter()
+                                .find(|tab| tab.id == *tab_id)
+                                .map(|tab| tab.sidebar_order)
+                        })
+                        .min()
+                        .unwrap_or(u64::MAX)
+                })
+                .unwrap_or(u64::MAX),
             SidebarRow::Tab(tab_index) => self
                 .tabs
                 .get(tab_index)
@@ -1901,6 +2523,31 @@ impl App {
     fn sorted_sidebar_rows(&self, mut rows: Vec<SidebarRow>) -> Vec<SidebarRow> {
         rows.sort_by_key(|row| self.row_sidebar_order(*row));
         rows
+    }
+
+    fn coalesce_split_rows(&self, rows: Vec<SidebarRow>) -> Vec<SidebarRow> {
+        let mut seen_groups = Vec::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row {
+                SidebarRow::Tab(index) => {
+                    let group_id = self.tabs.get(index).and_then(|tab| tab.split_group_id);
+                    if let Some(group_id) = group_id {
+                        if !seen_groups.contains(&group_id) {
+                            seen_groups.push(group_id);
+                            out.push(SidebarRow::SplitGroup(group_id));
+                        }
+                    } else {
+                        out.push(row);
+                    }
+                }
+                SidebarRow::TabGhost(_) => out.push(row),
+                SidebarRow::Folder(_) | SidebarRow::Label(_) | SidebarRow::SplitGroup(_) => {
+                    out.push(row)
+                }
+            }
+        }
+        out
     }
 
     fn root_section_rows(&self, pinned: bool) -> Vec<SidebarRow> {
@@ -1923,7 +2570,7 @@ impl App {
                     && tab.folder_id.is_none()
             })
             .map(|(index, _)| SidebarRow::Tab(index));
-        self.sorted_sidebar_rows(folders.chain(tabs).collect())
+        self.coalesce_split_rows(self.sorted_sidebar_rows(folders.chain(tabs).collect()))
     }
 
     fn assign_row_sidebar_order(&mut self, row: SidebarRow, sidebar_order: u64) {
@@ -1940,6 +2587,17 @@ impl App {
             SidebarRow::Tab(tab_index) => {
                 if let Some(tab) = self.tabs.get_mut(tab_index) {
                     tab.sidebar_order = sidebar_order;
+                }
+            }
+            SidebarRow::SplitGroup(group_id) => {
+                let tab_ids = self
+                    .split_group(group_id)
+                    .map(|group| group.tab_ids.clone())
+                    .unwrap_or_default();
+                for (offset, tab_id) in tab_ids.into_iter().enumerate() {
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                        tab.sidebar_order = sidebar_order + offset as u64;
+                    }
                 }
             }
             SidebarRow::TabGhost(_) => {}
@@ -2001,7 +2659,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let child_tabs = child_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.sorted_sidebar_rows(child_folders.chain(child_tabs).collect()) {
+        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
+            child_folders.chain(child_tabs).collect(),
+        )) {
             rows.push(row);
             if let SidebarRow::Folder(child_folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == child_folder_id) {
@@ -2049,8 +2709,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let loose_pinned_tabs = loose_pinned_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.sorted_sidebar_rows(root_pinned_folders.chain(loose_pinned_tabs).collect())
-        {
+        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
+            root_pinned_folders.chain(loose_pinned_tabs).collect(),
+        )) {
             pinned_rows.push(row);
             if let SidebarRow::Folder(folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
@@ -2084,7 +2745,9 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         let loose_tabs = loose_tabs.into_iter().map(SidebarRow::Tab);
-        for row in self.sorted_sidebar_rows(root_unpinned_folders.chain(loose_tabs).collect()) {
+        for row in self.coalesce_split_rows(self.sorted_sidebar_rows(
+            root_unpinned_folders.chain(loose_tabs).collect(),
+        )) {
             unpinned_rows.push(row);
             if let SidebarRow::Folder(folder_id) = row {
                 if let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) {
@@ -2113,6 +2776,21 @@ impl App {
                                 SidebarRow::Tab(idx) => {
                                     !self.is_tab_in_folder_subtree(idx, from_folder_id)
                                 }
+                                SidebarRow::SplitGroup(group_id) => self
+                                    .split_group(group_id)
+                                    .map(|group| {
+                                        !group.tab_ids.iter().any(|tab_id| {
+                                            self.tab_index_by_id(*tab_id)
+                                                .map(|idx| {
+                                                    self.is_tab_in_folder_subtree(
+                                                        idx,
+                                                        from_folder_id,
+                                                    )
+                                                })
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                    .unwrap_or(true),
                                 SidebarRow::TabGhost(_) => false,
                                 SidebarRow::Label(_) => true,
                             })
@@ -2160,6 +2838,18 @@ impl App {
                             .into_iter()
                             .filter(|row| match *row {
                                 SidebarRow::Tab(idx) => duplicate_drag || idx != from_tab_index,
+                                SidebarRow::SplitGroup(group_id) => {
+                                    let from_tab_id =
+                                        self.tabs.get(from_tab_index).map(|tab| tab.id);
+                                    duplicate_drag
+                                        || self
+                                            .split_group(group_id)
+                                            .zip(from_tab_id)
+                                            .map(|(group, tab_id)| {
+                                                !group.tab_ids.contains(&tab_id)
+                                            })
+                                            .unwrap_or(true)
+                                }
                                 SidebarRow::TabGhost(_) => false,
                                 _ => true,
                             })
@@ -2237,6 +2927,7 @@ impl App {
             y += match skipped {
                 SidebarRow::Label(_) => 24,
                 SidebarRow::Folder(_) => 36,
+                SidebarRow::SplitGroup(_) => 50,
                 SidebarRow::Tab(_) | SidebarRow::TabGhost(_) => 44,
             };
         }
@@ -2244,6 +2935,7 @@ impl App {
             let height = match row {
                 SidebarRow::Label(_) => 24,
                 SidebarRow::Folder(_) => 36,
+                SidebarRow::SplitGroup(_) => 50,
                 SidebarRow::Tab(_) | SidebarRow::TabGhost(_) => 44,
             };
             if y + height > bottom_limit {
@@ -2261,6 +2953,33 @@ impl App {
             y += height;
         }
         rects
+    }
+
+    fn sidebar_row_contains_tab(&self, row: SidebarRow, index: usize) -> bool {
+        match row {
+            SidebarRow::Tab(row_index) => row_index == index,
+            SidebarRow::SplitGroup(group_id) => {
+                let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) else {
+                    return false;
+                };
+                self.split_group(group_id)
+                    .map(|group| group.tab_ids.contains(&tab_id))
+                    .unwrap_or(false)
+            }
+            SidebarRow::Label(_) | SidebarRow::Folder(_) | SidebarRow::TabGhost(_) => false,
+        }
+    }
+
+    fn sidebar_row_rect_for_tab(&self, index: usize) -> Option<RECT> {
+        self.sidebar_row_rects()
+            .into_iter()
+            .find_map(|(row, rect)| {
+                if self.sidebar_row_contains_tab(row, index) {
+                    Some(rect)
+                } else {
+                    None
+                }
+            })
     }
 
     fn topbar_pushed_height(&self) -> i32 {
@@ -2382,6 +3101,9 @@ impl App {
             if point_in_rect(x, y, rect) {
                 return match row {
                     SidebarRow::Folder(id) => Some(SidebarHit::Folder(id)),
+                    SidebarRow::SplitGroup(group_id) => {
+                        self.split_group_active_index(group_id).map(SidebarHit::Tab)
+                    }
                     SidebarRow::Tab(index) => Some(SidebarHit::Tab(index)),
                     SidebarRow::TabGhost(_) | SidebarRow::Label(_) => None,
                 };
@@ -2401,6 +3123,7 @@ impl App {
         self.bookmark_folders.clear();
         self.bookmarks.clear();
         self.tabs.clear();
+        self.split_groups.clear();
         self.workspace_active_tabs.clear();
         self.visited_sites.clear();
         self.custom_keybinds.clear();
@@ -2528,7 +3251,13 @@ impl App {
                         .get(3)
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or_else(|| current_timestamp());
+                    let title = parts
+                        .get(4)
+                        .filter(|title| !title.trim().is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| label_for_url(&url));
                     self.visited_sites.push(VisitedSite {
+                        title,
                         url,
                         visit_count,
                         last_visit_time,
@@ -2547,18 +3276,18 @@ impl App {
                     }
                 }
                 "setting" if parts.len() >= 3 => match parts[1].as_str() {
-                "dominant_color" => {
-                    if let Ok(color) = parts[2].parse::<u32>() {
-                        self.dominant_color = color;
+                    "dominant_color" => {
+                        if let Ok(color) = parts[2].parse::<u32>() {
+                            self.dominant_color = color;
+                        }
                     }
-                }
-                "secondary_color" => {
-                    if let Ok(color) = parts[2].parse::<u32>() {
-                        self.secondary_color = color;
-                        self.recreate_secondary_brush();
+                    "secondary_color" => {
+                        if let Ok(color) = parts[2].parse::<u32>() {
+                            self.secondary_color = color;
+                            self.recreate_secondary_brush();
+                        }
                     }
-                }
-                "accent_color" => {
+                    "accent_color" => {
                         if let Ok(color) = parts[2].parse::<u32>() {
                             self.accent_color = color;
                         }
@@ -2569,6 +3298,12 @@ impl App {
                             "light" => SiteMode::Light,
                             _ => SiteMode::Auto,
                         };
+                    }
+                    "history_sort_mode" => {
+                        self.history_sort_mode = HistorySortMode::from_str(&parts[2]);
+                    }
+                    "history_visit_sort_desc" => {
+                        self.history_visit_sort_desc = parts[2] != "asc";
                     }
                     "startup_mode" => {
                         self.startup_mode = match parts[2].as_str() {
@@ -2691,7 +3426,10 @@ impl App {
         let mut lines = Vec::new();
         lines.push(format!("active_workspace\t{}", self.active_workspace));
         lines.push(format!("setting\tdominant_color\t{}", self.dominant_color));
-        lines.push(format!("setting\tsecondary_color\t{}", self.secondary_color));
+        lines.push(format!(
+            "setting\tsecondary_color\t{}",
+            self.secondary_color
+        ));
         lines.push(format!("setting\taccent_color\t{}", self.accent_color));
         lines.push(format!(
             "setting\tsite_mode\t{}",
@@ -2699,6 +3437,18 @@ impl App {
                 SiteMode::Auto => "auto",
                 SiteMode::Dark => "dark",
                 SiteMode::Light => "light",
+            }
+        ));
+        lines.push(format!(
+            "setting\thistory_sort_mode\t{}",
+            self.history_sort_mode.as_str()
+        ));
+        lines.push(format!(
+            "setting\thistory_visit_sort_desc\t{}",
+            if self.history_visit_sort_desc {
+                "desc"
+            } else {
+                "asc"
             }
         ));
         lines.push(format!(
@@ -2710,7 +3460,11 @@ impl App {
         ));
         lines.push(format!(
             "setting\tdefault_bubble_dismissed\t{}",
-            if self.default_bubble_dismissed { "1" } else { "0" }
+            if self.default_bubble_dismissed {
+                "1"
+            } else {
+                "0"
+            }
         ));
         for (action, combo) in &self.custom_keybinds {
             lines.push(format!(
@@ -2793,10 +3547,11 @@ impl App {
         }
         for site in self.visited_sites.iter().take(500) {
             lines.push(format!(
-                "suggestion\t{}\t{}\t{}",
+                "suggestion\t{}\t{}\t{}\t{}",
                 escape_state(&site.url),
                 site.visit_count,
-                site.last_visit_time
+                site.last_visit_time,
+                escape_state(&site.title)
             ));
         }
         let _ = fs::write(state_path(), lines.join("\n"));
@@ -3549,6 +4304,7 @@ impl App {
     }
 
     fn update_tab_title(&mut self, tab_id: usize, title: String) {
+        let mut visited_update = None;
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             if tab.is_sleeping {
                 return;
@@ -3559,6 +4315,19 @@ impl App {
                 if let Some(entry) = tab.history.get_mut(tab.history_cursor) {
                     entry.title = tab.title.clone();
                 }
+                if !tab.url.trim().is_empty() && !tab.url.starts_with("aster:") {
+                    visited_update = Some((tab.url.clone(), tab.title.clone()));
+                }
+            }
+        }
+        if let Some((url, title)) = visited_update {
+            let norm_url = normalize_url_for_dedup(&url);
+            if let Some(site) = self
+                .visited_sites
+                .iter_mut()
+                .find(|item| normalize_url_for_dedup(&item.url) == norm_url)
+            {
+                site.title = title;
             }
         }
         self.save_state();
@@ -3640,7 +4409,7 @@ impl App {
                         tab.history_cursor = tab.history_cursor.saturating_sub(drain);
                     }
                 }
-                suggestion = Some(tab.url.clone());
+                suggestion = Some((tab.url.clone(), tab.title.clone()));
             }
             if Some(index) == active_index {
                 if tab.unloaded {
@@ -3650,19 +4419,35 @@ impl App {
                 }
             }
         }
-        if let Some(url) = suggestion {
-            self.remember_suggestion(url);
+        if let Some((url, title)) = suggestion {
+            self.remember_suggestion(url, title);
+        }
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+            let url = tab.url.clone();
+            let favicon_uri = tab.favicon_uri.clone();
+            self.request_favicon_for_url(&url, Some(&favicon_uri));
         }
         self.save_state();
         self.refresh();
     }
 
     fn update_tab_favicon_uri(&mut self, tab_id: usize, favicon_uri: String) {
+        let mut page_url = None;
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             if tab.is_sleeping {
                 return;
             }
             tab.favicon_uri = favicon_uri;
+            page_url = Some(tab.url.clone());
+        }
+        if let Some(url) = page_url {
+            let favicon_uri = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| tab.favicon_uri.clone())
+                .unwrap_or_default();
+            self.request_favicon_for_url(&url, Some(&favicon_uri));
         }
         self.refresh();
     }
@@ -3677,6 +4462,94 @@ impl App {
         self.refresh();
     }
 
+    fn request_missing_favicons(&mut self) {
+        let tab_requests: Vec<(String, String)> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.favicon_bitmap.is_none())
+            .map(|tab| (tab.url.clone(), tab.favicon_uri.clone()))
+            .collect();
+        for (url, favicon_uri) in tab_requests {
+            self.request_favicon_for_url(&url, Some(&favicon_uri));
+        }
+        let history_urls: Vec<String> = self
+            .visited_sites
+            .iter()
+            .take(80)
+            .map(|site| site.url.clone())
+            .collect();
+        for url in history_urls {
+            self.request_favicon_for_url(&url, None);
+        }
+    }
+
+    fn request_command_favicons(&mut self) {
+        let urls: Vec<String> = self
+            .command_suggestions()
+            .into_iter()
+            .take(16)
+            .map(|(_, _, url)| url)
+            .collect();
+        for url in urls {
+            self.request_favicon_for_url(&url, None);
+        }
+    }
+
+    fn request_favicon_for_url(&mut self, url: &str, known_favicon_uri: Option<&str>) {
+        if url.trim().is_empty() || url.starts_with("aster:") || url == "about:blank" {
+            return;
+        }
+        let host = display_host(url);
+        if host.is_empty()
+            || self.favicon_cache.contains_key(&host)
+            || self.pending_favicon_hosts.iter().any(|pending| pending == &host)
+        {
+            return;
+        }
+        let candidates = favicon_candidate_urls(url, known_favicon_uri);
+        if candidates.is_empty() {
+            return;
+        }
+        self.pending_favicon_hosts.push(host.clone());
+        let hwnd_raw = self.hwnd.0 as isize;
+        let page_url = url.to_string();
+        std::thread::spawn(move || {
+            let path = download_first_favicon(&candidates, &page_url).unwrap_or_default();
+            let result = Box::new(FaviconFetchResult { host, path });
+            let ptr = Box::into_raw(result);
+            let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+            let posted = unsafe {
+                WindowsAndMessaging::PostMessageW(
+                    Some(hwnd),
+                    FAVICON_FETCHED_MSG,
+                    WPARAM(ptr as usize),
+                    LPARAM(0),
+                )
+                .is_ok()
+            };
+            if !posted {
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        });
+    }
+
+    fn complete_favicon_fetch(&mut self, result: FaviconFetchResult) {
+        self.pending_favicon_hosts
+            .retain(|host| host != &result.host);
+        if result.path.is_empty() {
+            return;
+        }
+        if self.favicon_cache.contains_key(&result.host) {
+            return;
+        }
+        if let Some(bitmap) = decode_favicon_file(&result.path) {
+            self.favicon_cache.insert(result.host, bitmap);
+            self.refresh();
+        }
+    }
+
     fn update_tab_audio(&mut self, tab_id: usize, playing: Option<bool>, muted: Option<bool>) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             if let Some(playing) = playing {
@@ -3689,13 +4562,18 @@ impl App {
         self.refresh();
     }
 
-    fn remember_suggestion(&mut self, url: String) {
+    fn remember_suggestion(&mut self, url: String, title: String) {
         let value = url.trim();
-        if value.is_empty() || value == "about:blank" {
+        if value.is_empty() || value == "about:blank" || value.starts_with("aster:") {
             return;
         }
         let now = current_timestamp();
         let norm_value = normalize_url_for_dedup(value);
+        let title = if title.trim().is_empty() || title == "New Tab" {
+            label_for_url(value)
+        } else {
+            title.trim().to_string()
+        };
         if let Some(site) = self
             .visited_sites
             .iter_mut()
@@ -3703,11 +4581,13 @@ impl App {
         {
             site.visit_count += 1;
             site.last_visit_time = now;
+            site.title = title;
             if value.len() < site.url.len() {
                 site.url = value.to_string();
             }
         } else {
             self.visited_sites.push(VisitedSite {
+                title,
                 url: value.to_string(),
                 visit_count: 1,
                 last_visit_time: now,
@@ -3725,36 +4605,37 @@ impl App {
         }
         let workspace_id = self.tabs[index].workspace_id;
         self.active_workspace = workspace_id;
-        let mut needs_reload = false;
-        if let Some(tab) = self.tabs.get_mut(index) {
-            if wake_up {
+        let visible_tab_ids = self.visible_tab_ids_for_index(index);
+        let mut reloads: Vec<(usize, String)> = Vec::new();
+        for tab in &mut self.tabs {
+            let visible = tab.workspace_id == workspace_id && visible_tab_ids.contains(&tab.id);
+            if wake_up && visible {
                 if tab.is_sleeping {
-                    needs_reload = true;
+                    let url_to_load = tab.pinned_url.clone().unwrap_or_else(|| tab.url.clone());
+                    reloads.push((tab.id, url_to_load));
                     tab.is_sleeping = false;
                 }
                 tab.unloaded = false;
             }
-            if !tab.unloaded {
-                unsafe {
-                    let _ = WindowsAndMessaging::ShowWindow(
-                        tab.child_hwnd,
-                        WindowsAndMessaging::SW_SHOW,
-                    );
-                }
-            } else {
-                unsafe {
-                    let _ = WindowsAndMessaging::ShowWindow(
-                        tab.child_hwnd,
-                        WindowsAndMessaging::SW_HIDE,
-                    );
-                }
+            unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(
+                    tab.child_hwnd,
+                    if visible && !tab.unloaded {
+                        WindowsAndMessaging::SW_SHOW
+                    } else {
+                        WindowsAndMessaging::SW_HIDE
+                    },
+                );
+                let _ = tab.controller.SetIsVisible(visible && !tab.unloaded);
             }
         }
-        for (i, tab) in self.tabs.iter().enumerate() {
-            unsafe {
-                let _ = tab
-                    .controller
-                    .SetIsVisible(i == index && tab.workspace_id == workspace_id && !tab.unloaded);
+        if let Some(group_id) = self.tabs[index].split_group_id {
+            if let Some(group) = self
+                .split_groups
+                .iter_mut()
+                .find(|group| group.id == group_id)
+            {
+                group.active_tab_id = self.tabs[index].id;
             }
         }
         self.active = index;
@@ -3772,9 +4653,11 @@ impl App {
                 }
             }
         }
-        if needs_reload {
-            let tab = &self.tabs[index];
-            let url_to_load = tab.pinned_url.clone().unwrap_or_else(|| tab.url.clone());
+        for (tab_id, url_to_load) in reloads {
+            let Some(tab_index) = self.tab_index_by_id(tab_id) else {
+                continue;
+            };
+            let tab = &self.tabs[tab_index];
             let url_w = to_wide(&url_to_load);
             unsafe {
                 let _ = tab.webview.Navigate(PCWSTR(url_w.as_ptr()));
@@ -3831,6 +4714,8 @@ impl App {
         if self.tabs.is_empty() || index >= self.tabs.len() {
             return;
         }
+        let closing_tab_id = self.tabs[index].id;
+        self.detach_tab_from_split_by_id(closing_tab_id);
 
         if !self.tabs[index].pinned {
             let tab = &self.tabs[index];
@@ -3997,6 +4882,10 @@ impl App {
         let _ = self.create_tab("aster:settings");
     }
 
+    fn open_history_page(&mut self) {
+        let _ = self.create_tab("aster:history");
+    }
+
     fn navigate_active(&mut self, url: &str) {
         let Some(index) = self.active_tab_index() else {
             let _ = self.create_tab(url);
@@ -4004,6 +4893,10 @@ impl App {
         };
         if url == "aster:settings" {
             self.load_settings_page(index);
+            return;
+        }
+        if url == "aster:history" {
+            self.load_history_page(index);
             return;
         }
         if let Some(tab) = self.tabs.get_mut(index) {
@@ -4019,7 +4912,671 @@ impl App {
         self.refresh();
     }
 
+    fn load_history_page(&mut self, index: usize) {
+        let html = history_page_html(
+            self.dominant_color,
+            self.secondary_color,
+            self.accent_color,
+            self.history_sort_mode,
+            self.history_visit_sort_desc,
+            &self.visited_sites,
+        );
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.url = "aster:history".to_string();
+            tab.title = "Aster History".to_string();
+            tab.favicon_bitmap = render_glyph_favicon(18, 0xE81C, &self.fonts.icon, COLOR_ACCENT);
+            unsafe {
+                let html = CoTaskMemPWSTR::from(html.as_str());
+                let _ = tab.webview.NavigateToString(*html.as_ref().as_pcwstr());
+            }
+            set_window_text(self.address_hwnd, "aster:history");
+        }
+        self.save_state();
+        self.refresh();
+    }
+
+    fn reload_history_pages(&mut self) {
+        let indexes: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                if tab.url == "aster:history" {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for index in indexes {
+            self.load_history_page(index);
+        }
+    }
+
+    fn reload_settings_pages(&mut self) {
+        let indexes: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                if tab.url == "aster:settings" {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for index in indexes {
+            self.load_settings_page(index);
+        }
+    }
+
+    fn portable_bookmarks(&self) -> Vec<PortableBookmark> {
+        self.bookmarks
+            .iter()
+            .map(|bookmark| PortableBookmark {
+                title: bookmark.title.clone(),
+                url: bookmark.url.clone(),
+                folder: bookmark
+                    .folder_id
+                    .and_then(|id| self.bookmark_folders.iter().find(|folder| folder.id == id))
+                    .map(|folder| folder.name.clone())
+                    .unwrap_or_default(),
+                tags: bookmark.tags.clone(),
+                created_at: bookmark.created_at,
+            })
+            .collect()
+    }
+
+    fn portable_history(&self) -> Vec<PortableHistoryEntry> {
+        self.visited_sites
+            .iter()
+            .map(|site| PortableHistoryEntry {
+                title: site.title.clone(),
+                url: site.url.clone(),
+                visit_count: site.visit_count.max(1),
+                last_visit_time: site.last_visit_time,
+            })
+            .collect()
+    }
+
+    fn cookie_manager(&self) -> Option<ICoreWebView2CookieManager> {
+        let tab = self.tabs.get(self.active).or_else(|| self.tabs.first())?;
+        unsafe {
+            let webview2 = tab.webview.cast::<ICoreWebView2_2>().ok()?;
+            webview2.CookieManager().ok()
+        }
+    }
+
+    fn export_cookies(&self) -> Vec<PortableCookie> {
+        let Some(manager) = self.cookie_manager() else {
+            return Vec::new();
+        };
+        let cookies = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let output = cookies.clone();
+        let result = GetCookiesCompletedHandler::wait_for_async_operation(
+            Box::new(move |handler| unsafe {
+                let uri = CoTaskMemPWSTR::from("");
+                manager
+                    .GetCookies(*uri.as_ref().as_pcwstr(), &handler)
+                    .map_err(webview2_com::Error::WindowsError)
+            }),
+            Box::new(move |error_code, list| {
+                error_code?;
+                if let Some(list) = list {
+                    unsafe {
+                        let mut count = 0u32;
+                        let _ = list.Count(&mut count);
+                        for index in 0..count {
+                            if let Ok(cookie) = list.GetValueAtIndex(index) {
+                                if let Some(portable) = portable_cookie_from_webview(&cookie) {
+                                    output.borrow_mut().push(portable);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }),
+        );
+        if result.is_err() {
+            return Vec::new();
+        }
+        let exported = cookies.borrow().clone();
+        exported
+    }
+
+    fn aster_export_json(&self) -> String {
+        let export = AsterDataExport {
+            app: "Aster".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            exported_at: current_timestamp(),
+            bookmarks: self.portable_bookmarks(),
+            history: self.portable_history(),
+            cookies: self.export_cookies(),
+        };
+        serde_json::to_string_pretty(&export).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn bookmarks_export_html(&self) -> String {
+        let mut html = String::from(
+            "<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>Bookmarks</TITLE>\n<H1>Bookmarks</H1>\n<DL><p>\n",
+        );
+        for bookmark in &self.bookmarks {
+            html.push_str(&format!(
+                "    <DT><A HREF=\"{}\" ADD_DATE=\"{}\">{}</A>\n",
+                html_escape_attr(&bookmark.url),
+                bookmark.created_at,
+                html_escape_text(&bookmark.title)
+            ));
+        }
+        html.push_str("</DL><p>\n");
+        html
+    }
+
+    fn import_uploaded_files(&mut self, raw: &str) -> ImportStats {
+        let uploads: Vec<ImportUploadFile> = match serde_json::from_str(raw) {
+            Ok(files) => files,
+            Err(error) => {
+                let mut stats = ImportStats::default();
+                stats
+                    .errors
+                    .push(format!("Could not read dropped files: {error}"));
+                return stats;
+            }
+        };
+        let mut decoded = Vec::new();
+        for upload in uploads {
+            match decode_upload_content(&upload.content) {
+                Ok(bytes) => decoded.push((upload, bytes)),
+                Err(error) => {
+                    let mut stats = ImportStats::default();
+                    stats
+                        .errors
+                        .push(format!("{} could not be decoded: {error}", upload.name));
+                    return stats;
+                }
+            }
+        }
+
+        let chromium_key = decoded
+            .iter()
+            .find_map(|(_, bytes)| extract_chromium_profile_key(bytes));
+        let mut total = ImportStats::default();
+        for (upload, bytes) in decoded {
+            if extract_chromium_profile_key(&bytes).is_some() {
+                continue;
+            }
+            let mut stats = if looks_like_sqlite(&upload.name, &bytes) {
+                self.import_sqlite_data(&upload.name, &upload.path, &bytes, chromium_key.as_deref())
+            } else if looks_like_html(&upload.name, &bytes) {
+                self.import_bookmarks_html(&bytes)
+            } else {
+                self.import_json_data(&upload.name, &bytes)
+            };
+            if stats.bookmarks == 0
+                && stats.history == 0
+                && stats.cookies == 0
+                && stats.errors.is_empty()
+            {
+                stats.errors.push(format!(
+                    "{} did not contain supported browser data",
+                    upload.name
+                ));
+            }
+            total.absorb(stats);
+        }
+        self.save_state();
+        self.request_missing_favicons();
+        total
+    }
+
+    fn import_json_data(&mut self, name: &str, bytes: &[u8]) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            stats.errors.push(format!("{name} is not valid JSON"));
+            return stats;
+        };
+
+        if value.get("bookmarks").is_some()
+            || value.get("history").is_some()
+            || value.get("cookies").is_some()
+        {
+            match serde_json::from_value::<AsterDataExport>(value.clone()) {
+                Ok(export) => {
+                    stats.absorb(self.merge_portable_bookmarks(export.bookmarks));
+                    stats.absorb(self.merge_portable_history(export.history));
+                    stats.absorb(self.import_portable_cookies(export.cookies));
+                    return stats;
+                }
+                Err(error) => {
+                    stats.errors.push(format!(
+                        "{name} looked like an Aster export but failed: {error}"
+                    ));
+                    return stats;
+                }
+            }
+        }
+
+        let mut bookmarks = Vec::new();
+        collect_bookmarks_from_json(&value, "", &mut bookmarks);
+        if !bookmarks.is_empty() {
+            stats.absorb(self.merge_portable_bookmarks(bookmarks));
+        }
+
+        let mut history = Vec::new();
+        collect_history_from_json(&value, &mut history);
+        if !history.is_empty() {
+            stats.absorb(self.merge_portable_history(history));
+        }
+
+        let mut cookies = Vec::new();
+        collect_cookies_from_json(&value, &mut cookies);
+        if !cookies.is_empty() {
+            stats.absorb(self.import_portable_cookies(cookies));
+        }
+        stats
+    }
+
+    fn import_bookmarks_html(&mut self, bytes: &[u8]) -> ImportStats {
+        let Ok(raw) = std::str::from_utf8(bytes) else {
+            let mut stats = ImportStats::default();
+            stats
+                .errors
+                .push("Bookmark HTML was not UTF-8 text".to_string());
+            return stats;
+        };
+        self.merge_portable_bookmarks(parse_bookmark_html(raw))
+    }
+
+    fn import_sqlite_data(
+        &mut self,
+        name: &str,
+        path_hint: &str,
+        bytes: &[u8],
+        chromium_key: Option<&[u8]>,
+    ) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let temp_path = sqlite_temp_path(name, path_hint);
+        if let Err(error) = fs::write(&temp_path, bytes) {
+            stats.errors.push(format!(
+                "{name} could not be staged for SQLite import: {error}"
+            ));
+            return stats;
+        }
+
+        let result = (|| -> std::result::Result<ImportStats, String> {
+            let connection = Connection::open(&temp_path).map_err(|error| error.to_string())?;
+            let tables = sqlite_table_names(&connection);
+            let mut found = ImportStats::default();
+            if tables.iter().any(|table| table == "urls") {
+                found.absorb(self.import_chromium_history(&connection, name));
+            }
+            if tables.iter().any(|table| table == "moz_places") {
+                found.absorb(self.import_firefox_history(&connection, name));
+            }
+            if tables.iter().any(|table| table == "cookies") {
+                found.absorb(self.import_chromium_cookies(&connection, name, chromium_key));
+            }
+            if tables.iter().any(|table| table == "moz_cookies") {
+                found.absorb(self.import_firefox_cookies(&connection, name));
+            }
+            Ok(found)
+        })();
+
+        let _ = fs::remove_file(&temp_path);
+        match result {
+            Ok(found) => found,
+            Err(error) => {
+                stats.errors.push(format!(
+                    "{name} could not be parsed as browser SQLite: {error}"
+                ));
+                stats
+            }
+        }
+    }
+
+    fn import_chromium_history(&mut self, connection: &Connection, name: &str) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let mut statement = match connection.prepare(
+            "SELECT url, COALESCE(title,''), COALESCE(visit_count,1), COALESCE(last_visit_time,0) FROM urls",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{name} history table could not be read: {error}"));
+                return stats;
+            }
+        };
+        let rows = statement.query_map([], |row| {
+            Ok(PortableHistoryEntry {
+                url: row.get::<_, String>(0)?,
+                title: row.get::<_, String>(1)?,
+                visit_count: row.get::<_, u32>(2).unwrap_or(1),
+                last_visit_time: chrome_time_to_unix_secs(row.get::<_, i64>(3).unwrap_or(0)),
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let history = rows.filter_map(|row| row.ok()).collect();
+                stats.absorb(self.merge_portable_history(history));
+            }
+            Err(error) => stats
+                .errors
+                .push(format!("{name} history rows could not be read: {error}")),
+        }
+        stats
+    }
+
+    fn import_firefox_history(&mut self, connection: &Connection, name: &str) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let mut statement = match connection.prepare(
+            "SELECT url, COALESCE(title,''), COALESCE(visit_count,1), COALESCE(last_visit_date,0) FROM moz_places WHERE url IS NOT NULL",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{name} places table could not be read: {error}"));
+                return stats;
+            }
+        };
+        let rows = statement.query_map([], |row| {
+            let last_visit = row.get::<_, i64>(3).unwrap_or(0);
+            Ok(PortableHistoryEntry {
+                url: row.get::<_, String>(0)?,
+                title: row.get::<_, String>(1)?,
+                visit_count: row.get::<_, u32>(2).unwrap_or(1),
+                last_visit_time: if last_visit > 0 {
+                    (last_visit / 1_000_000).max(0) as u64
+                } else {
+                    current_timestamp()
+                },
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let history = rows.filter_map(|row| row.ok()).collect();
+                stats.absorb(self.merge_portable_history(history));
+            }
+            Err(error) => stats
+                .errors
+                .push(format!("{name} places rows could not be read: {error}")),
+        }
+        stats
+    }
+
+    fn import_chromium_cookies(
+        &mut self,
+        connection: &Connection,
+        name: &str,
+        chromium_key: Option<&[u8]>,
+    ) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let mut statement = match connection.prepare(
+            "SELECT host_key, name, path, COALESCE(expires_utc,0), COALESCE(is_secure,0), COALESCE(is_httponly,0), COALESCE(samesite,0), COALESCE(value,''), encrypted_value FROM cookies",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{name} cookies table could not be read: {error}"));
+                return stats;
+            }
+        };
+        let rows = statement.query_map([], |row| {
+            let encrypted = row.get::<_, Vec<u8>>(8).unwrap_or_default();
+            let mut value = row.get::<_, String>(7).unwrap_or_default();
+            if value.is_empty() {
+                value = chromium_key
+                    .and_then(|key| decrypt_chromium_cookie(&encrypted, key).ok())
+                    .or_else(|| {
+                        dpapi_decrypt(&encrypted)
+                            .ok()
+                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                    })
+                    .unwrap_or_default();
+            }
+            Ok(PortableCookie {
+                domain: row.get::<_, String>(0)?,
+                name: row.get::<_, String>(1)?,
+                path: row.get::<_, String>(2).unwrap_or_else(|_| "/".to_string()),
+                expires: Some(chrome_time_to_unix_secs(row.get::<_, i64>(3).unwrap_or(0)) as f64),
+                secure: row.get::<_, i32>(4).unwrap_or(0) != 0,
+                http_only: row.get::<_, i32>(5).unwrap_or(0) != 0,
+                same_site: same_site_from_chromium(row.get::<_, i32>(6).unwrap_or(0)),
+                value,
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let cookies = rows.filter_map(|row| row.ok()).collect();
+                stats.absorb(self.import_portable_cookies(cookies));
+            }
+            Err(error) => stats
+                .errors
+                .push(format!("{name} cookie rows could not be read: {error}")),
+        }
+        if chromium_key.is_none() && stats.cookies == 0 {
+            stats.errors.push(format!(
+                "{name} contains encrypted Chromium cookies. Drop the matching Local State file with it to import account sessions."
+            ));
+        }
+        stats
+    }
+
+    fn import_firefox_cookies(&mut self, connection: &Connection, name: &str) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let mut statement = match connection.prepare(
+            "SELECT host, name, value, path, COALESCE(expiry,0), COALESCE(isSecure,0), COALESCE(isHttpOnly,0), COALESCE(sameSite,0) FROM moz_cookies",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                stats
+                    .errors
+                    .push(format!("{name} cookies table could not be read: {error}"));
+                return stats;
+            }
+        };
+        let rows = statement.query_map([], |row| {
+            Ok(PortableCookie {
+                domain: row.get::<_, String>(0)?,
+                name: row.get::<_, String>(1)?,
+                value: row.get::<_, String>(2)?,
+                path: row.get::<_, String>(3).unwrap_or_else(|_| "/".to_string()),
+                expires: Some(row.get::<_, i64>(4).unwrap_or(0).max(0) as f64),
+                secure: row.get::<_, i32>(5).unwrap_or(0) != 0,
+                http_only: row.get::<_, i32>(6).unwrap_or(0) != 0,
+                same_site: same_site_from_firefox(row.get::<_, i32>(7).unwrap_or(0)),
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let cookies = rows.filter_map(|row| row.ok()).collect();
+                stats.absorb(self.import_portable_cookies(cookies));
+            }
+            Err(error) => stats
+                .errors
+                .push(format!("{name} cookie rows could not be read: {error}")),
+        }
+        stats
+    }
+
+    fn merge_portable_bookmarks(&mut self, bookmarks: Vec<PortableBookmark>) -> ImportStats {
+        let mut stats = ImportStats::default();
+        self.ensure_default_bookmark_folder();
+        for bookmark in bookmarks {
+            let url = normalize_address(&bookmark.url);
+            if url.starts_with("aster:") || url.trim().is_empty() {
+                stats.skipped += 1;
+                continue;
+            }
+            if self.bookmark_index_for_url(&url).is_some() {
+                stats.skipped += 1;
+                continue;
+            }
+            let folder_id = self.folder_id_for_imported_bookmark(&bookmark.folder);
+            let id = self.next_bookmark_id;
+            self.next_bookmark_id += 1;
+            let order = self.allocate_sidebar_order();
+            self.bookmarks.push(Bookmark {
+                id,
+                folder_id,
+                title: if bookmark.title.trim().is_empty() {
+                    label_for_url(&url)
+                } else {
+                    bookmark.title
+                },
+                url,
+                tags: bookmark.tags,
+                created_at: if bookmark.created_at == 0 {
+                    current_timestamp()
+                } else {
+                    bookmark.created_at
+                },
+                sidebar_order: order,
+            });
+            stats.bookmarks += 1;
+        }
+        stats
+    }
+
+    fn folder_id_for_imported_bookmark(&mut self, folder_name: &str) -> Option<usize> {
+        let name = folder_name.trim();
+        if name.is_empty() {
+            return self.bookmark_folders.first().map(|folder| folder.id);
+        }
+        if let Some(folder) = self
+            .bookmark_folders
+            .iter()
+            .find(|folder| folder.parent_id.is_none() && folder.name.eq_ignore_ascii_case(name))
+        {
+            return Some(folder.id);
+        }
+        let id = self.next_bookmark_folder_id;
+        self.next_bookmark_folder_id += 1;
+        let order = self.allocate_sidebar_order();
+        self.bookmark_folders.push(BookmarkFolder {
+            id,
+            parent_id: None,
+            name: name.to_string(),
+            sidebar_order: order,
+        });
+        Some(id)
+    }
+
+    fn merge_portable_history(&mut self, history: Vec<PortableHistoryEntry>) -> ImportStats {
+        let mut stats = ImportStats::default();
+        for entry in history {
+            let url = normalize_address(&entry.url);
+            if url.trim().is_empty() || url.starts_with("aster:") {
+                stats.skipped += 1;
+                continue;
+            }
+            let norm = normalize_url_for_dedup(&url);
+            let title = if entry.title.trim().is_empty() {
+                label_for_url(&url)
+            } else {
+                entry.title
+            };
+            if let Some(existing) = self
+                .visited_sites
+                .iter_mut()
+                .find(|site| normalize_url_for_dedup(&site.url) == norm)
+            {
+                existing.visit_count = existing.visit_count.max(entry.visit_count.max(1));
+                existing.last_visit_time = existing.last_visit_time.max(entry.last_visit_time);
+                if existing.title.trim().is_empty() {
+                    existing.title = title;
+                }
+                stats.skipped += 1;
+            } else {
+                self.visited_sites.push(VisitedSite {
+                    title,
+                    url,
+                    visit_count: entry.visit_count.max(1),
+                    last_visit_time: if entry.last_visit_time == 0 {
+                        current_timestamp()
+                    } else {
+                        entry.last_visit_time
+                    },
+                });
+                stats.history += 1;
+            }
+        }
+        if self.visited_sites.len() > 1000 {
+            self.visited_sites.sort_by_key(|site| site.last_visit_time);
+            let drain = self.visited_sites.len() - 1000;
+            self.visited_sites.drain(0..drain);
+        }
+        stats
+    }
+
+    fn import_portable_cookies(&mut self, cookies: Vec<PortableCookie>) -> ImportStats {
+        let mut stats = ImportStats::default();
+        let Some(manager) = self.cookie_manager() else {
+            if !cookies.is_empty() {
+                stats
+                    .errors
+                    .push("No active browser profile was available for cookie import".to_string());
+            }
+            return stats;
+        };
+        unsafe {
+            for portable in cookies {
+                if portable.name.trim().is_empty()
+                    || portable.domain.trim().is_empty()
+                    || portable.value.is_empty()
+                {
+                    stats.skipped += 1;
+                    continue;
+                }
+                let name = CoTaskMemPWSTR::from(portable.name.as_str());
+                let value = CoTaskMemPWSTR::from(portable.value.as_str());
+                let domain = CoTaskMemPWSTR::from(portable.domain.as_str());
+                let path = CoTaskMemPWSTR::from(if portable.path.trim().is_empty() {
+                    "/"
+                } else {
+                    portable.path.as_str()
+                });
+                match manager.CreateCookie(
+                    *name.as_ref().as_pcwstr(),
+                    *value.as_ref().as_pcwstr(),
+                    *domain.as_ref().as_pcwstr(),
+                    *path.as_ref().as_pcwstr(),
+                ) {
+                    Ok(cookie) => {
+                        if let Some(expires) = portable.expires {
+                            if expires > 0.0 {
+                                let _ = cookie.SetExpires(expires);
+                            }
+                        }
+                        let _ = cookie.SetIsSecure(portable.secure);
+                        let _ = cookie.SetIsHttpOnly(portable.http_only);
+                        let _ = cookie.SetSameSite(same_site_to_webview(&portable.same_site));
+                        if manager.AddOrUpdateCookie(&cookie).is_ok() {
+                            if is_account_cookie(&portable) {
+                                stats.accounts += 1;
+                            }
+                            stats.cookies += 1;
+                        } else {
+                            stats.skipped += 1;
+                        }
+                    }
+                    Err(error) => stats.errors.push(format!(
+                        "Cookie {} for {} could not be created: {error}",
+                        portable.name, portable.domain
+                    )),
+                }
+            }
+        }
+        stats
+    }
+
     fn load_settings_page(&mut self, index: usize) {
+        let export_json = self.aster_export_json();
+        let bookmarks_html = self.bookmarks_export_html();
         let html = settings_page_html(
             self.dominant_color,
             self.secondary_color,
@@ -4030,6 +5587,9 @@ impl App {
                 StartupMode::LastSession => "last",
             },
             is_aster_default_browser(),
+            &export_json,
+            &bookmarks_html,
+            self.import_export_notice.as_deref().unwrap_or(""),
         );
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.url = "aster:settings".to_string();
@@ -4073,6 +5633,7 @@ impl App {
             CommandMode::NewWorkspace | CommandMode::RenameWorkspace(_) => "Workspace name...",
         };
         set_edit_cue_banner(self.address_hwnd, cue);
+        self.request_command_favicons();
         self.layout();
         unsafe {
             let _ =
@@ -4542,7 +6103,7 @@ impl App {
         let bottom = settings.top - 8;
         RECT {
             left: 12,
-            top: bottom - 108,
+            top: bottom - 152,
             right: 196,
             bottom,
         }
@@ -4559,6 +6120,16 @@ impl App {
     }
 
     fn settings_page_row_rect(&self) -> RECT {
+        let row = self.history_page_row_rect();
+        RECT {
+            left: row.left,
+            top: row.bottom + 8,
+            right: row.right,
+            bottom: row.bottom + 44,
+        }
+    }
+
+    fn history_page_row_rect(&self) -> RECT {
         let row = self.mode_row_rect();
         RECT {
             left: row.left,
@@ -4592,6 +6163,47 @@ impl App {
             right: center + width / 2,
             bottom: y + 43,
         }
+    }
+
+    fn split_toolbar_rect(&self) -> Option<RECT> {
+        self.active_split_group_id()?;
+        if self.fullscreen {
+            return None;
+        }
+        let (min_btn, _, _) = self.window_button_rects();
+        let address = self.address_pill_rect();
+        let y = self.topbar_y();
+        let right = min_btn.left - 12;
+        let left = (right - 88).max(address.right + 10);
+        if right - left < 72 {
+            return None;
+        }
+        Some(RECT {
+            left,
+            top: y + 14,
+            right,
+            bottom: y + 44,
+        })
+    }
+
+    fn split_layout_button_rect(&self) -> Option<RECT> {
+        let toolbar = self.split_toolbar_rect()?;
+        Some(RECT {
+            left: toolbar.left + 4,
+            top: toolbar.top + 3,
+            right: toolbar.left + 32,
+            bottom: toolbar.bottom - 3,
+        })
+    }
+
+    fn split_unsplit_button_rect(&self) -> Option<RECT> {
+        let toolbar = self.split_toolbar_rect()?;
+        Some(RECT {
+            left: toolbar.right - 32,
+            top: toolbar.top + 3,
+            right: toolbar.right - 4,
+            bottom: toolbar.bottom - 3,
+        })
     }
 
     fn window_button_rects(&self) -> (RECT, RECT, RECT) {
@@ -4715,6 +6327,7 @@ impl App {
                     true
                 } else {
                     site.url.to_ascii_lowercase().contains(&query)
+                        || site.title.to_ascii_lowercase().contains(&query)
                         || extract_search_query(&site.url)
                             .map(|q| q.to_ascii_lowercase().contains(&query))
                             .unwrap_or(false)
@@ -4739,7 +6352,12 @@ impl App {
             {
                 continue;
             }
-            rows.push((None, label_for_url(&site.url), site.url.clone()));
+            let title = if site.title.trim().is_empty() {
+                label_for_url(&site.url)
+            } else {
+                site.title.clone()
+            };
+            rows.push((None, title, site.url.clone()));
         }
 
         // 4. If there is a query, sort the results to prioritize prefix matches
@@ -4834,6 +6452,346 @@ impl App {
         1.0
     }
 
+    fn web_content_bounds(&self) -> RECT {
+        let rect = client_rect(self.hwnd);
+        let sidebar_width = self.sidebar_width();
+        let pushed_left = sidebar_width;
+        if self.fullscreen {
+            RECT {
+                left: 0,
+                top: 0,
+                right: rect.right,
+                bottom: rect.bottom,
+            }
+        } else {
+            match self.sidebar_mode {
+                SidebarMode::Hidden => {
+                    if self.sidebar_target >= SIDEBAR_EXPANDED {
+                        match self.sidebar_expand_mode {
+                            SidebarMode::Overlay => RECT {
+                                left: 0,
+                                top: self.topbar_pushed_height(),
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                            SidebarMode::Pushed => RECT {
+                                left: pushed_left,
+                                top: self.topbar_pushed_height(),
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                            _ => RECT {
+                                left: HOVER_ZONE,
+                                top: self.topbar_pushed_height(),
+                                right: rect.right,
+                                bottom: rect.bottom,
+                            },
+                        }
+                    } else {
+                        RECT {
+                            left: 0,
+                            top: self.topbar_pushed_height(),
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        }
+                    }
+                }
+                SidebarMode::Overlay => RECT {
+                    left: 0,
+                    top: self.topbar_pushed_height(),
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                SidebarMode::Pushed => RECT {
+                    left: pushed_left,
+                    top: self.topbar_pushed_height(),
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+            }
+        }
+    }
+
+    fn split_layout_rects_for(&self, bounds: RECT, layout: SplitLayout, count: usize) -> Vec<RECT> {
+        let count = count.clamp(1, SPLIT_MAX_PANES);
+        let width = (bounds.right - bounds.left).max(1);
+        let height = (bounds.bottom - bounds.top).max(1);
+        match layout {
+            SplitLayout::Horizontal => {
+                let total_gap = SPLIT_GAP * (count as i32 - 1).max(0);
+                let pane_width = (width - total_gap).max(count as i32) / count as i32;
+                (0..count)
+                    .map(|i| {
+                        let left = bounds.left + i as i32 * (pane_width + SPLIT_GAP);
+                        let right = if i + 1 == count {
+                            bounds.right
+                        } else {
+                            left + pane_width
+                        };
+                        RECT {
+                            left,
+                            top: bounds.top,
+                            right,
+                            bottom: bounds.bottom,
+                        }
+                    })
+                    .collect()
+            }
+            SplitLayout::Vertical => {
+                let total_gap = SPLIT_GAP * (count as i32 - 1).max(0);
+                let pane_height = (height - total_gap).max(count as i32) / count as i32;
+                (0..count)
+                    .map(|i| {
+                        let top = bounds.top + i as i32 * (pane_height + SPLIT_GAP);
+                        let bottom = if i + 1 == count {
+                            bounds.bottom
+                        } else {
+                            top + pane_height
+                        };
+                        RECT {
+                            left: bounds.left,
+                            top,
+                            right: bounds.right,
+                            bottom,
+                        }
+                    })
+                    .collect()
+            }
+            SplitLayout::Grid => {
+                let cols = match count {
+                    1 => 1,
+                    2 => 2,
+                    _ => 2,
+                };
+                let rows = count.div_ceil(cols).max(1);
+                let total_gap_x = SPLIT_GAP * (cols as i32 - 1).max(0);
+                let total_gap_y = SPLIT_GAP * (rows as i32 - 1).max(0);
+                let pane_width = (width - total_gap_x).max(cols as i32) / cols as i32;
+                let pane_height = (height - total_gap_y).max(rows as i32) / rows as i32;
+                (0..count)
+                    .map(|i| {
+                        let col = i % cols;
+                        let row = i / cols;
+                        let left = bounds.left + col as i32 * (pane_width + SPLIT_GAP);
+                        let top = bounds.top + row as i32 * (pane_height + SPLIT_GAP);
+                        RECT {
+                            left,
+                            top,
+                            right: if col + 1 == cols {
+                                bounds.right
+                            } else {
+                                left + pane_width
+                            },
+                            bottom: if row + 1 == rows {
+                                bounds.bottom
+                            } else {
+                                top + pane_height
+                            },
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn active_pane_rects(&self, bounds: RECT) -> Vec<(usize, RECT)> {
+        let Some(active_index) = self.active_tab_index() else {
+            return Vec::new();
+        };
+        let Some(active_tab) = self.tabs.get(active_index) else {
+            return Vec::new();
+        };
+        if let Some(group_id) = active_tab.split_group_id {
+            if let Some(group) = self.split_group(group_id) {
+                let rects =
+                    self.split_layout_rects_for(bounds, group.layout, group.tab_ids.len());
+                return group
+                    .tab_ids
+                    .iter()
+                    .copied()
+                    .zip(rects)
+                    .collect();
+            }
+        }
+        vec![(active_tab.id, bounds)]
+    }
+
+    fn split_preview_pane_rects(&self, bounds: RECT) -> Option<(Vec<(usize, RECT)>, RECT)> {
+        let target = self.split_drop_target?;
+        let drag = self.drag_state?;
+        let DragSource::Tab(source_index) = drag.source else {
+            return None;
+        };
+        let source_tab_id = self.tabs.get(source_index).map(|tab| tab.id)?;
+        if source_tab_id == target.target_tab_id {
+            return None;
+        }
+        let mut tab_ids = self
+            .split_group_for_tab_id(target.target_tab_id)
+            .and_then(|group_id| self.split_group(group_id))
+            .map(|group| group.tab_ids.clone())
+            .unwrap_or_else(|| vec![target.target_tab_id]);
+        tab_ids.retain(|tab_id| *tab_id != source_tab_id);
+        let target_pos = tab_ids
+            .iter()
+            .position(|tab_id| *tab_id == target.target_tab_id)?;
+        if tab_ids.len() + 1 > SPLIT_MAX_PANES {
+            return None;
+        }
+        let insert_at = match target.zone {
+            SplitDropZone::Left | SplitDropZone::Top => target_pos,
+            SplitDropZone::Right | SplitDropZone::Bottom => target_pos + 1,
+        }
+        .min(tab_ids.len());
+        let mut slots: Vec<Option<usize>> = tab_ids.into_iter().map(Some).collect();
+        slots.insert(insert_at, None);
+        let layout = match target.zone {
+            SplitDropZone::Left | SplitDropZone::Right => SplitLayout::Horizontal,
+            SplitDropZone::Top | SplitDropZone::Bottom => SplitLayout::Vertical,
+        };
+        let rects = self.split_layout_rects_for(bounds, layout, slots.len());
+        let mut existing = Vec::new();
+        let mut placeholder = None;
+        for (slot, rect) in slots.into_iter().zip(rects) {
+            if let Some(tab_id) = slot {
+                existing.push((tab_id, rect));
+            } else {
+                placeholder = Some(rect);
+            }
+        }
+        placeholder.map(|placeholder| (existing, placeholder))
+    }
+
+    fn shrink_rect_for_split_preview(&self, rect: RECT, zone: SplitDropZone) -> RECT {
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
+        match zone {
+            SplitDropZone::Left => RECT {
+                left: rect.left + (width * 34 / 100).max(96),
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            SplitDropZone::Right => RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right - (width * 34 / 100).max(96),
+                bottom: rect.bottom,
+            },
+            SplitDropZone::Top => RECT {
+                left: rect.left,
+                top: rect.top + (height * 34 / 100).max(96),
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+            SplitDropZone::Bottom => RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom - (height * 34 / 100).max(96),
+            },
+        }
+    }
+
+    fn split_placeholder_rect(&self) -> Option<RECT> {
+        if let Some((_, placeholder)) = self.split_preview_pane_rects(self.web_content_bounds()) {
+            return Some(placeholder);
+        }
+        let target = self.split_drop_target?;
+        let bounds = self.web_content_bounds();
+        let pane = self
+            .active_pane_rects(bounds)
+            .into_iter()
+            .find(|(tab_id, _)| *tab_id == target.target_tab_id)
+            .map(|(_, rect)| rect)?;
+        let shrunken = self.shrink_rect_for_split_preview(pane, target.zone);
+        Some(match target.zone {
+            SplitDropZone::Left => RECT {
+                left: pane.left,
+                top: pane.top,
+                right: shrunken.left - SPLIT_GAP,
+                bottom: pane.bottom,
+            },
+            SplitDropZone::Right => RECT {
+                left: shrunken.right + SPLIT_GAP,
+                top: pane.top,
+                right: pane.right,
+                bottom: pane.bottom,
+            },
+            SplitDropZone::Top => RECT {
+                left: pane.left,
+                top: pane.top,
+                right: pane.right,
+                bottom: shrunken.top - SPLIT_GAP,
+            },
+            SplitDropZone::Bottom => RECT {
+                left: pane.left,
+                top: shrunken.bottom + SPLIT_GAP,
+                right: pane.right,
+                bottom: pane.bottom,
+            },
+        })
+    }
+
+    fn split_drop_zone_for_point(&self, rect: RECT, x: i32, y: i32) -> SplitDropZone {
+        let left = (x - rect.left).abs();
+        let right = (rect.right - x).abs();
+        let top = (y - rect.top).abs();
+        let bottom = (rect.bottom - y).abs();
+        let mut best = (left, SplitDropZone::Left);
+        if right < best.0 {
+            best = (right, SplitDropZone::Right);
+        }
+        if top < best.0 {
+            best = (top, SplitDropZone::Top);
+        }
+        if bottom < best.0 {
+            best = (bottom, SplitDropZone::Bottom);
+        }
+        best.1
+    }
+
+    fn calculate_split_drop_target(&self, x: i32, y: i32) -> Option<SplitDropTarget> {
+        let drag = self.drag_state?;
+        if !drag.active {
+            return None;
+        }
+        let DragSource::Tab(source_index) = drag.source else {
+            return None;
+        };
+        let source_tab_id = self.tabs.get(source_index).map(|tab| tab.id)?;
+        let bounds = self.web_content_bounds();
+        if self.sidebar_width() > 92 && (x as f32) < self.sidebar_width {
+            return None;
+        }
+        if self.topbar_height > 1.0 && y < self.topbar_height as i32 {
+            return None;
+        }
+        if !point_in_rect(x, y, bounds) {
+            return None;
+        }
+        for (target_tab_id, rect) in self.active_pane_rects(bounds) {
+            if !point_in_rect(x, y, rect) || target_tab_id == source_tab_id {
+                continue;
+            }
+            let target_group_len = self
+                .split_group_for_tab_id(target_tab_id)
+                .and_then(|group_id| self.split_group(group_id))
+                .map(|group| group.tab_ids.len())
+                .unwrap_or(1);
+            let same_group = self.split_group_for_tab_id(source_tab_id)
+                == self.split_group_for_tab_id(target_tab_id);
+            if target_group_len >= SPLIT_MAX_PANES && !same_group {
+                return None;
+            }
+            return Some(SplitDropTarget {
+                target_tab_id,
+                zone: self.split_drop_zone_for_point(rect, x, y),
+            });
+        }
+        None
+    }
+
     fn layout(&self) {
         let rect = client_rect(self.hwnd);
         unsafe {
@@ -4897,61 +6855,7 @@ impl App {
         }
 
         let sidebar_width = self.sidebar_width();
-        let pushed_left = sidebar_width;
-        let bounds = if self.fullscreen {
-            RECT {
-                left: 0,
-                top: 0,
-                right: rect.right,
-                bottom: rect.bottom,
-            }
-        } else {
-            match self.sidebar_mode {
-                SidebarMode::Hidden => {
-                    if self.sidebar_target >= SIDEBAR_EXPANDED {
-                        match self.sidebar_expand_mode {
-                            SidebarMode::Overlay => RECT {
-                                left: 0,
-                                top: self.topbar_pushed_height(),
-                                right: rect.right,
-                                bottom: rect.bottom,
-                            },
-                            SidebarMode::Pushed => RECT {
-                                left: pushed_left,
-                                top: self.topbar_pushed_height(),
-                                right: rect.right,
-                                bottom: rect.bottom,
-                            },
-                            _ => RECT {
-                                left: HOVER_ZONE,
-                                top: self.topbar_pushed_height(),
-                                right: rect.right,
-                                bottom: rect.bottom,
-                            },
-                        }
-                    } else {
-                        RECT {
-                            left: 0,
-                            top: self.topbar_pushed_height(),
-                            right: rect.right,
-                            bottom: rect.bottom,
-                        }
-                    }
-                }
-                SidebarMode::Overlay => RECT {
-                    left: 0,
-                    top: self.topbar_pushed_height(),
-                    right: rect.right,
-                    bottom: rect.bottom,
-                },
-                SidebarMode::Pushed => RECT {
-                    left: pushed_left,
-                    top: self.topbar_pushed_height(),
-                    right: rect.right,
-                    bottom: rect.bottom,
-                },
-            }
-        };
+        let bounds = self.web_content_bounds();
         let last = self.last_bounds_rect.get();
         let size_changed = bounds.left != last.left
             || bounds.right != last.right
@@ -4975,18 +6879,28 @@ impl App {
         let was_clipped = self.last_clip_width.get() != 0.0 || self.last_clip_top.get() != 0.0;
         let should_clear =
             (!needs_clipping || (sidebar_width <= 0 && self.topbar_height <= 0.0)) && was_clipped;
-        for (i, tab) in self.tabs.iter().enumerate() {
+        let active_panes = self
+            .split_preview_pane_rects(bounds)
+            .map(|(panes, _)| panes)
+            .unwrap_or_else(|| self.active_pane_rects(bounds));
+        for tab in self.tabs.iter() {
             unsafe {
-                let is_active = Some(i) == self.active_tab_index();
-                if is_active {
-                    let _ = tab.controller.SetBounds(bounds);
+                let pane_rect = active_panes
+                    .iter()
+                    .find(|(tab_id, _)| *tab_id == tab.id)
+                    .map(|(_, rect)| *rect);
+                let is_visible = pane_rect.is_some()
+                    && tab.workspace_id == self.active_workspace
+                    && !tab.unloaded;
+                if let Some(tab_bounds) = pane_rect {
+                    let _ = tab.controller.SetBounds(tab_bounds);
                     let _ = WindowsAndMessaging::SetWindowPos(
                         tab.child_hwnd,
                         None,
-                        bounds.left,
-                        bounds.top,
-                        bounds.right - bounds.left,
-                        bounds.bottom - bounds.top,
+                        tab_bounds.left,
+                        tab_bounds.top,
+                        tab_bounds.right - tab_bounds.left,
+                        tab_bounds.bottom - tab_bounds.top,
                         WindowsAndMessaging::SWP_NOZORDER | WindowsAndMessaging::SWP_NOACTIVATE,
                     );
                 }
@@ -5006,7 +6920,7 @@ impl App {
                 } else if should_clear {
                     let _ = SetWindowRgn(tab.child_hwnd, None, true);
                 }
-                let _ = tab.controller.SetIsVisible(is_active && !tab.unloaded);
+                let _ = tab.controller.SetIsVisible(is_visible);
             }
         }
         unsafe {
@@ -5135,14 +7049,14 @@ impl App {
                 back,
                 IconKind::Back,
                 self.hover_target == Some(HoverTarget::Back),
-                &self.fonts.toolbar_icon,
+                &self.fonts.nav_icon,
             );
             draw_toolbar_icon_button(
                 hdc,
                 forward,
                 IconKind::Forward,
                 self.hover_target == Some(HoverTarget::Forward),
-                &self.fonts.toolbar_icon,
+                &self.fonts.nav_icon,
             );
             draw_toolbar_icon_button(
                 hdc,
@@ -5361,6 +7275,9 @@ impl App {
                 }
             }
 
+            self.paint_split_toolbar(hdc);
+            self.paint_split_drop_overlay(hdc);
+
             if sidebar_width > 92 {
                 self.paint_workspace_header(hdc);
                 let has_pinned = self
@@ -5397,6 +7314,9 @@ impl App {
                         SidebarRow::Label(label) => self.paint_sidebar_label(hdc, label, row_rect),
                         SidebarRow::Folder(folder_id) => {
                             self.paint_folder_row(hdc, folder_id, row_rect)
+                        }
+                        SidebarRow::SplitGroup(group_id) => {
+                            self.paint_split_group_row(hdc, group_id, row_rect)
                         }
                         SidebarRow::Tab(index) => {
                             if let Some(tab) = self.tabs.get(index) {
@@ -5593,7 +7513,14 @@ impl App {
                     let _ = SetViewportOrgEx(mem_dc, -rect.left, -rect.top, None);
 
                     // 1. Draw rounded slate-grey background onto mem_dc (clipped to round region in local coordinates)
-                    let rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+                    let rgn = CreateRoundRectRgn(
+                        rect.left,
+                        rect.top,
+                        rect.right + 1,
+                        rect.bottom + 1,
+                        16,
+                        16,
+                    );
                     let _ = SelectClipRgn(mem_dc, Some(rgn));
                     fill_rect(
                         mem_dc,
@@ -5613,11 +7540,22 @@ impl App {
 
                     // 3. Draw close button
                     let close_rect = self.default_bubble_close_rect().unwrap();
-                    let is_close_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleClose);
+                    let is_close_hovered =
+                        self.hover_target == Some(HoverTarget::DefaultBubbleClose);
                     if is_close_hovered {
                         fill_round_rect(mem_dc, close_rect, COLOR_SURFACE_HOVER, 6);
                     }
-                    draw_icon_glyph(mem_dc, &self.fonts.toolbar_icon, "\u{E8BB}", close_rect, if is_close_hovered { 0xffffff } else { COLOR_MUTED });
+                    draw_icon_glyph(
+                        mem_dc,
+                        &self.fonts.toolbar_icon,
+                        "\u{E8BB}",
+                        close_rect,
+                        if is_close_hovered {
+                            0xffffff
+                        } else {
+                            COLOR_MUTED
+                        },
+                    );
 
                     // 4. Draw messages
                     let line1_rect = RECT {
@@ -5626,7 +7564,13 @@ impl App {
                         right: rect.right - 36,
                         bottom: rect.top + 28,
                     };
-                    draw_text(mem_dc, &self.fonts.body, "Make Aster default browser?", line1_rect, COLOR_TEXT);
+                    draw_text(
+                        mem_dc,
+                        &self.fonts.body,
+                        "Make Aster default browser?",
+                        line1_rect,
+                        COLOR_TEXT,
+                    );
 
                     let line2_rect = RECT {
                         left: rect.left + 14,
@@ -5634,32 +7578,48 @@ impl App {
                         right: rect.right - 36,
                         bottom: rect.top + 46,
                     };
-                    draw_text(mem_dc, &self.fonts.small, "For a faster web experience.", line2_rect, COLOR_MUTED);
+                    draw_text(
+                        mem_dc,
+                        &self.fonts.small,
+                        "For a faster web experience.",
+                        line2_rect,
+                        COLOR_MUTED,
+                    );
 
                     // 5. Draw primary action button
                     let btn_rect = self.default_bubble_button_rect().unwrap();
-                    let is_btn_hovered = self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
+                    let is_btn_hovered =
+                        self.hover_target == Some(HoverTarget::DefaultBubbleSetDefault);
                     let btn_bg = if is_btn_hovered {
                         self.accent_color
                     } else {
                         0x343434
                     };
-                    let btn_fg = if is_btn_hovered {
-                        0x000000
-                    } else {
-                        0xffffff
-                    };
+                    let btn_fg = if is_btn_hovered { 0x000000 } else { 0xffffff };
                     fill_round_rect(mem_dc, btn_rect, btn_bg, 8);
                     if !is_btn_hovered {
                         draw_outline(mem_dc, btn_rect, 0x454545, 8);
                     }
-                    draw_centered_text(mem_dc, &self.fonts.body, "Set as Default", btn_rect, btn_fg);
+                    draw_centered_text(
+                        mem_dc,
+                        &self.fonts.body,
+                        "Set as Default",
+                        btn_rect,
+                        btn_fg,
+                    );
 
                     // Reset viewport origin before alpha blending onto the destination
                     let _ = SetViewportOrgEx(mem_dc, 0, 0, None);
 
                     // Select a rounded clip region on the destination hdc to cleanly truncate corners
-                    let dest_rgn = CreateRoundRectRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1, 16, 16);
+                    let dest_rgn = CreateRoundRectRgn(
+                        rect.left,
+                        rect.top,
+                        rect.right + 1,
+                        rect.bottom + 1,
+                        16,
+                        16,
+                    );
                     let _ = SelectClipRgn(hdc, Some(dest_rgn));
 
                     let blend = BLENDFUNCTION {
@@ -5670,17 +7630,7 @@ impl App {
                     };
 
                     let _ = AlphaBlend(
-                        hdc,
-                        rect.left,
-                        rect.top,
-                        width,
-                        height,
-                        mem_dc,
-                        0,
-                        0,
-                        width,
-                        height,
-                        blend,
+                        hdc, rect.left, rect.top, width, height, mem_dc, 0, 0, width, height, blend,
                     );
 
                     // Restore clipping region on hdc and clean up resources
@@ -5799,6 +7749,35 @@ impl App {
                     top: row.top,
                     right: row.right - 6,
                     bottom: row.bottom,
+                },
+                COLOR_MUTED,
+            );
+
+            let history_row = self.history_page_row_rect();
+            if self.hover_target == Some(HoverTarget::HistoryPage) {
+                fill_round_rect(hdc, history_row, COLOR_SURFACE_HOVER, 9);
+            }
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                "History",
+                RECT {
+                    left: history_row.left + 12,
+                    top: history_row.top,
+                    right: history_row.right - 30,
+                    bottom: history_row.bottom,
+                },
+                COLOR_TEXT,
+            );
+            draw_icon_glyph(
+                hdc,
+                &self.fonts.icon,
+                glyph(0xE81C).as_str(),
+                RECT {
+                    left: history_row.right - 28,
+                    top: history_row.top,
+                    right: history_row.right - 6,
+                    bottom: history_row.bottom,
                 },
                 COLOR_MUTED,
             );
@@ -6424,6 +8403,35 @@ impl App {
         }
     }
 
+    fn paint_tab_favicon(&self, hdc: HDC, rect: RECT, tab: &Tab, dimmed: bool) {
+        unsafe {
+            if let Some(favicon) = tab.favicon_bitmap.as_ref() {
+                draw_bitmap_fit(hdc, rect, favicon, dimmed);
+                return;
+            }
+            let host = display_host(&tab.url);
+            if let Some(favicon) = self.favicon_cache.get(&host) {
+                draw_bitmap_fit(hdc, rect, favicon, dimmed);
+                return;
+            }
+            draw_tab_favicon(hdc, &self.fonts.small, rect, tab, dimmed);
+        }
+    }
+
+    fn paint_url_favicon(&self, hdc: HDC, rect: RECT, url: &str, dimmed: bool) -> bool {
+        let host = display_host(url);
+        if host.is_empty() {
+            return false;
+        }
+        if let Some(favicon) = self.favicon_cache.get(&host) {
+            unsafe {
+                draw_bitmap_fit(hdc, rect, favicon, dimmed);
+            }
+            return true;
+        }
+        false
+    }
+
     fn paint_command_popup(&self, hdc: HDC) {
         unsafe {
             let rect = client_rect(self.command_hwnd);
@@ -6504,7 +8512,9 @@ impl App {
                 };
                 let mut favicon_drawn = false;
                 if let Some(index) = tab_index.and_then(|index| self.tabs.get(index)) {
-                    draw_tab_favicon(hdc, &self.fonts.small, favicon, index, false);
+                    self.paint_tab_favicon(hdc, favicon, index, false);
+                    favicon_drawn = true;
+                } else if self.paint_url_favicon(hdc, favicon, &url, false) {
                     favicon_drawn = true;
                 } else {
                     let host = display_host(&url);
@@ -6514,7 +8524,7 @@ impl App {
                             .iter()
                             .find(|t| t.favicon_bitmap.is_some() && display_host(&t.url) == host)
                         {
-                            draw_tab_favicon(hdc, &self.fonts.small, favicon, matching_tab, false);
+                            self.paint_tab_favicon(hdc, favicon, matching_tab, false);
                             favicon_drawn = true;
                         }
                     }
@@ -6724,7 +8734,11 @@ impl App {
                         fill_round_rect(
                             hdc,
                             rect,
-                            if active { self.accent_color } else { self.secondary_color },
+                            if active {
+                                self.accent_color
+                            } else {
+                                self.secondary_color
+                            },
                             14,
                         );
                         draw_outline(
@@ -6881,6 +8895,122 @@ impl App {
         }
     }
 
+    fn paint_split_drop_overlay(&self, hdc: HDC) {
+        unsafe {
+            let Some(rect) = self.split_placeholder_rect() else {
+                return;
+            };
+            if rect.right <= rect.left || rect.bottom <= rect.top {
+                return;
+            }
+            let inset = RECT {
+                left: rect.left + 10,
+                top: rect.top + 10,
+                right: rect.right - 10,
+                bottom: rect.bottom - 10,
+            };
+            fill_round_rect(hdc, inset, self.secondary_color, 12);
+            draw_outline(hdc, inset, self.accent_color, 12);
+            let label = match self.split_drop_target.map(|target| target.zone) {
+                Some(SplitDropZone::Left) => "Split left",
+                Some(SplitDropZone::Right) => "Split right",
+                Some(SplitDropZone::Top) => "Split top",
+                Some(SplitDropZone::Bottom) => "Split bottom",
+                None => "Split",
+            };
+            let mut label_rect = inset;
+            label_rect.bottom = ((inset.top + inset.bottom) / 2).min(inset.top + 42);
+            draw_centered_text(hdc, &self.fonts.body, label, label_rect, COLOR_TEXT);
+            if let Some(DragState {
+                source: DragSource::Tab(index),
+                ..
+            }) = self.drag_state
+            {
+                if let Some(tab) = self.tabs.get(index) {
+                    let title = if tab.title.trim().is_empty() {
+                        label_for_url(&tab.url)
+                    } else {
+                        tab.title.clone()
+                    };
+                    let icon = RECT {
+                        left: inset.left + 18,
+                        top: label_rect.bottom + 10,
+                        right: inset.left + 38,
+                        bottom: label_rect.bottom + 30,
+                    };
+                    self.paint_tab_favicon(hdc, icon, tab, false);
+                    draw_text(
+                        hdc,
+                        &self.fonts.body,
+                        &title,
+                        RECT {
+                            left: icon.right + 10,
+                            top: icon.top - 6,
+                            right: inset.right - 18,
+                            bottom: icon.bottom + 6,
+                        },
+                        COLOR_TEXT,
+                    );
+                }
+            }
+        }
+    }
+
+    fn paint_split_toolbar(&self, hdc: HDC) {
+        unsafe {
+            let Some(toolbar) = self.split_toolbar_rect() else {
+                return;
+            };
+            fill_round_rect(hdc, toolbar, self.secondary_color, 10);
+            draw_outline(hdc, toolbar, COLOR_BORDER, 10);
+            if let Some(layout_button) = self.split_layout_button_rect() {
+                if self.hover_target == Some(HoverTarget::SplitLayout) {
+                    fill_round_rect(hdc, layout_button, COLOR_SURFACE_HOVER, 8);
+                }
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.toolbar_icon,
+                    glyph(0xE9F9).as_str(),
+                    layout_button,
+                    COLOR_TEXT,
+                );
+            }
+            if let Some(group_id) = self.active_split_group_id() {
+                if let Some(group) = self.split_group(group_id) {
+                    let label = match group.layout {
+                        SplitLayout::Horizontal => "H",
+                        SplitLayout::Vertical => "V",
+                        SplitLayout::Grid => "G",
+                    };
+                    draw_centered_text(
+                        hdc,
+                        &self.fonts.small,
+                        label,
+                        RECT {
+                            left: toolbar.left + 36,
+                            top: toolbar.top,
+                            right: toolbar.right - 36,
+                            bottom: toolbar.bottom,
+                        },
+                        COLOR_MUTED,
+                    );
+                }
+            }
+            if let Some(unsplit_button) = self.split_unsplit_button_rect() {
+                if self.hover_target == Some(HoverTarget::SplitUnsplit) {
+                    fill_round_rect(hdc, unsplit_button, COLOR_SURFACE_HOVER, 8);
+                }
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.toolbar_icon,
+                    glyph(0xE711).as_str(),
+                    unsplit_button,
+                    COLOR_TEXT,
+                );
+            }
+        }
+    }
+
     fn paint_tab(&self, hdc: HDC, index: usize, tab: &Tab, item: RECT, force_ghost: bool) {
         unsafe {
             let mut item = item;
@@ -6903,7 +9033,7 @@ impl App {
                 right: favicon_left + 18,
                 bottom: item.top + 29,
             };
-            draw_tab_favicon(hdc, &self.fonts.small, favicon, tab, is_ghost);
+            self.paint_tab_favicon(hdc, favicon, tab, is_ghost);
             let text_color = if is_ghost {
                 0x555555
             } else if Some(index) == self.active_tab_index() {
@@ -6970,6 +9100,171 @@ impl App {
                         close_color,
                     );
                 }
+            }
+        }
+    }
+
+    fn paint_split_group_row(&self, hdc: HDC, group_id: usize, item: RECT) {
+        unsafe {
+            let Some(group) = self.split_group(group_id) else {
+                return;
+            };
+            let active_index = self.split_group_active_index(group_id);
+            let active = active_index.and_then(|index| self.tabs.get(index));
+            let title = group
+                .tab_ids
+                .iter()
+                .filter_map(|tab_id| {
+                    self.tabs
+                        .iter()
+                        .find(|tab| tab.id == *tab_id)
+                        .map(|tab| {
+                            if tab.title.trim().is_empty() {
+                                label_for_url(&tab.url)
+                            } else {
+                                tab.title.clone()
+                            }
+                        })
+                })
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let title = if title.trim().is_empty() {
+                "Split View".to_string()
+            } else {
+                title
+            };
+            let is_active = group.tab_ids.iter().any(|tab_id| {
+                self.tabs
+                    .get(self.active)
+                    .map(|tab| tab.id == *tab_id)
+                    .unwrap_or(false)
+            });
+            let is_hovered = active_index
+                .map(|index| self.hover_tab == Some(index))
+                .unwrap_or(false);
+            let row = item;
+            if is_active || is_hovered {
+                fill_round_rect(hdc, row, self.secondary_color, 10);
+            }
+            let accent = RECT {
+                left: row.left + 8,
+                top: row.top + 8,
+                right: row.left + 12,
+                bottom: row.bottom - 8,
+            };
+            fill_round_rect(hdc, accent, self.accent_color, 3);
+            let mini = RECT {
+                left: row.left + 20,
+                top: row.top + 8,
+                right: row.left + 58,
+                bottom: row.bottom - 8,
+            };
+            fill_round_rect(hdc, mini, 0x101010, 6);
+            draw_outline(hdc, mini, COLOR_BORDER, 6);
+            let mini_cells = self.split_layout_rects_for(
+                RECT {
+                    left: mini.left + 4,
+                    top: mini.top + 4,
+                    right: mini.right - 4,
+                    bottom: mini.bottom - 4,
+                },
+                group.layout,
+                group.tab_ids.len(),
+            );
+            for (tab_id, cell) in group.tab_ids.iter().copied().zip(mini_cells) {
+                let is_active_cell = active
+                    .map(|tab| tab.id == tab_id)
+                    .unwrap_or(false);
+                fill_round_rect(
+                    hdc,
+                    cell,
+                    if is_active_cell {
+                        self.accent_color
+                    } else {
+                        self.secondary_color
+                    },
+                    4,
+                );
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+                    let icon = RECT {
+                        left: cell.left + 2,
+                        top: cell.top + 2,
+                        right: cell.right - 2,
+                        bottom: cell.bottom - 2,
+                    };
+                    self.paint_tab_favicon(hdc, icon, tab, !is_active_cell);
+                }
+            }
+            draw_text(
+                hdc,
+                &self.fonts.body,
+                &title,
+                RECT {
+                    left: row.left + 68,
+                    top: row.top + 2,
+                    right: row.right - 42,
+                    bottom: row.top + 29,
+                },
+                if is_active { COLOR_TEXT } else { COLOR_MUTED },
+            );
+            let subtitle = format!(
+                "{} panes - {}",
+                group.tab_ids.len(),
+                match group.layout {
+                    SplitLayout::Horizontal => "horizontal",
+                    SplitLayout::Vertical => "vertical",
+                    SplitLayout::Grid => "grid",
+                }
+            );
+            draw_text(
+                hdc,
+                &self.fonts.small,
+                &subtitle,
+                RECT {
+                    left: row.left + 68,
+                    top: row.top + 25,
+                    right: row.right - 42,
+                    bottom: row.bottom,
+                },
+                COLOR_MUTED,
+            );
+            if let Some(tab) = active {
+                if tab.audio_playing || tab.muted {
+                    let audio_icon = if tab.muted {
+                        glyph(0xE74F)
+                    } else {
+                        glyph(0xE767)
+                    };
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.toolbar_icon,
+                        audio_icon.as_str(),
+                        self.tab_audio_rect(row),
+                        if tab.muted { COLOR_MUTED } else { COLOR_TEXT },
+                    );
+                }
+            }
+            if is_hovered {
+                draw_icon_glyph(
+                    hdc,
+                    &self.fonts.icon,
+                    glyph(0xE711).as_str(),
+                    RECT {
+                        left: row.right - 30,
+                        top: row.top + 12,
+                        right: row.right - 8,
+                        bottom: row.top + 34,
+                    },
+                    if active_index
+                        .map(|index| self.hover_close == Some(index))
+                        .unwrap_or(false)
+                    {
+                        COLOR_TEXT
+                    } else {
+                        COLOR_MUTED
+                    },
+                );
             }
         }
     }
@@ -7072,6 +9367,18 @@ impl App {
         }
 
         if self.settings_open {
+            if point_in_rect(x, y, self.history_page_row_rect()) {
+                self.settings_open = false;
+                self.mode_menu_open = false;
+                self.open_history_page();
+                return;
+            }
+            if point_in_rect(x, y, self.settings_page_row_rect()) {
+                self.settings_open = false;
+                self.mode_menu_open = false;
+                self.open_settings_page();
+                return;
+            }
             if self.mode_menu_open {
                 let options = self.mode_options_rect();
                 if point_in_rect(x, y, options) {
@@ -7089,12 +9396,6 @@ impl App {
             }
 
             if point_in_rect(x, y, self.mode_row_rect()) {
-                return;
-            }
-            if point_in_rect(x, y, self.settings_page_row_rect()) {
-                self.settings_open = false;
-                self.mode_menu_open = false;
-                self.open_settings_page();
                 return;
             }
 
@@ -7171,6 +9472,22 @@ impl App {
             return;
         }
 
+        if let Some(rect) = self.split_layout_button_rect() {
+            if point_in_rect(x, y, rect) {
+                self.cycle_active_split_layout();
+                return;
+            }
+        }
+
+        if let Some(rect) = self.split_unsplit_button_rect() {
+            if point_in_rect(x, y, rect) {
+                if let Some(group_id) = self.active_split_group_id() {
+                    self.unsplit_group(group_id);
+                }
+                return;
+            }
+        }
+
         if self.find_open {
             if point_in_rect(x, y, self.find_prev_rect()) {
                 self.run_find_script(-1);
@@ -7223,13 +9540,7 @@ impl App {
                     }
                 }
                 SidebarHit::Tab(index) => {
-                    let row =
-                        self.sidebar_row_rects()
-                            .into_iter()
-                            .find_map(|(row, rect)| match row {
-                                SidebarRow::Tab(row_index) if row_index == index => Some(rect),
-                                _ => None,
-                            });
+                    let row = self.sidebar_row_rect_for_tab(index);
                     if let Some(row) = row {
                         if self
                             .tabs
@@ -7344,6 +9655,21 @@ impl App {
                     },
                 ));
                 labels.push((MENU_TAB_DUPLICATE, "Duplicate Tab".to_string()));
+                if tab.split_group_id.is_some() {
+                    labels.push((MENU_TAB_UNSPLIT, "Unsplit Tab".to_string()));
+                    labels.push((MENU_TAB_SPLIT_HORIZONTAL, "Horizontal Layout".to_string()));
+                    labels.push((MENU_TAB_SPLIT_VERTICAL, "Vertical Layout".to_string()));
+                    labels.push((MENU_TAB_SPLIT_GRID, "Grid Layout".to_string()));
+                } else if self
+                    .active_tab_index()
+                    .map(|active| active != index)
+                    .unwrap_or(false)
+                    || self.active_workspace_tabs().len() > 1
+                {
+                    labels.push((MENU_TAB_SPLIT_HORIZONTAL, "Split Horizontally".to_string()));
+                    labels.push((MENU_TAB_SPLIT_VERTICAL, "Split Vertically".to_string()));
+                    labels.push((MENU_TAB_SPLIT_GRID, "Split as Grid".to_string()));
+                }
                 labels.push((MENU_WORKSPACE_NEW_FOLDER, "New Folder".to_string()));
                 if tab.folder_id.is_some() {
                     labels.push((MENU_TAB_REMOVE_FOLDER, "Remove From Folder".to_string()));
@@ -7638,11 +9964,20 @@ impl App {
             | MENU_TAB_DUPLICATE
             | MENU_TAB_CLOSE
             | MENU_TAB_DELETE_PIN
+            | MENU_TAB_SPLIT_WITH_ACTIVE
+            | MENU_TAB_SPLIT_NEXT
+            | MENU_TAB_UNSPLIT
+            | MENU_TAB_SPLIT_HORIZONTAL
+            | MENU_TAB_SPLIT_VERTICAL
+            | MENU_TAB_SPLIT_GRID
                 if matches!(hit, SidebarHit::Tab(_)) =>
             {
                 if let SidebarHit::Tab(index) = hit {
                     match id {
                         MENU_TAB_PIN => {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                            }
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.pinned = true;
                                 tab.pinned_url = Some(tab.url.clone());
@@ -7650,18 +9985,79 @@ impl App {
                             }
                         }
                         MENU_TAB_UNPIN => {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                            }
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.pinned = false;
                                 tab.pinned_url = None;
                             }
                         }
                         MENU_TAB_REMOVE_FOLDER => {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                            }
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.folder_id = None;
                             }
                         }
                         MENU_TAB_DUPLICATE => {
                             let _ = self.duplicate_tab(index, true);
+                        }
+                        MENU_TAB_SPLIT_WITH_ACTIVE | MENU_TAB_SPLIT_NEXT => {
+                            self.split_tab_with_active(index, SplitLayout::Horizontal);
+                        }
+                        MENU_TAB_UNSPLIT => {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                                self.layout();
+                                self.refresh();
+                            }
+                        }
+                        MENU_TAB_SPLIT_HORIZONTAL => {
+                            if let Some(group_id) =
+                                self.tabs.get(index).and_then(|tab| tab.split_group_id)
+                            {
+                                if let Some(group) =
+                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                {
+                                    group.layout = SplitLayout::Horizontal;
+                                }
+                                self.layout();
+                                self.refresh();
+                            } else {
+                                self.split_tab_with_active(index, SplitLayout::Horizontal);
+                            }
+                        }
+                        MENU_TAB_SPLIT_VERTICAL => {
+                            if let Some(group_id) =
+                                self.tabs.get(index).and_then(|tab| tab.split_group_id)
+                            {
+                                if let Some(group) =
+                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                {
+                                    group.layout = SplitLayout::Vertical;
+                                }
+                                self.layout();
+                                self.refresh();
+                            } else {
+                                self.split_tab_with_active(index, SplitLayout::Vertical);
+                            }
+                        }
+                        MENU_TAB_SPLIT_GRID => {
+                            if let Some(group_id) =
+                                self.tabs.get(index).and_then(|tab| tab.split_group_id)
+                            {
+                                if let Some(group) =
+                                    self.split_groups.iter_mut().find(|group| group.id == group_id)
+                                {
+                                    group.layout = SplitLayout::Grid;
+                                }
+                                self.layout();
+                                self.refresh();
+                            } else {
+                                self.split_tab_with_active(index, SplitLayout::Grid);
+                            }
                         }
                         MENU_TAB_CLOSE => self.close_tab(index),
                         MENU_TAB_DELETE_PIN => self.delete_pin(index),
@@ -7682,6 +10078,9 @@ impl App {
                             .collect();
                         let offset = id - MENU_TAB_MOVE_FOLDER_BASE;
                         if let Some(folder_id) = folders.get(offset).copied() {
+                            if let Some(tab_id) = self.tabs.get(index).map(|tab| tab.id) {
+                                self.detach_tab_from_split_by_id(tab_id);
+                            }
                             if let Some(tab) = self.tabs.get_mut(index) {
                                 tab.pinned = false;
                                 tab.folder_id = Some(folder_id);
@@ -7768,11 +10167,13 @@ impl App {
         let old_mode_menu = self.mode_menu_open;
         let old_hovering = self.hovering_sidebar;
         let old_drop_target = self.drop_target;
+        let old_split_drop_target = self.split_drop_target;
         self.hover_close = None;
         self.hover_tab = None;
         self.hover_folder = None;
         self.hover_target = None;
         self.drop_target = Some(DropTarget::None);
+        self.split_drop_target = None;
 
         if self.show_default_bubble && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
@@ -7878,6 +10279,18 @@ impl App {
                     self.hover_target = Some(HoverTarget::Reload);
                 } else if point_in_rect(x, y, self.address_menu_rect()) {
                     self.hover_target = Some(HoverTarget::AddressMenu);
+                } else if self
+                    .split_layout_button_rect()
+                    .map(|rect| point_in_rect(x, y, rect))
+                    .unwrap_or(false)
+                {
+                    self.hover_target = Some(HoverTarget::SplitLayout);
+                } else if self
+                    .split_unsplit_button_rect()
+                    .map(|rect| point_in_rect(x, y, rect))
+                    .unwrap_or(false)
+                {
+                    self.hover_target = Some(HoverTarget::SplitUnsplit);
                 } else if point_in_rect(x, y, self.address_pill_rect()) {
                     self.hover_target = Some(HoverTarget::Address);
                 } else if point_in_rect(x, y, self.settings_rect()) {
@@ -7891,12 +10304,16 @@ impl App {
                         Some(id) => Some(HoverTarget::DownloadIndicator(id)),
                         None => Some(HoverTarget::DownloadOverflow),
                     };
+                } else if self.settings_open && point_in_rect(x, y, self.history_page_row_rect()) {
+                    self.hover_target = Some(HoverTarget::HistoryPage);
+                    self.mode_menu_open = false;
+                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
+                    self.hover_target = Some(HoverTarget::SettingsPage);
+                    self.mode_menu_open = false;
                 } else if self.settings_open && point_in_rect(x, y, self.mode_row_rect()) {
                     self.hover_target = Some(HoverTarget::ModeRow);
                     self.mode_menu_open = true;
-                } else if self.settings_open
-                    && point_in_rect(x, y, self.mode_options_rect())
-                {
+                } else if self.settings_open && point_in_rect(x, y, self.mode_options_rect()) {
                     let options = self.mode_options_rect();
                     let local_y = y - options.top - 8;
                     if local_y >= 0 {
@@ -7907,9 +10324,6 @@ impl App {
                             _ => None,
                         };
                     }
-                } else if self.settings_open && point_in_rect(x, y, self.settings_page_row_rect()) {
-                    self.hover_target = Some(HoverTarget::SettingsPage);
-                    self.mode_menu_open = false;
                 }
             }
         }
@@ -7957,6 +10371,7 @@ impl App {
         }
 
         if self.drag_state.as_ref().map(|d| d.active).unwrap_or(false) {
+            let split_target = self.calculate_split_drop_target(x, y);
             // Temporarily disable drag preview so that calculate_drop_target
             // sees the raw (non-preview) sidebar layout, where the pinned
             // section divider is at its true position. Without this, the
@@ -7966,9 +10381,17 @@ impl App {
                 d.active = false;
             }
             self.drop_target = Some(self.calculate_drop_target(x, y));
+            self.split_drop_target = split_target;
+            if self.split_drop_target.is_some() {
+                self.drop_target = Some(DropTarget::None);
+            }
             if let Some(ref mut d) = self.drag_state {
                 d.active = true;
             }
+        }
+
+        if old_split_drop_target != self.split_drop_target {
+            self.layout();
         }
 
         if !self.animating_sidebar
@@ -7978,22 +10401,19 @@ impl App {
                 || old_target != self.hover_target
                 || old_mode_menu != self.mode_menu_open
                 || old_hovering != self.hovering_sidebar
-                || old_drop_target != self.drop_target)
+                || old_drop_target != self.drop_target
+                || old_split_drop_target != self.split_drop_target)
         {
             self.refresh();
         }
     }
 
-    fn start_drag_candidate(&mut self, x: i32, y: i32) {
+    fn start_drag_candidate(&mut self, x: i32, y: i32) -> bool {
         if self.renaming_folder_id.is_some() {
-            return;
+            return false;
         }
         if let Some(SidebarHit::Tab(index)) = self.hit_sidebar(x, y) {
-            if let Some((_, row)) = self
-                .sidebar_row_rects()
-                .into_iter()
-                .find(|(row, _)| matches!(row, SidebarRow::Tab(row_index) if *row_index == index))
-            {
+            if let Some(row) = self.sidebar_row_rect_for_tab(index) {
                 let audio_hit = self
                     .tabs
                     .get(index)
@@ -8009,6 +10429,7 @@ impl App {
                         current_x: x,
                         current_y: y,
                     });
+                    return true;
                 }
             }
         } else if let Some(SidebarHit::Folder(folder_id)) = self.hit_sidebar(x, y) {
@@ -8025,8 +10446,10 @@ impl App {
                     current_x: x,
                     current_y: y,
                 });
+                return true;
             }
         }
+        false
     }
 
     fn finish_drag(&mut self, x: i32, y: i32) -> bool {
@@ -8045,16 +10468,20 @@ impl App {
         }
         if !drag.active {
             self.drop_target = Some(DropTarget::None);
+            self.split_drop_target = None;
             return false;
         }
         let duplicate = matches!(drag.source, DragSource::Tab(_))
             && unsafe { (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
         self.handle_drop(drag.source, x, y, duplicate);
         self.drop_target = Some(DropTarget::None);
+        self.split_drop_target = None;
+        self.layout();
         true
     }
     fn handle_drop(&mut self, source: DragSource, _x: i32, _y: i32, duplicate_tab: bool) {
         let target = self.drop_target.unwrap_or(DropTarget::None);
+        let split_target = self.split_drop_target;
 
         match source {
             DragSource::Tab(mut from_index) => {
@@ -8066,6 +10493,18 @@ impl App {
                         return;
                     };
                     from_index = new_index;
+                }
+                if let Some(split_target) = split_target {
+                    self.apply_split_drop(from_index, split_target, None);
+                    return;
+                }
+                if let Some(tab_id) = self.tabs.get(from_index).map(|tab| tab.id) {
+                    self.detach_tab_from_split_by_id(tab_id);
+                    if let Some(index) = self.tab_index_by_id(tab_id) {
+                        from_index = index;
+                    } else {
+                        return;
+                    }
                 }
                 let dragged_workspace = self.tabs[from_index].workspace_id;
 
@@ -8270,9 +10709,7 @@ impl App {
                             .map(|folder| folder.pinned)
                             .unwrap_or(false);
                         if y < rect.top + third {
-                            if folder_pinned
-                                && previous_root_row(&rows, idx, true).is_none()
-                            {
+                            if folder_pinned && previous_root_row(&rows, idx, true).is_none() {
                                 DropTarget::PinnedSection
                             } else {
                                 DropTarget::RootAfter {
@@ -8293,9 +10730,7 @@ impl App {
                         let tab_pinned =
                             self.tabs.get(index).map(|tab| tab.pinned).unwrap_or(false);
                         if y < (rect.top + rect.bottom) / 2 {
-                            if tab_pinned
-                                && previous_root_row(&rows, idx, true).is_none()
-                            {
+                            if tab_pinned && previous_root_row(&rows, idx, true).is_none() {
                                 DropTarget::PinnedSection
                             } else {
                                 DropTarget::RootAfter {
@@ -8307,6 +10742,30 @@ impl App {
                             DropTarget::RootAfter {
                                 pinned: tab_pinned,
                                 row: Some(SidebarRow::Tab(index)),
+                            }
+                        }
+                    }
+                    SidebarRow::SplitGroup(group_id) => {
+                        let tab_pinned = self
+                            .split_group(group_id)
+                            .and_then(|group| group.tab_ids.first().copied())
+                            .and_then(|tab_id| self.tab_index_by_id(tab_id))
+                            .and_then(|index| self.tabs.get(index))
+                            .map(|tab| tab.pinned)
+                            .unwrap_or(false);
+                        if y < (rect.top + rect.bottom) / 2 {
+                            if tab_pinned && previous_root_row(&rows, idx, true).is_none() {
+                                DropTarget::PinnedSection
+                            } else {
+                                DropTarget::RootAfter {
+                                    pinned: tab_pinned,
+                                    row: previous_root_row(&rows, idx, tab_pinned),
+                                }
+                            }
+                        } else {
+                            DropTarget::RootAfter {
+                                pinned: tab_pinned,
+                                row: Some(SidebarRow::SplitGroup(group_id)),
                             }
                         }
                     }
@@ -8383,7 +10842,7 @@ impl App {
                             right: favicon_left + 18,
                             bottom: 29,
                         };
-                        draw_tab_favicon(mem_dc, &self.fonts.small, favicon, tab, false);
+                        self.paint_tab_favicon(mem_dc, favicon, tab, false);
                         draw_text(
                             mem_dc,
                             &self.fonts.body,
@@ -8832,7 +11291,7 @@ fn main() -> AppResult<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     }
-    
+
     unsafe {
         if let Ok(existing_hwnd) = WindowsAndMessaging::FindWindowW(CLASS_NAME, None) {
             if !existing_hwnd.is_invalid() {
@@ -8846,10 +11305,11 @@ fn main() -> AppResult<()> {
                         }
                     }
                 }
-                
-                let _ = WindowsAndMessaging::ShowWindow(existing_hwnd, WindowsAndMessaging::SW_RESTORE);
+
+                let _ =
+                    WindowsAndMessaging::ShowWindow(existing_hwnd, WindowsAndMessaging::SW_RESTORE);
                 let _ = WindowsAndMessaging::SetForegroundWindow(existing_hwnd);
-                
+
                 if !startup_url.is_empty() {
                     let bytes = startup_url.as_bytes();
                     let cds = COPYDATASTRUCT {
@@ -8874,10 +11334,10 @@ fn main() -> AppResult<()> {
     let hwnd = create_main_window()?;
     let environment = create_environment()?;
 
-
     let app = Box::new(App::new(hwnd, environment)?);
     unsafe {
         SetWindowLong(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
+        with_app(hwnd, |app| app.request_missing_favicons());
         let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOW);
         let _ = Gdi::UpdateWindow(hwnd);
     }
@@ -9726,6 +12186,16 @@ unsafe extern "system" fn bookmark_popup_proc(
 
 extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     match msg {
+        msg if msg == FAVICON_FETCHED_MSG => {
+            let ptr = w_param.0 as *mut FaviconFetchResult;
+            if !ptr.is_null() {
+                unsafe {
+                    let result = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.complete_favicon_fetch(result));
+                }
+            }
+            LRESULT(0)
+        }
         WM_COPYDATA => {
             unsafe {
                 let cds = &*(l_param.0 as *const COPYDATASTRUCT);
@@ -9742,7 +12212,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                             }
                             app.refresh();
                         });
-                        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_RESTORE);
+                        let _ =
+                            WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_RESTORE);
                         let _ = WindowsAndMessaging::SetForegroundWindow(hwnd);
                     }
                 }
@@ -9836,6 +12307,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     let address = app.address_pill_rect();
                     let find_bar = app.find_bar_rect();
                     let (min_btn, max_btn, close_btn) = app.window_button_rects();
+                    let split_layout = app.split_layout_button_rect();
+                    let split_unsplit = app.split_unsplit_button_rect();
 
                     if point_in_rect(pt.x, pt.y, logo)
                         || point_in_rect(pt.x, pt.y, new_tab)
@@ -9843,6 +12316,12 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         || point_in_rect(pt.x, pt.y, forward)
                         || point_in_rect(pt.x, pt.y, reload)
                         || point_in_rect(pt.x, pt.y, address)
+                        || split_layout
+                            .map(|rect| point_in_rect(pt.x, pt.y, rect))
+                            .unwrap_or(false)
+                        || split_unsplit
+                            .map(|rect| point_in_rect(pt.x, pt.y, rect))
+                            .unwrap_or(false)
                         || (app.find_open && point_in_rect(pt.x, pt.y, find_bar))
                         || point_in_rect(pt.x, pt.y, min_btn)
                         || point_in_rect(pt.x, pt.y, max_btn)
@@ -9933,17 +12412,36 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             let x = loword(l_param.0 as u32) as i16 as i32;
             let y = hiword(l_param.0 as u32) as i16 as i32;
             with_app(hwnd, |app| {
-                app.start_drag_candidate(x, y);
-                app.handle_click(x, y);
+                if !app.start_drag_candidate(x, y) {
+                    app.handle_click(x, y);
+                }
             });
             LRESULT(0)
         }
-        WindowsAndMessaging::WM_LBUTTONDBLCLK => LRESULT(0),
+        WindowsAndMessaging::WM_LBUTTONDBLCLK => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            with_app(hwnd, |app| {
+                if !app.start_drag_candidate(x, y) {
+                    app.handle_click(x, y);
+                }
+            });
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             let x = loword(l_param.0 as u32) as i16 as i32;
             let y = hiword(l_param.0 as u32) as i16 as i32;
             with_app(hwnd, |app| {
-                let _ = app.finish_drag(x, y);
+                let pending_click = app
+                    .drag_state
+                    .as_ref()
+                    .filter(|drag| !drag.active)
+                    .map(|drag| (drag.start_x, drag.start_y));
+                if !app.finish_drag(x, y) {
+                    if let Some((click_x, click_y)) = pending_click {
+                        app.handle_click(click_x, click_y);
+                    }
+                }
             });
             LRESULT(0)
         }
@@ -10082,6 +12580,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                                 if app.has_typed && !app.is_deleting {
                                     app.try_autofill(&current_text);
                                 }
+                                app.request_command_favicons();
                             }
                             unsafe {
                                 let _ = InvalidateRect(Some(app.command_hwnd), None, false);
@@ -10182,6 +12681,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
                     app.load_settings_page(index);
                 }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:history") {
+                    app.load_history_page(index);
+                }
             });
             unsafe { WindowsAndMessaging::DefWindowProcW(hwnd, msg, w_param, l_param) }
         }
@@ -10200,6 +12702,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 }
                 if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:settings") {
                     app.load_settings_page(index);
+                }
+                if let Some(index) = app.tabs.iter().position(|t| t.url == "aster:history") {
+                    app.load_history_page(index);
                 }
 
                 if app.renaming_folder_id.is_some() {
@@ -10298,6 +12803,32 @@ fn handle_keydown(hwnd: HWND, w_param: WPARAM) {
             0x53 if alt => {
                 app.switch_tab_below();
             }
+            0x48 if ctrl && alt => {
+                if app.active_split_group_id().is_some() {
+                    app.set_active_split_layout(SplitLayout::Horizontal);
+                } else if let Some(index) = app.active_tab_index() {
+                    app.split_tab_with_active(index, SplitLayout::Horizontal);
+                }
+            }
+            0x56 if ctrl && alt => {
+                if app.active_split_group_id().is_some() {
+                    app.set_active_split_layout(SplitLayout::Vertical);
+                } else if let Some(index) = app.active_tab_index() {
+                    app.split_tab_with_active(index, SplitLayout::Vertical);
+                }
+            }
+            0x47 if ctrl && alt => {
+                if app.active_split_group_id().is_some() {
+                    app.set_active_split_layout(SplitLayout::Grid);
+                } else if let Some(index) = app.active_tab_index() {
+                    app.split_tab_with_active(index, SplitLayout::Grid);
+                }
+            }
+            0x55 if ctrl && alt => {
+                if let Some(group_id) = app.active_split_group_id() {
+                    app.unsplit_group(group_id);
+                }
+            }
             code if code == VK_F5.0 as u32 => app.reload(),
             code if code == VK_F11.0 as u32 => app.toggle_fullscreen(),
             _ => {}
@@ -10313,6 +12844,7 @@ fn is_aster_shortcut(key: u32) -> bool {
         matches!(key, 0x44 | 0x46 | 0x4C | 0x53 | 0x54 | 0x57 | 0x52 | 0x30 | 0x60 | 0xBB | 0x6B | 0xBD | 0x6D if ctrl)
             || (key == 0x5A && ctrl && shift)
             || matches!(key, 0x25 | 0x27 | 0x41 | 0x44 | 0x57 | 0x53 if alt)
+            || matches!(key, 0x47 | 0x48 | 0x55 | 0x56 if ctrl && alt)
             || key == VK_F5.0 as u32
             || key == VK_F11.0 as u32
     }
@@ -10335,6 +12867,10 @@ fn default_action_for_event(key: u32, ctrl: bool, alt: bool, shift: bool) -> Opt
         0x27 | 0x44 if alt => Some("Go forward"),
         0x57 if alt => Some("Switch tab above"),
         0x53 if alt => Some("Switch tab below"),
+        0x48 if ctrl && alt => Some("Split horizontal"),
+        0x56 if ctrl && alt => Some("Split vertical"),
+        0x47 if ctrl && alt => Some("Split grid"),
+        0x55 if ctrl && alt => Some("Unsplit tabs"),
         code if code == VK_F5.0 as u32 => Some("Reload"),
         code if code == VK_F11.0 as u32 => Some("Toggle fullscreen"),
         _ => None,
@@ -10473,7 +13009,10 @@ fn draw_settings_button(hdc: HDC, rect: RECT, hovered: bool) {
         let spacing = 6;
         BRUSH_CACHE.with(|cache| {
             let mut c = cache.borrow_mut();
-            let brush = *c.brushes.entry(COLOR_MUTED).or_insert_with(|| solid_brush(COLOR_MUTED));
+            let brush = *c
+                .brushes
+                .entry(COLOR_MUTED)
+                .or_insert_with(|| solid_brush(COLOR_MUTED));
             let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
             let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
             let size = r * 2;
@@ -10674,7 +13213,11 @@ unsafe fn draw_bookmark_popup_gdi(hdc: HDC, rect: RECT, elapsed_ms: u64, is_unbo
     draw_text(
         hdc,
         &text_font,
-        if is_unbookmark { "Unbookmarked" } else { "Bookmarked Site!" },
+        if is_unbookmark {
+            "Unbookmarked"
+        } else {
+            "Bookmarked Site!"
+        },
         RECT {
             left: body.left + 52,
             top: body.top,
@@ -11127,8 +13670,8 @@ impl IconKind {
     fn glyph(self) -> &'static str {
         match self {
             Self::Plus => "\u{E710}",
-            Self::Back => "\u{E72B}",
-            Self::Forward => "\u{E72A}",
+            Self::Back => "\u{E76B}",
+            Self::Forward => "\u{E76C}",
             Self::Reload => "\u{E72C}",
         }
     }
@@ -11350,7 +13893,235 @@ fn decode_favicon_stream(stream: &IStream) -> Option<FaviconBitmap> {
     }
 }
 
-fn render_glyph_favicon(size: i32, codepoint: u32, icon_font: &HFONT, color: u32) -> Option<FaviconBitmap> {
+fn decode_favicon_file(path: &str) -> Option<FaviconBitmap> {
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let path_w = to_wide(path);
+        let decoder = factory
+            .CreateDecoderFromFilename(
+                PCWSTR(path_w.as_ptr()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnDemand,
+            )
+            .ok()?;
+        let frame = decoder.GetFrame(0).ok()?;
+        let converter = factory.CreateFormatConverter().ok()?;
+        converter
+            .Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None::<&windows::Win32::Graphics::Imaging::IWICPalette>,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .ok()?;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        converter.GetSize(&mut width, &mut height).ok()?;
+        if width == 0 || height == 0 || width > 256 || height > 256 {
+            return None;
+        }
+        let stride = width * 4;
+        let mut pixels = vec![0u8; (stride * height) as usize];
+        converter
+            .CopyPixels(ptr::null(), stride, &mut pixels)
+            .ok()?;
+        let handle = create_bgra_bitmap(width as i32, height as i32, &pixels)?;
+        Some(FaviconBitmap {
+            handle,
+            width: width as i32,
+            height: height as i32,
+        })
+    }
+}
+
+fn favicon_candidate_urls(url: &str, known_favicon_uri: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(known) = known_favicon_uri {
+        let known = known.trim();
+        if known.starts_with("http://") || known.starts_with("https://") {
+            candidates.push(known.to_string());
+        }
+    }
+    if let Some(origin) = url_origin(url) {
+        candidates.push(format!("{origin}/favicon.ico"));
+    }
+    candidates.dedup();
+    candidates
+}
+
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(format!("{scheme}://{host}"))
+    }
+}
+
+fn download_first_favicon(candidates: &[String], page_url: &str) -> Option<String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    let mut result = None;
+    for candidate in candidates {
+        if let Some(path) = download_url_to_cache(candidate) {
+            if looks_like_favicon_file(&path) {
+                result = Some(path);
+                break;
+            }
+        }
+    }
+    if result.is_none() {
+        if let Some(path) = download_url_to_cache(page_url) {
+            if let Ok(html) = fs::read_to_string(&path) {
+                for href in extract_favicon_hrefs(&html) {
+                    if let Some(icon_url) = resolve_url(page_url, &href) {
+                        if let Some(icon_path) = download_url_to_cache(&icon_url) {
+                            if looks_like_favicon_file(&icon_path) {
+                                result = Some(icon_path);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+fn looks_like_favicon_file(path: &str) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    bytes.starts_with(&[0x00, 0x00, 0x01, 0x00])
+        || bytes.starts_with(&[0x89, b'P', b'N', b'G'])
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+}
+
+fn extract_favicon_hrefs(html: &str) -> Vec<String> {
+    let mut hrefs = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(start) = lower[offset..].find("<link") {
+        let tag_start = offset + start;
+        let Some(tag_end_rel) = lower[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_rel + 1;
+        let tag = &html[tag_start..tag_end];
+        let rel = extract_attr_value(tag, "rel")
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if rel
+            .split_whitespace()
+            .any(|part| part == "icon" || part == "apple-touch-icon" || part == "mask-icon")
+            || rel == "shortcut icon"
+        {
+            if let Some(href) = extract_attr_value(tag, "href") {
+                hrefs.push(href);
+            }
+        }
+        offset = tag_end;
+    }
+    hrefs
+}
+
+fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let pos = lower.find(attr)?;
+    let after_attr = &tag[pos + attr.len()..];
+    let after_attr = after_attr.trim_start();
+    let value = after_attr.strip_prefix('=')?.trim_start();
+    if let Some(rest) = value.strip_prefix('"') {
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    } else if let Some(rest) = value.strip_prefix('\'') {
+        let end = rest.find('\'')?;
+        Some(rest[..end].to_string())
+    } else {
+        let end = value
+            .find(|ch: char| ch.is_whitespace() || ch == '>')
+            .unwrap_or(value.len());
+        Some(value[..end].to_string())
+    }
+}
+
+fn resolve_url(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    if href.starts_with("//") {
+        let scheme = base.split_once("://").map(|(scheme, _)| scheme).unwrap_or("https");
+        return Some(format!("{scheme}:{href}"));
+    }
+    let origin = url_origin(base)?;
+    if href.starts_with('/') {
+        return Some(format!("{origin}{href}"));
+    }
+    let mut prefix = base
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(base)
+        .to_string();
+    if !prefix.ends_with('/') {
+        if let Some(pos) = prefix.rfind('/') {
+            prefix.truncate(pos + 1);
+        } else {
+            prefix.push('/');
+        }
+    }
+    Some(format!("{prefix}{href}"))
+}
+
+fn download_url_to_cache(url: &str) -> Option<String> {
+    let url_w = to_wide(url);
+    let mut path = vec![0u16; 2048];
+    let ok = unsafe {
+        URLDownloadToCacheFileW(
+            None::<&IUnknown>,
+            PCWSTR(url_w.as_ptr()),
+            &mut path,
+            0,
+            None::<&IBindStatusCallback>,
+        )
+        .is_ok()
+    };
+    if !ok {
+        return None;
+    }
+    let len = path.iter().position(|ch| *ch == 0).unwrap_or(path.len());
+    if len == 0 {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&path[..len]))
+    }
+}
+
+fn render_glyph_favicon(
+    size: i32,
+    codepoint: u32,
+    icon_font: &HFONT,
+    color: u32,
+) -> Option<FaviconBitmap> {
     unsafe {
         let hdc = CreateCompatibleDC(None);
         if hdc.is_invalid() {
@@ -11811,6 +14582,454 @@ fn open_in_file_explorer(file_path: &str) {
     }
 }
 
+fn decode_upload_content(content: &str) -> std::result::Result<Vec<u8>, String> {
+    let payload = content
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(content)
+        .trim();
+    general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|error| error.to_string())
+}
+
+fn looks_like_sqlite(name: &str, bytes: &[u8]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    bytes.starts_with(b"SQLite format 3")
+        || lower.ends_with(".sqlite")
+        || lower.ends_with(".sqlite3")
+        || lower.ends_with(".db")
+        || lower == "history"
+        || lower == "cookies"
+        || lower.ends_with("\\history")
+        || lower.ends_with("\\cookies")
+        || lower.contains("places.sqlite")
+}
+
+fn looks_like_html(name: &str, bytes: &[u8]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".html")
+        || lower.ends_with(".htm")
+        || std::str::from_utf8(bytes)
+            .map(|text| text.to_ascii_lowercase().contains("netscape-bookmark-file"))
+            .unwrap_or(false)
+}
+
+fn sqlite_temp_path(name: &str, path_hint: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let raw_name = Path::new(path_hint)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(name);
+    let safe_name: String = raw_name
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    path.push(format!(
+        "aster-import-{}-{}-{}.sqlite",
+        std::process::id(),
+        current_timestamp(),
+        safe_name
+    ));
+    path
+}
+
+fn sqlite_table_names(connection: &Connection) -> Vec<String> {
+    let Ok(mut statement) =
+        connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+fn chrome_time_to_unix_secs(value: i64) -> u64 {
+    const CHROME_EPOCH_OFFSET_MICROS: i64 = 11_644_473_600_i64 * 1_000_000;
+    if value <= CHROME_EPOCH_OFFSET_MICROS {
+        0
+    } else {
+        ((value - CHROME_EPOCH_OFFSET_MICROS) / 1_000_000) as u64
+    }
+}
+
+fn same_site_from_chromium(value: i32) -> String {
+    match value {
+        1 => "lax",
+        2 => "strict",
+        _ => "none",
+    }
+    .to_string()
+}
+
+fn same_site_from_firefox(value: i32) -> String {
+    match value {
+        1 => "lax",
+        2 => "strict",
+        _ => "none",
+    }
+    .to_string()
+}
+
+fn same_site_from_webview(value: COREWEBVIEW2_COOKIE_SAME_SITE_KIND) -> String {
+    if value == COREWEBVIEW2_COOKIE_SAME_SITE_KIND_LAX {
+        "lax".to_string()
+    } else if value == COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT {
+        "strict".to_string()
+    } else {
+        "none".to_string()
+    }
+}
+
+fn same_site_to_webview(value: &str) -> COREWEBVIEW2_COOKIE_SAME_SITE_KIND {
+    match value.to_ascii_lowercase().as_str() {
+        "lax" => COREWEBVIEW2_COOKIE_SAME_SITE_KIND_LAX,
+        "strict" => COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT,
+        _ => COREWEBVIEW2_COOKIE_SAME_SITE_KIND_NONE,
+    }
+}
+
+fn dpapi_decrypt(bytes: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    if bytes.is_empty() {
+        return Err("empty encrypted payload".to_string());
+    }
+    unsafe {
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: bytes.len() as u32,
+            pbData: bytes.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        CryptUnprotectData(&input, None, None, None, None, 0, &mut output)
+            .map_err(|error| error.to_string())?;
+        let result = if output.pbData.is_null() || output.cbData == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
+        };
+        let _ = LocalFree(Some(HLOCAL(output.pbData as _)));
+        Ok(result)
+    }
+}
+
+fn extract_chromium_profile_key(bytes: &[u8]) -> Option<Vec<u8>> {
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    let encrypted_key = value
+        .get("os_crypt")?
+        .get("encrypted_key")?
+        .as_str()
+        .filter(|key| !key.is_empty())?;
+    let mut decoded = general_purpose::STANDARD.decode(encrypted_key).ok()?;
+    if decoded.starts_with(b"DPAPI") {
+        decoded.drain(0..5);
+    }
+    dpapi_decrypt(&decoded).ok()
+}
+
+fn decrypt_chromium_cookie(bytes: &[u8], key: &[u8]) -> std::result::Result<String, String> {
+    if bytes.is_empty() {
+        return Err("empty encrypted cookie".to_string());
+    }
+    if (bytes.starts_with(b"v10") || bytes.starts_with(b"v11")) && bytes.len() > 15 {
+        let cipher = Aes256Gcm::new_from_slice(key).map_err(|error| error.to_string())?;
+        let nonce = Nonce::from_slice(&bytes[3..15]);
+        let decrypted = cipher
+            .decrypt(nonce, &bytes[15..])
+            .map_err(|error| error.to_string())?;
+        String::from_utf8(decrypted).map_err(|error| error.to_string())
+    } else {
+        let decrypted = dpapi_decrypt(bytes)?;
+        String::from_utf8(decrypted).map_err(|error| error.to_string())
+    }
+}
+
+fn portable_cookie_from_webview(cookie: &ICoreWebView2Cookie) -> Option<PortableCookie> {
+    unsafe {
+        let mut raw = PWSTR::null();
+        cookie.Name(&mut raw).ok()?;
+        let name = take_pwstr(raw);
+        cookie.Value(&mut raw).ok()?;
+        let value = take_pwstr(raw);
+        cookie.Domain(&mut raw).ok()?;
+        let domain = take_pwstr(raw);
+        cookie.Path(&mut raw).ok()?;
+        let path = take_pwstr(raw);
+
+        let mut expires = 0.0f64;
+        let _ = cookie.Expires(&mut expires);
+        let mut session = BOOL(0);
+        let _ = cookie.IsSession(&mut session);
+        let mut secure = BOOL(0);
+        let _ = cookie.IsSecure(&mut secure);
+        let mut http_only = BOOL(0);
+        let _ = cookie.IsHttpOnly(&mut http_only);
+        let mut same_site = COREWEBVIEW2_COOKIE_SAME_SITE_KIND_NONE;
+        let _ = cookie.SameSite(&mut same_site);
+
+        Some(PortableCookie {
+            name,
+            value,
+            domain,
+            path,
+            expires: if session.as_bool() {
+                None
+            } else {
+                Some(expires)
+            },
+            secure: secure.as_bool(),
+            http_only: http_only.as_bool(),
+            same_site: same_site_from_webview(same_site),
+        })
+    }
+}
+
+fn is_account_cookie(cookie: &PortableCookie) -> bool {
+    let domain = cookie.domain.to_ascii_lowercase();
+    if !(domain.contains("google.") || domain.contains("accounts.google.")) {
+        return false;
+    }
+    matches!(
+        cookie.name.as_str(),
+        "SID"
+            | "HSID"
+            | "SSID"
+            | "APISID"
+            | "SAPISID"
+            | "__Secure-1PSID"
+            | "__Secure-3PSID"
+            | "__Secure-1PSIDTS"
+            | "__Secure-3PSIDTS"
+            | "LSID"
+            | "ACCOUNT_CHOOSER"
+    )
+}
+
+fn collect_bookmarks_from_json(value: &Value, folder: &str, out: &mut Vec<PortableBookmark>) {
+    match value {
+        Value::Object(map) => {
+            let name = map
+                .get("name")
+                .or_else(|| map.get("title"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let url = map
+                .get("url")
+                .or_else(|| map.get("uri"))
+                .and_then(Value::as_str);
+            if let Some(url) = url {
+                if !url.trim().is_empty() {
+                    out.push(PortableBookmark {
+                        title: if name.trim().is_empty() {
+                            label_for_url(url)
+                        } else {
+                            name.to_string()
+                        },
+                        url: url.to_string(),
+                        folder: folder.to_string(),
+                        tags: Vec::new(),
+                        created_at: current_timestamp(),
+                    });
+                }
+            }
+            let next_folder = if url.is_none() && !name.trim().is_empty() {
+                name
+            } else {
+                folder
+            };
+            for child in map.values() {
+                collect_bookmarks_from_json(child, next_folder, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_bookmarks_from_json(item, folder, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_history_from_json(value: &Value, out: &mut Vec<PortableHistoryEntry>) {
+    match value {
+        Value::Object(map) => {
+            let has_history_shape = map.contains_key("visit_count")
+                || map.contains_key("visitCount")
+                || map.contains_key("last_visit_time")
+                || map.contains_key("lastVisitTime")
+                || map.contains_key("last_visit_date");
+            if has_history_shape {
+                if let Some(url) = map.get("url").and_then(Value::as_str) {
+                    let title = map
+                        .get("title")
+                        .or_else(|| map.get("name"))
+                        .and_then(Value::as_str)
+                        .map(|title| title.to_string())
+                        .unwrap_or_else(|| label_for_url(url));
+                    out.push(PortableHistoryEntry {
+                        title,
+                        url: url.to_string(),
+                        visit_count: map
+                            .get("visit_count")
+                            .or_else(|| map.get("visitCount"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1)
+                            .max(1) as u32,
+                        last_visit_time: map
+                            .get("last_visit_time")
+                            .or_else(|| map.get("lastVisitTime"))
+                            .or_else(|| map.get("last_visit_date"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or_else(current_timestamp),
+                    });
+                }
+            }
+            for child in map.values() {
+                collect_history_from_json(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_history_from_json(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_cookies_from_json(value: &Value, out: &mut Vec<PortableCookie>) {
+    match value {
+        Value::Object(map) => {
+            let domain = map
+                .get("domain")
+                .or_else(|| map.get("host"))
+                .or_else(|| map.get("host_key"))
+                .and_then(Value::as_str);
+            let name = map.get("name").and_then(Value::as_str);
+            let value_text = map.get("value").and_then(Value::as_str);
+            if let (Some(domain), Some(name), Some(value_text)) = (domain, name, value_text) {
+                out.push(PortableCookie {
+                    name: name.to_string(),
+                    value: value_text.to_string(),
+                    domain: domain.to_string(),
+                    path: map
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/")
+                        .to_string(),
+                    expires: map
+                        .get("expires")
+                        .or_else(|| map.get("expirationDate"))
+                        .or_else(|| map.get("expiry"))
+                        .and_then(Value::as_f64),
+                    secure: map
+                        .get("secure")
+                        .or_else(|| map.get("isSecure"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    http_only: map
+                        .get("http_only")
+                        .or_else(|| map.get("httpOnly"))
+                        .or_else(|| map.get("isHttpOnly"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    same_site: map
+                        .get("same_site")
+                        .or_else(|| map.get("sameSite"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("none")
+                        .to_string(),
+                });
+            }
+            for child in map.values() {
+                collect_cookies_from_json(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_cookies_from_json(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_bookmark_html(raw: &str) -> Vec<PortableBookmark> {
+    let mut bookmarks = Vec::new();
+    let lower = raw.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(rel_start) = lower[cursor..].find("<a ") {
+        let start = cursor + rel_start;
+        let Some(rel_end) = lower[start..].find('>') else {
+            break;
+        };
+        let tag_end = start + rel_end;
+        let tag = &raw[start..=tag_end];
+        let Some(href) = html_attr(tag, "href") else {
+            cursor = tag_end + 1;
+            continue;
+        };
+        let Some(rel_close) = lower[tag_end..].find("</a>") else {
+            break;
+        };
+        let close = tag_end + rel_close;
+        let title = html_unescape(raw[tag_end + 1..close].trim());
+        bookmarks.push(PortableBookmark {
+            title: if title.is_empty() {
+                label_for_url(&href)
+            } else {
+                title
+            },
+            url: html_unescape(&href),
+            folder: String::new(),
+            tags: Vec::new(),
+            created_at: current_timestamp(),
+        });
+        cursor = close + 4;
+    }
+    bookmarks
+}
+
+fn html_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let needle = format!("{attr}=");
+    let pos = lower.find(&needle)? + needle.len();
+    let bytes = tag.as_bytes();
+    let quote = bytes.get(pos).copied().unwrap_or(b' ');
+    if quote == b'"' || quote == b'\'' {
+        let start = pos + 1;
+        let end = tag[start..].find(quote as char)? + start;
+        Some(tag[start..end].to_string())
+    } else {
+        let end = tag[pos..]
+            .find(|ch: char| ch.is_whitespace() || ch == '>')
+            .map(|offset| pos + offset)
+            .unwrap_or(tag.len());
+        Some(tag[pos..end].to_string())
+    }
+}
+
+fn html_unescape(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn html_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn html_escape_attr(value: &str) -> String {
+    html_escape_text(value).replace('"', "&quot;")
+}
+
 fn menu_item(id: usize, label: &str) -> OverlayMenuItem {
     OverlayMenuItem {
         id,
@@ -11834,10 +15053,23 @@ fn settings_page_html(
     site_mode: &str,
     startup_mode: &str,
     is_default: bool,
+    export_json: &str,
+    bookmarks_html: &str,
+    import_notice: &str,
 ) -> String {
     let dominant = colorref_to_css(dominant_color);
     let secondary = colorref_to_css(secondary_color);
     let accent = colorref_to_css(accent_color);
+    let export_json_literal = js_string_literal(export_json);
+    let bookmarks_html_literal = js_string_literal(bookmarks_html);
+    let import_notice_html = if import_notice.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="notice" id="importNotice"><span>{}</span><button class="notice-close" id="clearImportNotice">Close</button></div>"#,
+            html_escape_text(import_notice)
+        )
+    };
     let default_browser_button = if is_default {
         r#"<button class="action-btn" id="makeDefaultBtn" disabled style="opacity: 0.6; cursor: not-allowed;">Aster is default</button>"#
     } else {
@@ -11879,6 +15111,18 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 .action-btn:hover {{ background: var(--panel); }}
 .pill {{ display: inline-flex; align-items: center; gap: 8px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; }}
 .dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }}
+.stack {{ display: grid; gap: 12px; }}
+.actions {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
+.dropzone {{ border: 1px dashed color-mix(in srgb, var(--accent), var(--line) 55%); border-radius: 8px; padding: 18px; background: color-mix(in srgb, var(--panel), #000 14%); min-width: min(420px, 100%); transition: border-color .16s ease, background .16s ease; }}
+.dropzone.dragging {{ border-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 90%); }}
+.drop-title {{ font-weight: 600; }}
+.drop-hint {{ color: var(--muted); font-size: 12px; margin-top: 4px; max-width: 540px; }}
+.notice {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid color-mix(in srgb, var(--accent), var(--line) 58%); background: color-mix(in srgb, var(--accent), transparent 90%); border-radius: 8px; padding: 11px 13px; margin: 0 0 14px; }}
+.notice-close {{ color: var(--muted); border: 0; background: transparent; cursor: pointer; }}
+.notice-close:hover {{ color: var(--text); }}
+.file-input {{ display: none; }}
+.status {{ color: var(--muted); font-size: 12px; min-height: 18px; }}
+@media (max-width: 760px) {{ .row {{ grid-template-columns: minmax(0, 1fr); }} .actions {{ justify-content: stretch; }} .actions .action-btn {{ flex: 1; }} }}
 </style>
 </head>
 <body>
@@ -11913,8 +15157,11 @@ select, .capture {{ min-width: 170px; color: var(--text); background: #080808; b
 </section>
 <section id="privacy">
 <h2>Privacy</h2><p class="lead">Site data and browsing controls.</p>
+{import_notice_html}
 <div class="group">
 <div class="row"><div><div class="title">Browser data</div><div class="hint">View your saved bookmarks, tabs, and settings.</div></div><button class="action-btn" id="openStateFile">Open aster-state</button></div>
+<div class="row"><div><div class="title">Import from another browser</div><div class="hint">Drop bookmark JSON/HTML, history SQLite, cookies SQLite, Aster exports, or a matching Chromium Local State file for account sessions.</div></div><div class="stack"><div class="dropzone" id="importDrop"><div class="drop-title">Drop browser data files here</div><div class="drop-hint">Works with Chrome, Edge, Firefox, and Aster export files. Drop multiple files together when sessions need a profile key.</div></div><div class="actions"><button class="action-btn" id="chooseImport">Choose files</button></div><input class="file-input" id="importInput" type="file" multiple><div class="status" id="importStatus"></div></div></div>
+<div class="row"><div><div class="title">Export data</div><div class="hint">Aster data restores bookmarks, history, and sessions in Aster. Bookmarks HTML can be imported by other browsers.</div></div><div class="actions"><button class="action-btn" id="exportAsterData">Export Aster data</button><button class="action-btn" id="exportBookmarkHtml">Export bookmarks HTML</button></div></div>
 </div>
 </section>
 </main>
@@ -11957,6 +15204,67 @@ document.querySelectorAll(".reset-btn").forEach((btn) => {{
 document.getElementById("openStateFile").onclick = () => post("settings:open-state-file");
 const makeDefaultBtn = document.getElementById("makeDefaultBtn");
 if (makeDefaultBtn) makeDefaultBtn.onclick = () => post("settings:make-default");
+const asterExport = {export_json_literal};
+const bookmarkExport = {bookmarks_html_literal};
+const importStatus = document.getElementById("importStatus");
+const clearImportNotice = document.getElementById("clearImportNotice");
+if (clearImportNotice) clearImportNotice.onclick = () => post("settings:clear-import-notice");
+function dateStamp() {{
+  return new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+}}
+function downloadText(filename, mime, text) {{
+  const blob = new Blob([text], {{ type: mime }});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 800);
+}}
+document.getElementById("exportAsterData").onclick = () => downloadText(`aster-data-${{dateStamp()}}.json`, "application/json", asterExport);
+document.getElementById("exportBookmarkHtml").onclick = () => downloadText(`aster-bookmarks-${{dateStamp()}}.html`, "text/html", bookmarkExport);
+const importDrop = document.getElementById("importDrop");
+const importInput = document.getElementById("importInput");
+document.getElementById("chooseImport").onclick = () => importInput.click();
+importInput.onchange = () => importFiles(importInput.files);
+["dragenter", "dragover"].forEach((name) => importDrop.addEventListener(name, (event) => {{
+  event.preventDefault();
+  importDrop.classList.add("dragging");
+}}));
+["dragleave", "drop"].forEach((name) => importDrop.addEventListener(name, (event) => {{
+  event.preventDefault();
+  if (name === "drop") importFiles(event.dataTransfer.files);
+  importDrop.classList.remove("dragging");
+}}));
+function readFileData(file) {{
+  return new Promise((resolve, reject) => {{
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",").pop() || "");
+    reader.onerror = () => reject(reader.error || new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  }});
+}}
+async function importFiles(files) {{
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  importStatus.textContent = `Preparing ${{list.length}} file${{list.length === 1 ? "" : "s"}}...`;
+  try {{
+    const payload = [];
+    for (const file of list) {{
+      payload.push({{
+        name: file.name,
+        path: file.webkitRelativePath || file.name,
+        content: await readFileData(file)
+      }});
+    }}
+    importStatus.textContent = "Importing...";
+    post("settings:import-files:" + JSON.stringify(payload));
+  }} catch (error) {{
+    importStatus.textContent = error && error.message ? error.message : "Import failed";
+  }}
+}}
 const defaults = [
   ["Navigate", "Ctrl+L"], ["Bookmark site", "Ctrl+D"], ["Find in page", "Ctrl+F"], ["New tab", "Ctrl+T"],
   ["Close tab", "Ctrl+W"], ["Reload", "Ctrl+R"], ["Reset zoom", "Ctrl+0"], ["Zoom in", "Ctrl++"],
@@ -11996,6 +15304,224 @@ defaults.forEach(([name, combo]) => {{
         startup_mode = startup_mode,
         default_browser_button = default_browser_button
     )
+}
+
+fn history_entries_json(entries: &[VisitedSite]) -> String {
+    let items = entries
+        .iter()
+        .filter(|entry| !entry.url.trim().is_empty())
+        .map(|entry| {
+            let title = if entry.title.trim().is_empty() {
+                label_for_url(&entry.url)
+            } else {
+                entry.title.clone()
+            };
+            format!(
+                "{{\"title\":{},\"url\":{},\"visitCount\":{},\"lastVisitTime\":{}}}",
+                js_string_literal(&title),
+                js_string_literal(&entry.url),
+                entry.visit_count,
+                entry.last_visit_time
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", items)
+}
+
+fn history_page_html(
+    dominant_color: u32,
+    secondary_color: u32,
+    accent_color: u32,
+    sort_mode: HistorySortMode,
+    visit_sort_desc: bool,
+    entries: &[VisitedSite],
+) -> String {
+    let dominant = colorref_to_css(dominant_color);
+    let secondary = colorref_to_css(secondary_color);
+    let accent = colorref_to_css(accent_color);
+    let entries_json = history_entries_json(entries);
+    let visit_direction = if visit_sort_desc { "desc" } else { "asc" };
+    let template = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aster History</title>
+<style>
+:root { --accent: __ACCENT__; --bg: __DOMINANT__; --secondary: __SECONDARY__; --panel: __SECONDARY__; --line: #2a2a2a; --text: #f5f5f5; --muted: #a1a1a1; --soft: #151515; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", sans-serif; }
+button, select { font: inherit; }
+.page { min-height: 100vh; padding: 34px clamp(22px, 5vw, 72px); }
+.header { display: flex; align-items: end; justify-content: space-between; gap: 20px; max-width: 1040px; margin: 0 auto 26px; }
+h1 { font-size: 28px; line-height: 1.1; margin: 0 0 7px; font-weight: 650; }
+.lead { color: var(--muted); margin: 0; }
+.controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+select { color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; min-width: 148px; }
+.wrap { max-width: 1040px; margin: 0 auto; }
+.empty { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 28px; color: var(--muted); }
+.year { margin: 28px 0 0; }
+.year-title { color: var(--text); font-size: 20px; font-weight: 650; margin: 0 0 14px; }
+.month { margin: 0 0 20px; }
+.month-title { color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; margin: 18px 0 10px; }
+.day { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; overflow: hidden; margin: 10px 0 14px; }
+.day-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--panel), #000 18%); }
+.day-name { font-weight: 600; }
+.day-count { color: var(--muted); font-size: 12px; }
+.item { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; text-align: left; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--text); padding: 13px 16px; cursor: pointer; }
+.item:first-of-type { border-top: 0; }
+.item:hover, .item:focus-visible { background: color-mix(in srgb, var(--accent), transparent 88%); outline: none; }
+.title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 560; }
+.url { color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; margin-top: 2px; font-size: 12px; }
+.meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 8px; vertical-align: 1px; }
+@media (max-width: 720px) {
+  .header { align-items: stretch; flex-direction: column; }
+  .controls { justify-content: stretch; }
+  select { flex: 1 1 180px; min-width: 0; }
+  .item { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="header">
+    <div>
+      <h1>Aster History</h1>
+      <p class="lead">Visited pages grouped by date.</p>
+    </div>
+    <div class="controls">
+      <select id="sortMode" aria-label="Sort history">
+        <option value="latest">Latest</option>
+        <option value="oldest">Oldest</option>
+        <option value="most_visited">Most visited</option>
+      </select>
+      <select id="visitDirection" aria-label="Most visited direction">
+        <option value="desc">Most visited first</option>
+        <option value="asc">Least visited first</option>
+      </select>
+    </div>
+  </header>
+  <main class="wrap" id="history"></main>
+</div>
+<script>
+const post = (m) => window.chrome?.webview?.postMessage(m);
+const entries = __ENTRIES__;
+const sortMode = document.getElementById("sortMode");
+const visitDirection = document.getElementById("visitDirection");
+sortMode.value = "__SORT_MODE__";
+visitDirection.value = "__VISIT_DIRECTION__";
+function cleanUrl(url) {
+  return String(url || "").replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "");
+}
+function itemTitle(item) {
+  return item.title && item.title !== "New Tab" ? item.title : cleanUrl(item.url);
+}
+function dayLabel(date) {
+  const today = new Date();
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const then = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const diff = Math.round((start - then) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  return date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+}
+function monthLabel(year, month) {
+  return new Date(year, month, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+function visitText(count) {
+  return count === 1 ? "1 visit" : `${count} visits`;
+}
+function sortItems(items) {
+  const mode = sortMode.value;
+  const byVisit = visitDirection.value === "asc" ? 1 : -1;
+  return items.slice().sort((a, b) => {
+    if (mode === "most_visited") {
+      const visits = (a.visitCount - b.visitCount) * byVisit;
+      if (visits !== 0) return visits;
+      return b.lastVisitTime - a.lastVisitTime;
+    }
+    return mode === "oldest"
+      ? a.lastVisitTime - b.lastVisitTime
+      : b.lastVisitTime - a.lastVisitTime;
+  });
+}
+function render() {
+  const root = document.getElementById("history");
+  root.textContent = "";
+  visitDirection.style.display = sortMode.value === "most_visited" ? "" : "none";
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No browsing history yet.";
+    root.appendChild(empty);
+    return;
+  }
+  const grouped = new Map();
+  for (const item of entries) {
+    const date = new Date((item.lastVisitTime || 0) * 1000);
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    const dayKey = `${year}-${month}-${date.getDate()}`;
+    if (!grouped.has(year)) grouped.set(year, new Map());
+    if (!grouped.get(year).has(month)) grouped.get(year).set(month, new Map());
+    if (!grouped.get(year).get(month).has(dayKey)) grouped.get(year).get(month).set(dayKey, { date, items: [] });
+    grouped.get(year).get(month).get(dayKey).items.push(item);
+  }
+  const groupDir = sortMode.value === "oldest" ? 1 : -1;
+  for (const [year, months] of [...grouped.entries()].sort((a, b) => (a[0] - b[0]) * groupDir)) {
+    const yearEl = document.createElement("section");
+    yearEl.className = "year";
+    yearEl.innerHTML = `<h2 class="year-title">${year}</h2>`;
+    for (const [month, days] of [...months.entries()].sort((a, b) => (a[0] - b[0]) * groupDir)) {
+      const monthEl = document.createElement("section");
+      monthEl.className = "month";
+      monthEl.innerHTML = `<h3 class="month-title">${monthLabel(year, month)}</h3>`;
+      for (const day of [...days.values()].sort((a, b) => (a.date - b.date) * groupDir)) {
+        const dayEl = document.createElement("section");
+        dayEl.className = "day";
+        const total = day.items.reduce((sum, item) => sum + item.visitCount, 0);
+        const head = document.createElement("div");
+        head.className = "day-head";
+        head.innerHTML = `<div class="day-name"><span class="dot"></span>${dayLabel(day.date)}</div><div class="day-count">${visitText(total)}</div>`;
+        dayEl.appendChild(head);
+        for (const item of sortItems(day.items)) {
+          const row = document.createElement("button");
+          row.className = "item";
+          row.type = "button";
+          row.innerHTML = `<div><div class="title"></div><div class="url"></div></div><div class="meta">${visitText(item.visitCount)}</div>`;
+          row.querySelector(".title").textContent = itemTitle(item);
+          row.querySelector(".url").textContent = cleanUrl(item.url);
+          row.onclick = () => post("history:open:" + encodeURIComponent(item.url));
+          dayEl.appendChild(row);
+        }
+        monthEl.appendChild(dayEl);
+      }
+      yearEl.appendChild(monthEl);
+    }
+    root.appendChild(yearEl);
+  }
+}
+sortMode.onchange = () => {
+  render();
+  post("history:sort:" + sortMode.value);
+};
+visitDirection.onchange = () => {
+  render();
+  post("history:visit-direction:" + visitDirection.value);
+};
+render();
+</script>
+</body>
+</html>"#;
+    template
+        .replace("__ACCENT__", &accent)
+        .replace("__DOMINANT__", &dominant)
+        .replace("__SECONDARY__", &secondary)
+        .replace("__ENTRIES__", &entries_json)
+        .replace("__SORT_MODE__", sort_mode.as_str())
+        .replace("__VISIT_DIRECTION__", visit_direction)
 }
 
 fn mix_color(from: u32, to: u32, amount: f32) -> u32 {
@@ -12150,6 +15676,9 @@ fn normalize_address(raw: &str) -> String {
     }
     if value.eq_ignore_ascii_case(":settings") || value.eq_ignore_ascii_case("aster:settings") {
         return "aster:settings".to_string();
+    }
+    if value.eq_ignore_ascii_case(":history") || value.eq_ignore_ascii_case("aster:history") {
+        return "aster:history".to_string();
     }
     if value.contains("://") || value.starts_with("about:") {
         value.to_string()
@@ -12508,6 +16037,7 @@ fn previous_root_row(
         .take_while(|(row, _)| pinned || !matches!(row, SidebarRow::Label(SidebarLabel::Tabs)))
         .find_map(|(row, _)| match *row {
             SidebarRow::Folder(folder_id) => Some(SidebarRow::Folder(folder_id)),
+            SidebarRow::SplitGroup(group_id) => Some(SidebarRow::SplitGroup(group_id)),
             SidebarRow::Tab(tab_index) => Some(SidebarRow::Tab(tab_index)),
             SidebarRow::TabGhost(_) | SidebarRow::Label(_) => None,
         })
@@ -12613,7 +16143,7 @@ fn is_aster_default_browser() -> bool {
        .arg("/v")
        .arg("ProgId");
     cmd.creation_flags(CREATE_NO_WINDOW);
-    
+
     if let Ok(output) = cmd.output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         stdout.contains("AsterHTML")
@@ -12626,27 +16156,105 @@ fn make_aster_default_browser() {
     use std::os::windows::process::CommandExt;
     if let Ok(exe_path) = std::env::current_exe() {
         let exe_str = exe_path.to_string_lossy();
-        
+
         let keys = vec![
-            ("HKCU\\Software\\Classes\\AsterHTML".to_string(), "".to_string(), "REG_SZ".to_string(), "Aster HTML Document".to_string()),
-            ("HKCU\\Software\\Classes\\AsterHTML".to_string(), "URL Protocol".to_string(), "REG_SZ".to_string(), "".to_string()),
-            ("HKCU\\Software\\Classes\\AsterHTML\\DefaultIcon".to_string(), "".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
-            ("HKCU\\Software\\Classes\\AsterHTML\\shell\\open\\command".to_string(), "".to_string(), "REG_SZ".to_string(), format!("\"{}\" \"%1\"", exe_str)),
-            
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster".to_string(), "".to_string(), "REG_SZ".to_string(), "Aster".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationDescription".to_string(), "REG_SZ".to_string(), "Aster Web Browser".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationIcon".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(), "ApplicationName".to_string(), "REG_SZ".to_string(), "Aster".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations".to_string(), ".htm".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations".to_string(), ".html".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations".to_string(), "http".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations".to_string(), "https".to_string(), "REG_SZ".to_string(), "AsterHTML".to_string()),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\DefaultIcon".to_string(), "".to_string(), "REG_SZ".to_string(), format!("{},0", exe_str)),
-            ("HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\shell\\open\\command".to_string(), "".to_string(), "REG_SZ".to_string(), format!("\"{}\"", exe_str)),
-            
-            ("HKCU\\Software\\RegisteredApplications".to_string(), "Aster".to_string(), "REG_SZ".to_string(), "Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string()),
+            (
+                "HKCU\\Software\\Classes\\AsterHTML".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                "Aster HTML Document".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Classes\\AsterHTML".to_string(),
+                "URL Protocol".to_string(),
+                "REG_SZ".to_string(),
+                "".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Classes\\AsterHTML\\DefaultIcon".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                format!("{},0", exe_str),
+            ),
+            (
+                "HKCU\\Software\\Classes\\AsterHTML\\shell\\open\\command".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                format!("\"{}\" \"%1\"", exe_str),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                "Aster".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(),
+                "ApplicationDescription".to_string(),
+                "REG_SZ".to_string(),
+                "Aster Web Browser".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(),
+                "ApplicationIcon".to_string(),
+                "REG_SZ".to_string(),
+                format!("{},0", exe_str),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(),
+                "ApplicationName".to_string(),
+                "REG_SZ".to_string(),
+                "Aster".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations"
+                    .to_string(),
+                ".htm".to_string(),
+                "REG_SZ".to_string(),
+                "AsterHTML".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\FileAssociations"
+                    .to_string(),
+                ".html".to_string(),
+                "REG_SZ".to_string(),
+                "AsterHTML".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations"
+                    .to_string(),
+                "http".to_string(),
+                "REG_SZ".to_string(),
+                "AsterHTML".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\Capabilities\\URLAssociations"
+                    .to_string(),
+                "https".to_string(),
+                "REG_SZ".to_string(),
+                "AsterHTML".to_string(),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\DefaultIcon".to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                format!("{},0", exe_str),
+            ),
+            (
+                "HKCU\\Software\\Clients\\StartMenuInternet\\Aster\\shell\\open\\command"
+                    .to_string(),
+                "".to_string(),
+                "REG_SZ".to_string(),
+                format!("\"{}\"", exe_str),
+            ),
+            (
+                "HKCU\\Software\\RegisteredApplications".to_string(),
+                "Aster".to_string(),
+                "REG_SZ".to_string(),
+                "Software\\Clients\\StartMenuInternet\\Aster\\Capabilities".to_string(),
+            ),
         ];
-        
+
         for (key, val_name, val_type, val_data) in keys {
             let mut cmd = std::process::Command::new("reg");
             cmd.arg("add").arg(&key);
@@ -12655,18 +16263,25 @@ fn make_aster_default_browser() {
             } else {
                 cmd.arg("/ve");
             }
-            cmd.arg("/t").arg(&val_type).arg("/d").arg(&val_data).arg("/f");
+            cmd.arg("/t")
+                .arg(&val_type)
+                .arg("/d")
+                .arg(&val_data)
+                .arg("/f");
             cmd.creation_flags(CREATE_NO_WINDOW);
             let _ = cmd.output();
         }
-        
+
         let _ = std::process::Command::new("cmd")
-            .args(&["/c", "start", "ms-settings:defaultapps?registeredAppUser=Aster"])
+            .args(&[
+                "/c",
+                "start",
+                "ms-settings:defaultapps?registeredAppUser=Aster",
+            ])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -12746,6 +16361,66 @@ mod tests {
         assert_eq!(
             strip_google_transient_params("https://github.com/"),
             "https://github.com/"
+        );
+    }
+
+    #[test]
+    fn test_collect_bookmarks_from_json() {
+        let raw = serde_json::json!({
+            "roots": {
+                "bookmark_bar": {
+                    "name": "Bookmarks bar",
+                    "children": [
+                        { "type": "url", "name": "Aster", "url": "https://aster.example" }
+                    ]
+                }
+            }
+        });
+        let mut bookmarks = Vec::new();
+        collect_bookmarks_from_json(&raw, "", &mut bookmarks);
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].title, "Aster");
+        assert_eq!(bookmarks[0].folder, "Bookmarks bar");
+    }
+
+    #[test]
+    fn test_parse_bookmark_html() {
+        let raw = r#"<!DOCTYPE NETSCAPE-Bookmark-file-1><DL><p><DT><A HREF="https://example.com?a=1&amp;b=2">Example &amp; Co</A></DL><p>"#;
+        let bookmarks = parse_bookmark_html(raw);
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].url, "https://example.com?a=1&b=2");
+        assert_eq!(bookmarks[0].title, "Example & Co");
+    }
+
+    #[test]
+    fn test_chrome_time_to_unix_secs() {
+        let unix = 1_700_000_000u64;
+        let chrome = 11_644_473_600_i64 * 1_000_000 + unix as i64 * 1_000_000;
+        assert_eq!(chrome_time_to_unix_secs(chrome), unix);
+    }
+
+    #[test]
+    fn test_favicon_discovery_helpers() {
+        let html = r#"
+            <html><head>
+              <link rel="preload" href="/not-icon.png">
+              <link rel="shortcut icon" href="/favicon-32.png">
+              <link href='touch.png' rel='apple-touch-icon'>
+            </head></html>
+        "#;
+        let hrefs = extract_favicon_hrefs(html);
+        assert_eq!(hrefs, vec!["/favicon-32.png", "touch.png"]);
+        assert_eq!(
+            resolve_url("https://example.com/docs/page", "/favicon-32.png"),
+            Some("https://example.com/favicon-32.png".to_string())
+        );
+        assert_eq!(
+            resolve_url("https://example.com/docs/page", "touch.png"),
+            Some("https://example.com/docs/touch.png".to_string())
+        );
+        assert_eq!(
+            favicon_candidate_urls("https://example.com/docs/page", None),
+            vec!["https://example.com/favicon.ico".to_string()]
         );
     }
 }
