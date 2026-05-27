@@ -24,8 +24,8 @@ use windows::{
     core::*,
     Win32::{
         Foundation::{
-            LocalFree, COLORREF, E_POINTER, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT, POINT, RECT,
-            WPARAM,
+            LocalFree, COLORREF, E_POINTER, GENERIC_READ, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT,
+            POINT, RECT, WPARAM,
         },
         Graphics::Dwm::{
             DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR,
@@ -48,7 +48,7 @@ use windows::{
             WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
         },
         Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
-        System::{Com::*, LibraryLoader},
+        System::{Com::*, Com::Urlmon::URLDownloadToCacheFileW, LibraryLoader},
         UI::{
             Controls::{EM_SETMARGINS, EM_SETSEL, MARGINS},
             HiDpi,
@@ -97,6 +97,7 @@ const SPLIT_MAX_PANES: usize = 4;
 const SPLIT_GAP: i32 = 6;
 const STATE_FILE: &str = ".aster-state";
 const FOCUS_EDIT_MSG: u32 = WM_APP + 1;
+const FAVICON_FETCHED_MSG: u32 = WM_APP + 2;
 const WM_COPYDATA: u32 = 0x004A;
 
 #[allow(non_snake_case)]
@@ -217,6 +218,11 @@ struct FaviconBitmap {
     handle: HBITMAP,
     width: i32,
     height: i32,
+}
+
+struct FaviconFetchResult {
+    host: String,
+    path: String,
 }
 
 impl Drop for FaviconBitmap {
@@ -812,6 +818,8 @@ struct App {
     bookmarks: Vec<Bookmark>,
     tabs: Vec<Tab>,
     split_groups: Vec<SplitGroup>,
+    favicon_cache: HashMap<String, FaviconBitmap>,
+    pending_favicon_hosts: Vec<String>,
     active_workspace: usize,
     active: usize,
     next_id: usize,
@@ -983,6 +991,8 @@ impl App {
             bookmarks: Vec::new(),
             tabs: Vec::new(),
             split_groups: Vec::new(),
+            favicon_cache: HashMap::new(),
+            pending_favicon_hosts: Vec::new(),
             active_workspace: 1,
             active: 0,
             next_id: 1,
@@ -4412,16 +4422,32 @@ impl App {
         if let Some((url, title)) = suggestion {
             self.remember_suggestion(url, title);
         }
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+            let url = tab.url.clone();
+            let favicon_uri = tab.favicon_uri.clone();
+            self.request_favicon_for_url(&url, Some(&favicon_uri));
+        }
         self.save_state();
         self.refresh();
     }
 
     fn update_tab_favicon_uri(&mut self, tab_id: usize, favicon_uri: String) {
+        let mut page_url = None;
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             if tab.is_sleeping {
                 return;
             }
             tab.favicon_uri = favicon_uri;
+            page_url = Some(tab.url.clone());
+        }
+        if let Some(url) = page_url {
+            let favicon_uri = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| tab.favicon_uri.clone())
+                .unwrap_or_default();
+            self.request_favicon_for_url(&url, Some(&favicon_uri));
         }
         self.refresh();
     }
@@ -4434,6 +4460,94 @@ impl App {
             tab.favicon_bitmap = Some(favicon);
         }
         self.refresh();
+    }
+
+    fn request_missing_favicons(&mut self) {
+        let tab_requests: Vec<(String, String)> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.favicon_bitmap.is_none())
+            .map(|tab| (tab.url.clone(), tab.favicon_uri.clone()))
+            .collect();
+        for (url, favicon_uri) in tab_requests {
+            self.request_favicon_for_url(&url, Some(&favicon_uri));
+        }
+        let history_urls: Vec<String> = self
+            .visited_sites
+            .iter()
+            .take(80)
+            .map(|site| site.url.clone())
+            .collect();
+        for url in history_urls {
+            self.request_favicon_for_url(&url, None);
+        }
+    }
+
+    fn request_command_favicons(&mut self) {
+        let urls: Vec<String> = self
+            .command_suggestions()
+            .into_iter()
+            .take(16)
+            .map(|(_, _, url)| url)
+            .collect();
+        for url in urls {
+            self.request_favicon_for_url(&url, None);
+        }
+    }
+
+    fn request_favicon_for_url(&mut self, url: &str, known_favicon_uri: Option<&str>) {
+        if url.trim().is_empty() || url.starts_with("aster:") || url == "about:blank" {
+            return;
+        }
+        let host = display_host(url);
+        if host.is_empty()
+            || self.favicon_cache.contains_key(&host)
+            || self.pending_favicon_hosts.iter().any(|pending| pending == &host)
+        {
+            return;
+        }
+        let candidates = favicon_candidate_urls(url, known_favicon_uri);
+        if candidates.is_empty() {
+            return;
+        }
+        self.pending_favicon_hosts.push(host.clone());
+        let hwnd_raw = self.hwnd.0 as isize;
+        let page_url = url.to_string();
+        std::thread::spawn(move || {
+            let path = download_first_favicon(&candidates, &page_url).unwrap_or_default();
+            let result = Box::new(FaviconFetchResult { host, path });
+            let ptr = Box::into_raw(result);
+            let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+            let posted = unsafe {
+                WindowsAndMessaging::PostMessageW(
+                    Some(hwnd),
+                    FAVICON_FETCHED_MSG,
+                    WPARAM(ptr as usize),
+                    LPARAM(0),
+                )
+                .is_ok()
+            };
+            if !posted {
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        });
+    }
+
+    fn complete_favicon_fetch(&mut self, result: FaviconFetchResult) {
+        self.pending_favicon_hosts
+            .retain(|host| host != &result.host);
+        if result.path.is_empty() {
+            return;
+        }
+        if self.favicon_cache.contains_key(&result.host) {
+            return;
+        }
+        if let Some(bitmap) = decode_favicon_file(&result.path) {
+            self.favicon_cache.insert(result.host, bitmap);
+            self.refresh();
+        }
     }
 
     fn update_tab_audio(&mut self, tab_id: usize, playing: Option<bool>, muted: Option<bool>) {
@@ -5013,6 +5127,7 @@ impl App {
             total.absorb(stats);
         }
         self.save_state();
+        self.request_missing_favicons();
         total
     }
 
@@ -5518,6 +5633,7 @@ impl App {
             CommandMode::NewWorkspace | CommandMode::RenameWorkspace(_) => "Workspace name...",
         };
         set_edit_cue_banner(self.address_hwnd, cue);
+        self.request_command_favicons();
         self.layout();
         unsafe {
             let _ =
@@ -6500,6 +6616,52 @@ impl App {
         vec![(active_tab.id, bounds)]
     }
 
+    fn split_preview_pane_rects(&self, bounds: RECT) -> Option<(Vec<(usize, RECT)>, RECT)> {
+        let target = self.split_drop_target?;
+        let drag = self.drag_state?;
+        let DragSource::Tab(source_index) = drag.source else {
+            return None;
+        };
+        let source_tab_id = self.tabs.get(source_index).map(|tab| tab.id)?;
+        if source_tab_id == target.target_tab_id {
+            return None;
+        }
+        let mut tab_ids = self
+            .split_group_for_tab_id(target.target_tab_id)
+            .and_then(|group_id| self.split_group(group_id))
+            .map(|group| group.tab_ids.clone())
+            .unwrap_or_else(|| vec![target.target_tab_id]);
+        tab_ids.retain(|tab_id| *tab_id != source_tab_id);
+        let target_pos = tab_ids
+            .iter()
+            .position(|tab_id| *tab_id == target.target_tab_id)?;
+        if tab_ids.len() + 1 > SPLIT_MAX_PANES {
+            return None;
+        }
+        let insert_at = match target.zone {
+            SplitDropZone::Left | SplitDropZone::Top => target_pos,
+            SplitDropZone::Right | SplitDropZone::Bottom => target_pos + 1,
+        }
+        .min(tab_ids.len());
+        let mut slots: Vec<Option<usize>> = tab_ids.into_iter().map(Some).collect();
+        slots.insert(insert_at, None);
+        let layout = match target.zone {
+            SplitDropZone::Left | SplitDropZone::Right => SplitLayout::Horizontal,
+            SplitDropZone::Top | SplitDropZone::Bottom => SplitLayout::Vertical,
+        };
+        let rects = self.split_layout_rects_for(bounds, layout, slots.len());
+        let mut existing = Vec::new();
+        let mut placeholder = None;
+        for (slot, rect) in slots.into_iter().zip(rects) {
+            if let Some(tab_id) = slot {
+                existing.push((tab_id, rect));
+            } else {
+                placeholder = Some(rect);
+            }
+        }
+        placeholder.map(|placeholder| (existing, placeholder))
+    }
+
     fn shrink_rect_for_split_preview(&self, rect: RECT, zone: SplitDropZone) -> RECT {
         let width = (rect.right - rect.left).max(1);
         let height = (rect.bottom - rect.top).max(1);
@@ -6532,6 +6694,9 @@ impl App {
     }
 
     fn split_placeholder_rect(&self) -> Option<RECT> {
+        if let Some((_, placeholder)) = self.split_preview_pane_rects(self.web_content_bounds()) {
+            return Some(placeholder);
+        }
         let target = self.split_drop_target?;
         let bounds = self.web_content_bounds();
         let pane = self
@@ -6714,7 +6879,10 @@ impl App {
         let was_clipped = self.last_clip_width.get() != 0.0 || self.last_clip_top.get() != 0.0;
         let should_clear =
             (!needs_clipping || (sidebar_width <= 0 && self.topbar_height <= 0.0)) && was_clipped;
-        let active_panes = self.active_pane_rects(bounds);
+        let active_panes = self
+            .split_preview_pane_rects(bounds)
+            .map(|(panes, _)| panes)
+            .unwrap_or_else(|| self.active_pane_rects(bounds));
         for tab in self.tabs.iter() {
             unsafe {
                 let pane_rect = active_panes
@@ -6724,16 +6892,7 @@ impl App {
                 let is_visible = pane_rect.is_some()
                     && tab.workspace_id == self.active_workspace
                     && !tab.unloaded;
-                if let Some(mut tab_bounds) = pane_rect {
-                    if self
-                        .split_drop_target
-                        .map(|target| target.target_tab_id == tab.id)
-                        .unwrap_or(false)
-                    {
-                        if let Some(target) = self.split_drop_target {
-                            tab_bounds = self.shrink_rect_for_split_preview(tab_bounds, target.zone);
-                        }
-                    }
+                if let Some(tab_bounds) = pane_rect {
                     let _ = tab.controller.SetBounds(tab_bounds);
                     let _ = WindowsAndMessaging::SetWindowPos(
                         tab.child_hwnd,
@@ -8244,6 +8403,35 @@ impl App {
         }
     }
 
+    fn paint_tab_favicon(&self, hdc: HDC, rect: RECT, tab: &Tab, dimmed: bool) {
+        unsafe {
+            if let Some(favicon) = tab.favicon_bitmap.as_ref() {
+                draw_bitmap_fit(hdc, rect, favicon, dimmed);
+                return;
+            }
+            let host = display_host(&tab.url);
+            if let Some(favicon) = self.favicon_cache.get(&host) {
+                draw_bitmap_fit(hdc, rect, favicon, dimmed);
+                return;
+            }
+            draw_tab_favicon(hdc, &self.fonts.small, rect, tab, dimmed);
+        }
+    }
+
+    fn paint_url_favicon(&self, hdc: HDC, rect: RECT, url: &str, dimmed: bool) -> bool {
+        let host = display_host(url);
+        if host.is_empty() {
+            return false;
+        }
+        if let Some(favicon) = self.favicon_cache.get(&host) {
+            unsafe {
+                draw_bitmap_fit(hdc, rect, favicon, dimmed);
+            }
+            return true;
+        }
+        false
+    }
+
     fn paint_command_popup(&self, hdc: HDC) {
         unsafe {
             let rect = client_rect(self.command_hwnd);
@@ -8324,7 +8512,9 @@ impl App {
                 };
                 let mut favicon_drawn = false;
                 if let Some(index) = tab_index.and_then(|index| self.tabs.get(index)) {
-                    draw_tab_favicon(hdc, &self.fonts.small, favicon, index, false);
+                    self.paint_tab_favicon(hdc, favicon, index, false);
+                    favicon_drawn = true;
+                } else if self.paint_url_favicon(hdc, favicon, &url, false) {
                     favicon_drawn = true;
                 } else {
                     let host = display_host(&url);
@@ -8334,7 +8524,7 @@ impl App {
                             .iter()
                             .find(|t| t.favicon_bitmap.is_some() && display_host(&t.url) == host)
                         {
-                            draw_tab_favicon(hdc, &self.fonts.small, favicon, matching_tab, false);
+                            self.paint_tab_favicon(hdc, favicon, matching_tab, false);
                             favicon_drawn = true;
                         }
                     }
@@ -8728,7 +8918,41 @@ impl App {
                 Some(SplitDropZone::Bottom) => "Split bottom",
                 None => "Split",
             };
-            draw_centered_text(hdc, &self.fonts.body, label, inset, COLOR_TEXT);
+            let mut label_rect = inset;
+            label_rect.bottom = ((inset.top + inset.bottom) / 2).min(inset.top + 42);
+            draw_centered_text(hdc, &self.fonts.body, label, label_rect, COLOR_TEXT);
+            if let Some(DragState {
+                source: DragSource::Tab(index),
+                ..
+            }) = self.drag_state
+            {
+                if let Some(tab) = self.tabs.get(index) {
+                    let title = if tab.title.trim().is_empty() {
+                        label_for_url(&tab.url)
+                    } else {
+                        tab.title.clone()
+                    };
+                    let icon = RECT {
+                        left: inset.left + 18,
+                        top: label_rect.bottom + 10,
+                        right: inset.left + 38,
+                        bottom: label_rect.bottom + 30,
+                    };
+                    self.paint_tab_favicon(hdc, icon, tab, false);
+                    draw_text(
+                        hdc,
+                        &self.fonts.body,
+                        &title,
+                        RECT {
+                            left: icon.right + 10,
+                            top: icon.top - 6,
+                            right: inset.right - 18,
+                            bottom: icon.bottom + 6,
+                        },
+                        COLOR_TEXT,
+                    );
+                }
+            }
         }
     }
 
@@ -8809,7 +9033,7 @@ impl App {
                 right: favicon_left + 18,
                 bottom: item.top + 29,
             };
-            draw_tab_favicon(hdc, &self.fonts.small, favicon, tab, is_ghost);
+            self.paint_tab_favicon(hdc, favicon, tab, is_ghost);
             let text_color = if is_ghost {
                 0x555555
             } else if Some(index) == self.active_tab_index() {
@@ -8930,25 +9154,54 @@ impl App {
                 bottom: row.bottom - 8,
             };
             fill_round_rect(hdc, accent, self.accent_color, 3);
-            let icon_rect = RECT {
+            let mini = RECT {
                 left: row.left + 20,
-                top: row.top + 9,
-                right: row.left + 42,
-                bottom: row.top + 31,
+                top: row.top + 8,
+                right: row.left + 58,
+                bottom: row.bottom - 8,
             };
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.toolbar_icon,
-                glyph(0xE9F9).as_str(),
-                icon_rect,
-                COLOR_TEXT,
+            fill_round_rect(hdc, mini, 0x101010, 6);
+            draw_outline(hdc, mini, COLOR_BORDER, 6);
+            let mini_cells = self.split_layout_rects_for(
+                RECT {
+                    left: mini.left + 4,
+                    top: mini.top + 4,
+                    right: mini.right - 4,
+                    bottom: mini.bottom - 4,
+                },
+                group.layout,
+                group.tab_ids.len(),
             );
+            for (tab_id, cell) in group.tab_ids.iter().copied().zip(mini_cells) {
+                let is_active_cell = active
+                    .map(|tab| tab.id == tab_id)
+                    .unwrap_or(false);
+                fill_round_rect(
+                    hdc,
+                    cell,
+                    if is_active_cell {
+                        self.accent_color
+                    } else {
+                        self.secondary_color
+                    },
+                    4,
+                );
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+                    let icon = RECT {
+                        left: cell.left + 2,
+                        top: cell.top + 2,
+                        right: cell.right - 2,
+                        bottom: cell.bottom - 2,
+                    };
+                    self.paint_tab_favicon(hdc, icon, tab, !is_active_cell);
+                }
+            }
             draw_text(
                 hdc,
                 &self.fonts.body,
                 &title,
                 RECT {
-                    left: row.left + 48,
+                    left: row.left + 68,
                     top: row.top + 2,
                     right: row.right - 42,
                     bottom: row.top + 29,
@@ -8969,7 +9222,7 @@ impl App {
                 &self.fonts.small,
                 &subtitle,
                 RECT {
-                    left: row.left + 48,
+                    left: row.left + 68,
                     top: row.top + 25,
                     right: row.right - 42,
                     bottom: row.bottom,
@@ -9411,10 +9664,11 @@ impl App {
                     .active_tab_index()
                     .map(|active| active != index)
                     .unwrap_or(false)
+                    || self.active_workspace_tabs().len() > 1
                 {
-                    labels.push((MENU_TAB_SPLIT_WITH_ACTIVE, "Split With Active".to_string()));
-                } else if self.active_workspace_tabs().len() > 1 {
-                    labels.push((MENU_TAB_SPLIT_NEXT, "Split With Next Tab".to_string()));
+                    labels.push((MENU_TAB_SPLIT_HORIZONTAL, "Split Horizontally".to_string()));
+                    labels.push((MENU_TAB_SPLIT_VERTICAL, "Split Vertically".to_string()));
+                    labels.push((MENU_TAB_SPLIT_GRID, "Split as Grid".to_string()));
                 }
                 labels.push((MENU_WORKSPACE_NEW_FOLDER, "New Folder".to_string()));
                 if tab.folder_id.is_some() {
@@ -9771,6 +10025,8 @@ impl App {
                                 }
                                 self.layout();
                                 self.refresh();
+                            } else {
+                                self.split_tab_with_active(index, SplitLayout::Horizontal);
                             }
                         }
                         MENU_TAB_SPLIT_VERTICAL => {
@@ -9784,6 +10040,8 @@ impl App {
                                 }
                                 self.layout();
                                 self.refresh();
+                            } else {
+                                self.split_tab_with_active(index, SplitLayout::Vertical);
                             }
                         }
                         MENU_TAB_SPLIT_GRID => {
@@ -9797,6 +10055,8 @@ impl App {
                                 }
                                 self.layout();
                                 self.refresh();
+                            } else {
+                                self.split_tab_with_active(index, SplitLayout::Grid);
                             }
                         }
                         MENU_TAB_CLOSE => self.close_tab(index),
@@ -10148,9 +10408,9 @@ impl App {
         }
     }
 
-    fn start_drag_candidate(&mut self, x: i32, y: i32) {
+    fn start_drag_candidate(&mut self, x: i32, y: i32) -> bool {
         if self.renaming_folder_id.is_some() {
-            return;
+            return false;
         }
         if let Some(SidebarHit::Tab(index)) = self.hit_sidebar(x, y) {
             if let Some(row) = self.sidebar_row_rect_for_tab(index) {
@@ -10169,6 +10429,7 @@ impl App {
                         current_x: x,
                         current_y: y,
                     });
+                    return true;
                 }
             }
         } else if let Some(SidebarHit::Folder(folder_id)) = self.hit_sidebar(x, y) {
@@ -10185,8 +10446,10 @@ impl App {
                     current_x: x,
                     current_y: y,
                 });
+                return true;
             }
         }
+        false
     }
 
     fn finish_drag(&mut self, x: i32, y: i32) -> bool {
@@ -10579,7 +10842,7 @@ impl App {
                             right: favicon_left + 18,
                             bottom: 29,
                         };
-                        draw_tab_favicon(mem_dc, &self.fonts.small, favicon, tab, false);
+                        self.paint_tab_favicon(mem_dc, favicon, tab, false);
                         draw_text(
                             mem_dc,
                             &self.fonts.body,
@@ -11074,6 +11337,7 @@ fn main() -> AppResult<()> {
     let app = Box::new(App::new(hwnd, environment)?);
     unsafe {
         SetWindowLong(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
+        with_app(hwnd, |app| app.request_missing_favicons());
         let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOW);
         let _ = Gdi::UpdateWindow(hwnd);
     }
@@ -11922,6 +12186,16 @@ unsafe extern "system" fn bookmark_popup_proc(
 
 extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     match msg {
+        msg if msg == FAVICON_FETCHED_MSG => {
+            let ptr = w_param.0 as *mut FaviconFetchResult;
+            if !ptr.is_null() {
+                unsafe {
+                    let result = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.complete_favicon_fetch(result));
+                }
+            }
+            LRESULT(0)
+        }
         WM_COPYDATA => {
             unsafe {
                 let cds = &*(l_param.0 as *const COPYDATASTRUCT);
@@ -12138,17 +12412,36 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             let x = loword(l_param.0 as u32) as i16 as i32;
             let y = hiword(l_param.0 as u32) as i16 as i32;
             with_app(hwnd, |app| {
-                app.start_drag_candidate(x, y);
-                app.handle_click(x, y);
+                if !app.start_drag_candidate(x, y) {
+                    app.handle_click(x, y);
+                }
             });
             LRESULT(0)
         }
-        WindowsAndMessaging::WM_LBUTTONDBLCLK => LRESULT(0),
+        WindowsAndMessaging::WM_LBUTTONDBLCLK => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            with_app(hwnd, |app| {
+                if !app.start_drag_candidate(x, y) {
+                    app.handle_click(x, y);
+                }
+            });
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             let x = loword(l_param.0 as u32) as i16 as i32;
             let y = hiword(l_param.0 as u32) as i16 as i32;
             with_app(hwnd, |app| {
-                let _ = app.finish_drag(x, y);
+                let pending_click = app
+                    .drag_state
+                    .as_ref()
+                    .filter(|drag| !drag.active)
+                    .map(|drag| (drag.start_x, drag.start_y));
+                if !app.finish_drag(x, y) {
+                    if let Some((click_x, click_y)) = pending_click {
+                        app.handle_click(click_x, click_y);
+                    }
+                }
             });
             LRESULT(0)
         }
@@ -12287,6 +12580,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                                 if app.has_typed && !app.is_deleting {
                                     app.try_autofill(&current_text);
                                 }
+                                app.request_command_favicons();
                             }
                             unsafe {
                                 let _ = InvalidateRect(Some(app.command_hwnd), None, false);
@@ -13596,6 +13890,229 @@ fn decode_favicon_stream(stream: &IStream) -> Option<FaviconBitmap> {
             width: width as i32,
             height: height as i32,
         })
+    }
+}
+
+fn decode_favicon_file(path: &str) -> Option<FaviconBitmap> {
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let path_w = to_wide(path);
+        let decoder = factory
+            .CreateDecoderFromFilename(
+                PCWSTR(path_w.as_ptr()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnDemand,
+            )
+            .ok()?;
+        let frame = decoder.GetFrame(0).ok()?;
+        let converter = factory.CreateFormatConverter().ok()?;
+        converter
+            .Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None::<&windows::Win32::Graphics::Imaging::IWICPalette>,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .ok()?;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        converter.GetSize(&mut width, &mut height).ok()?;
+        if width == 0 || height == 0 || width > 256 || height > 256 {
+            return None;
+        }
+        let stride = width * 4;
+        let mut pixels = vec![0u8; (stride * height) as usize];
+        converter
+            .CopyPixels(ptr::null(), stride, &mut pixels)
+            .ok()?;
+        let handle = create_bgra_bitmap(width as i32, height as i32, &pixels)?;
+        Some(FaviconBitmap {
+            handle,
+            width: width as i32,
+            height: height as i32,
+        })
+    }
+}
+
+fn favicon_candidate_urls(url: &str, known_favicon_uri: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(known) = known_favicon_uri {
+        let known = known.trim();
+        if known.starts_with("http://") || known.starts_with("https://") {
+            candidates.push(known.to_string());
+        }
+    }
+    if let Some(origin) = url_origin(url) {
+        candidates.push(format!("{origin}/favicon.ico"));
+    }
+    candidates.dedup();
+    candidates
+}
+
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(format!("{scheme}://{host}"))
+    }
+}
+
+fn download_first_favicon(candidates: &[String], page_url: &str) -> Option<String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    let mut result = None;
+    for candidate in candidates {
+        if let Some(path) = download_url_to_cache(candidate) {
+            if looks_like_favicon_file(&path) {
+                result = Some(path);
+                break;
+            }
+        }
+    }
+    if result.is_none() {
+        if let Some(path) = download_url_to_cache(page_url) {
+            if let Ok(html) = fs::read_to_string(&path) {
+                for href in extract_favicon_hrefs(&html) {
+                    if let Some(icon_url) = resolve_url(page_url, &href) {
+                        if let Some(icon_path) = download_url_to_cache(&icon_url) {
+                            if looks_like_favicon_file(&icon_path) {
+                                result = Some(icon_path);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+fn looks_like_favicon_file(path: &str) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    bytes.starts_with(&[0x00, 0x00, 0x01, 0x00])
+        || bytes.starts_with(&[0x89, b'P', b'N', b'G'])
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+}
+
+fn extract_favicon_hrefs(html: &str) -> Vec<String> {
+    let mut hrefs = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(start) = lower[offset..].find("<link") {
+        let tag_start = offset + start;
+        let Some(tag_end_rel) = lower[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_rel + 1;
+        let tag = &html[tag_start..tag_end];
+        let rel = extract_attr_value(tag, "rel")
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if rel
+            .split_whitespace()
+            .any(|part| part == "icon" || part == "apple-touch-icon" || part == "mask-icon")
+            || rel == "shortcut icon"
+        {
+            if let Some(href) = extract_attr_value(tag, "href") {
+                hrefs.push(href);
+            }
+        }
+        offset = tag_end;
+    }
+    hrefs
+}
+
+fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let pos = lower.find(attr)?;
+    let after_attr = &tag[pos + attr.len()..];
+    let after_attr = after_attr.trim_start();
+    let value = after_attr.strip_prefix('=')?.trim_start();
+    if let Some(rest) = value.strip_prefix('"') {
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    } else if let Some(rest) = value.strip_prefix('\'') {
+        let end = rest.find('\'')?;
+        Some(rest[..end].to_string())
+    } else {
+        let end = value
+            .find(|ch: char| ch.is_whitespace() || ch == '>')
+            .unwrap_or(value.len());
+        Some(value[..end].to_string())
+    }
+}
+
+fn resolve_url(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    if href.starts_with("//") {
+        let scheme = base.split_once("://").map(|(scheme, _)| scheme).unwrap_or("https");
+        return Some(format!("{scheme}:{href}"));
+    }
+    let origin = url_origin(base)?;
+    if href.starts_with('/') {
+        return Some(format!("{origin}{href}"));
+    }
+    let mut prefix = base
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(base)
+        .to_string();
+    if !prefix.ends_with('/') {
+        if let Some(pos) = prefix.rfind('/') {
+            prefix.truncate(pos + 1);
+        } else {
+            prefix.push('/');
+        }
+    }
+    Some(format!("{prefix}{href}"))
+}
+
+fn download_url_to_cache(url: &str) -> Option<String> {
+    let url_w = to_wide(url);
+    let mut path = vec![0u16; 2048];
+    let ok = unsafe {
+        URLDownloadToCacheFileW(
+            None::<&IUnknown>,
+            PCWSTR(url_w.as_ptr()),
+            &mut path,
+            0,
+            None::<&IBindStatusCallback>,
+        )
+        .is_ok()
+    };
+    if !ok {
+        return None;
+    }
+    let len = path.iter().position(|ch| *ch == 0).unwrap_or(path.len());
+    if len == 0 {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&path[..len]))
     }
 }
 
@@ -15880,5 +16397,30 @@ mod tests {
         let unix = 1_700_000_000u64;
         let chrome = 11_644_473_600_i64 * 1_000_000 + unix as i64 * 1_000_000;
         assert_eq!(chrome_time_to_unix_secs(chrome), unix);
+    }
+
+    #[test]
+    fn test_favicon_discovery_helpers() {
+        let html = r#"
+            <html><head>
+              <link rel="preload" href="/not-icon.png">
+              <link rel="shortcut icon" href="/favicon-32.png">
+              <link href='touch.png' rel='apple-touch-icon'>
+            </head></html>
+        "#;
+        let hrefs = extract_favicon_hrefs(html);
+        assert_eq!(hrefs, vec!["/favicon-32.png", "touch.png"]);
+        assert_eq!(
+            resolve_url("https://example.com/docs/page", "/favicon-32.png"),
+            Some("https://example.com/favicon-32.png".to_string())
+        );
+        assert_eq!(
+            resolve_url("https://example.com/docs/page", "touch.png"),
+            Some("https://example.com/docs/touch.png".to_string())
+        );
+        assert_eq!(
+            favicon_candidate_urls("https://example.com/docs/page", None),
+            vec!["https://example.com/favicon.ico".to_string()]
+        );
     }
 }
