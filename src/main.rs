@@ -50,6 +50,7 @@ use windows::{
         Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
         System::{Com::Urlmon::URLDownloadToCacheFileW, Com::*, LibraryLoader},
         UI::{
+            Shell::SetCurrentProcessExplicitAppUserModelID,
             Controls::{EM_SETMARGINS, EM_SETSEL, MARGINS},
             HiDpi,
             Input::KeyboardAndMouse::{
@@ -74,6 +75,7 @@ use windows::{
 
 const APP_NAME: PCWSTR = w!("Aster");
 const CLASS_NAME: PCWSTR = w!("AsterWindow");
+const APP_USER_MODEL_ID: PCWSTR = w!("Aster.Browser");
 const ADDRESS_ID: i32 = 1001;
 const COMMAND_POPUP_ID: i32 = 1002;
 const DOWNLOAD_POPUP_ID: i32 = 1003;
@@ -220,24 +222,26 @@ const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
   const isInstallIntent = (label) => /\b(add to chrome|install in aster|get extension)\b/i.test(label)
     && !nonInstallPattern.test(label);
   const installControlFromPath = (path) => {
-    const nodes = Array.from(path || []).slice(0, 8);
-    const label = nodes.map(labelForNode).join(" ");
+    const buttonLike = Array.from(path || []).find((node) =>
+      node?.matches?.("button, a, [role='button'], [jsaction], [data-test-id], [aria-label]")
+    );
+    if (!buttonLike) return false;
+    if (buttonLike.id === "__asterExtensionInstall" || buttonLike.closest?.("#__asterExtensionInstall")) {
+      return false;
+    }
+    const label = labelForNode(buttonLike);
     if (isInstallIntent(label)) return true;
-    const buttonLike = nodes.find((node) => node?.matches?.("button, a, [role='button'], [jsaction], [data-test-id], [aria-label]"));
-    if (!buttonLike || nonInstallPattern.test(label)) return false;
+    if (nonInstallPattern.test(label)) return false;
     const id = extensionId();
     if (!id) return false;
-    const attrs = nodes.map((node) => {
-      if (!node?.getAttribute) return "";
-      return [
-        node.getAttribute("aria-label"),
-        node.getAttribute("title"),
-        node.getAttribute("data-test-id"),
-        node.getAttribute("jsaction"),
-        node.id,
-        node.className
-      ].filter(Boolean).join(" ");
-    }).join(" ").toLowerCase();
+    const attrs = [
+      buttonLike.getAttribute?.("aria-label"),
+      buttonLike.getAttribute?.("title"),
+      buttonLike.getAttribute?.("data-test-id"),
+      buttonLike.getAttribute?.("jsaction"),
+      buttonLike.id,
+      buttonLike.className
+    ].filter(Boolean).join(" ").toLowerCase();
     return /\b(add|install|get|webstore|extension)\b/.test(attrs) && !/\b(search|share|menu|close|back|review|support)\b/.test(attrs);
   };
   const applyInstallState = (el, installed) => {
@@ -469,6 +473,7 @@ static mut OLD_EXTENSION_INSTALL_POPUP_PROC: WNDPROC = None;
 static mut OLD_EXTENSION_SIDE_PANEL_PROC: WNDPROC = None;
 static mut OLD_BOOKMARK_POPUP_PROC: WNDPROC = None;
 static mut OLD_EXTENSION_POPUP_PROC: WNDPROC = None;
+static mut OLD_DIALOG_POPUP_PROC: WNDPROC = None;
 static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
 static mut CURRENT_DRAG_GHOST_BITMAP: Option<HBITMAP> = None;
 
@@ -900,6 +905,7 @@ struct OverlayMenu {
     target: MenuTarget,
     items: Vec<OverlayMenuItem>,
     opened_at: std::time::Instant,
+    closing_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -1050,6 +1056,22 @@ struct DownloadSnapshot {
     received_bytes: i64,
     total_bytes: i64,
     state: COREWEBVIEW2_DOWNLOAD_STATE,
+}
+
+struct ActivePermissionRequest {
+    args: ICoreWebView2PermissionRequestedEventArgs,
+    deferral: ICoreWebView2Deferral,
+    kind: COREWEBVIEW2_PERMISSION_KIND,
+    uri: String,
+}
+
+struct ActiveScriptDialog {
+    args: ICoreWebView2ScriptDialogOpeningEventArgs,
+    deferral: ICoreWebView2Deferral,
+    dialog_type: COREWEBVIEW2_SCRIPT_DIALOG_KIND,
+    message: String,
+    default_text: String,
+    uri: String,
 }
 
 struct DownloadToastState {
@@ -1294,6 +1316,11 @@ struct App {
     extension_popup_controller: Option<ICoreWebView2Controller>,
     extension_popup_anchor: Option<RECT>,
     extension_popup_extension_id: Option<String>,
+    dialog_popup_hwnd: HWND,
+    dialog_popup_controller: Option<ICoreWebView2Controller>,
+    dialog_active_permission: Option<ActivePermissionRequest>,
+    dialog_active_script_dialog: Option<ActiveScriptDialog>,
+    dialog_active_extension: Option<ExtensionCrxResult>,
     extension_side_panel_hwnd: HWND,
     extension_side_panel_controller: Option<ICoreWebView2Controller>,
     extension_side_panel_extension_id: Option<String>,
@@ -1491,6 +1518,11 @@ impl App {
             extension_popup_controller: None,
             extension_popup_anchor: None,
             extension_popup_extension_id: None,
+            dialog_popup_hwnd: HWND(std::ptr::null_mut()),
+            dialog_popup_controller: None,
+            dialog_active_permission: None,
+            dialog_active_script_dialog: None,
+            dialog_active_extension: None,
             extension_side_panel_hwnd: HWND(std::ptr::null_mut()),
             extension_side_panel_controller: None,
             extension_side_panel_extension_id: None,
@@ -2349,6 +2381,332 @@ impl App {
         }
     }
 
+    fn ensure_dialog_popup(&mut self) -> AppResult<&ICoreWebView2Controller> {
+        if self.dialog_popup_hwnd == HWND(std::ptr::null_mut()) {
+            let hwnd = create_dialog_popup_window(self.hwnd)?;
+            let controller = create_webview_controller(&self.environment, hwnd)?;
+            unsafe {
+                let _ = controller.SetBounds(RECT { left: 0, top: 0, right: 360, bottom: 240 });
+                let _ = controller.SetIsVisible(true);
+                if let Ok(wv) = controller.CoreWebView2() {
+                    let _ = configure_webview(&wv);
+                    self.attach_web_message_handler(&wv);
+                    apply_site_mode_to_webview(&wv, self.site_mode);
+                }
+            }
+            self.dialog_popup_hwnd = hwnd;
+            self.dialog_popup_controller = Some(controller);
+        }
+        Ok(self.dialog_popup_controller.as_ref().unwrap())
+    }
+
+    fn layout_dialog_popup(&self) {
+        if self.dialog_popup_hwnd == HWND(std::ptr::null_mut()) {
+            return;
+        }
+        let bounds = self.web_content_bounds();
+        let width = 360;
+        let height = 240;
+        let right = bounds.right - 12;
+        let top = bounds.top + 12;
+        let left = right - width;
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.dialog_popup_hwnd,
+                Some(HWND_TOP),
+                left,
+                top,
+                width,
+                height,
+                WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+            if let Some(controller) = &self.dialog_popup_controller {
+                let _ = controller.SetBounds(RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                });
+            }
+        }
+    }
+
+    fn close_dialog_popup(&mut self, approved: bool) {
+        if let Some(req) = self.dialog_active_permission.take() {
+            unsafe {
+                if approved {
+                    let _ = req.args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+                } else {
+                    let _ = req.args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY);
+                }
+                let _ = req.deferral.Complete();
+            }
+        }
+
+        if let Some(dialog) = self.dialog_active_script_dialog.take() {
+            unsafe {
+                if approved {
+                    let _ = dialog.args.Accept();
+                }
+                let _ = dialog.deferral.Complete();
+            }
+        }
+
+        if let Some(ext) = self.dialog_active_extension.take() {
+            if approved {
+                self.complete_extension_install_final(ext);
+            } else {
+                self.pending_extension_installs.remove(&ext.extension_id);
+                self.extension_notice = Some("Extension installation cancelled.".to_string());
+                self.send_store_status("Extension installation cancelled.");
+                self.reload_extensions_pages();
+            }
+        }
+
+        if let Some(controller) = self.dialog_popup_controller.take() {
+            unsafe {
+                let _ = controller.Close();
+            }
+        }
+        unsafe {
+            if self.dialog_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::DestroyWindow(self.dialog_popup_hwnd);
+                self.dialog_popup_hwnd = HWND(std::ptr::null_mut());
+            }
+        }
+        self.refresh();
+    }
+
+    fn show_extension_install_dialog(&mut self, ext_id: &str) {
+        let path = self.dialog_active_extension.as_ref().map(|r| r.install_path.as_str()).unwrap_or("");
+        let (name, desc, perms) = get_manifest_info(path).unwrap_or_else(|| {
+            ("Extension".to_string(), "No description provided.".to_string(), Vec::new())
+        });
+
+        let mut body_html = format!(r#"<div style="font-weight:600;margin-bottom:8px;font-size:12.5px;">Do you want to install "{}" to Aster?</div>"#, html_escape_text(&name));
+        if !desc.is_empty() {
+            body_html.push_str(&format!(r#"<div style="margin-bottom:12px;color:var(--muted);font-style:italic;">{}</div>"#, html_escape_text(&desc)));
+        }
+        let translated = translate_permissions(&perms);
+        if !translated.is_empty() {
+            body_html.push_str(r#"<div style="font-weight:600;font-size:11px;margin-bottom:4px;">It can:</div><div class="permissions-list">"#);
+            for p in translated {
+                body_html.push_str(&format!(r#"<div class="permission-item">
+                  <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:var(--accent);flex-shrink:0;"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+                  <span>{}</span>
+                </div>"#, html_escape_text(&p)));
+            }
+            body_html.push_str("</div>");
+        }
+
+        let buttons_html = r#"
+            <button class="btn btn-secondary" onclick="post('dialog:extension:cancel')">Cancel</button>
+            <button class="btn btn-primary" onclick="post('dialog:extension:accept')">Add Extension</button>
+        "#;
+
+        let icon_svg = r#"<svg viewBox="0 0 24 24"><path d="M20.5 11H19V7c0-1.1-.9-2-2-2h-4V3.5a2.5 2.5 0 0 0-5 0V5H4c-1.1 0-1.99.9-1.99 2v3.8H3.5a2.5 2.5 0 0 1 0 5H2v3.8c0 1.1.9 2 2 2h3.8v-1.5a2.5 2.5 0 0 1 5 0v1.5H17c1.1 0 2-.9 2-2v-4h1.5a2.5 2.5 0 0 0 0-5z"/></svg>"#;
+
+        let html = dialog_popup_html(
+            icon_svg,
+            "Install Extension",
+            &format!("ID: {}", ext_id),
+            &body_html,
+            buttons_html,
+            &colorref_to_css(self.accent_color),
+            &colorref_to_css(self.dominant_color),
+            &colorref_to_css(self.secondary_color),
+        );
+
+        if let Ok(controller) = self.ensure_dialog_popup() {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let wide = CoTaskMemPWSTR::from(html.as_str());
+                unsafe {
+                    let _ = wv.NavigateToString(*wide.as_ref().as_pcwstr());
+                }
+                self.layout_dialog_popup();
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(self.dialog_popup_hwnd, WindowsAndMessaging::SW_SHOW);
+                    let _ = WindowsAndMessaging::SetWindowPos(self.dialog_popup_hwnd, Some(HWND_TOP), 0, 0, 0, 0, WindowsAndMessaging::SWP_NOMOVE | WindowsAndMessaging::SWP_NOSIZE);
+                }
+            }
+        }
+    }
+
+    fn show_permission_dialog(&mut self, req: ActivePermissionRequest) {
+        let origin = &req.uri;
+        let domain = url_domain(origin).unwrap_or(origin.clone());
+        let (icon_svg, title, permission_desc) = match req.kind {
+            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>"#,
+                "Use Microphone",
+                "wants to use your microphone."
+            ),
+            COREWEBVIEW2_PERMISSION_KIND_CAMERA => (
+                r#"<svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg>"#,
+                "Use Camera",
+                "wants to use your camera."
+            ),
+            COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 0 1 0-5 2.5 2.5 0 0 1 0 5z"/></svg>"#,
+                "Know your Location",
+                "wants to know your location."
+            ),
+            COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 22c1.1 0 2-.9 2-2h-4a2 2 0 0 0 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>"#,
+                "Show Notifications",
+                "wants to show you notifications."
+            ),
+            _ => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>"#,
+                "Site Permission",
+                "wants additional site permissions."
+            )
+        };
+
+        let body_html = format!(
+            r#"<div style="font-size:12.5px;line-height:1.5;">
+              <span style="font-weight:600;color:var(--text);">{}</span> {}
+            </div>"#,
+            html_escape_text(&domain),
+            permission_desc
+        );
+
+        let buttons_html = r#"
+            <button class="btn btn-secondary" onclick="post('dialog:permission:block')">Block</button>
+            <button class="btn btn-primary" onclick="post('dialog:permission:allow')">Allow</button>
+        "#;
+
+        let html = dialog_popup_html(
+            icon_svg,
+            title,
+            origin,
+            &body_html,
+            buttons_html,
+            &colorref_to_css(self.accent_color),
+            &colorref_to_css(self.dominant_color),
+            &colorref_to_css(self.secondary_color),
+        );
+
+        self.dialog_active_permission = Some(req);
+
+        if let Ok(controller) = self.ensure_dialog_popup() {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let wide = CoTaskMemPWSTR::from(html.as_str());
+                unsafe {
+                    let _ = wv.NavigateToString(*wide.as_ref().as_pcwstr());
+                }
+                self.layout_dialog_popup();
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(self.dialog_popup_hwnd, WindowsAndMessaging::SW_SHOW);
+                    let _ = WindowsAndMessaging::SetWindowPos(self.dialog_popup_hwnd, Some(HWND_TOP), 0, 0, 0, 0, WindowsAndMessaging::SWP_NOMOVE | WindowsAndMessaging::SWP_NOSIZE);
+                }
+            }
+        }
+    }
+
+    fn show_script_dialog(&mut self, req: ActiveScriptDialog) {
+        let origin = &req.uri;
+        let domain = url_domain(origin).unwrap_or(origin.clone());
+
+        let (icon_svg, title) = match req.dialog_type {
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>"#,
+                "Alert"
+            ),
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 16h-2v-2h2v2zm1.07-7.75l-.9.92C12.45 11.9 12 12.5 12 14h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/></svg>"#,
+                "Confirm"
+            ),
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 16h-2v-2h2v2zm1.07-7.75l-.9.92C12.45 11.9 12 12.5 12 14h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/></svg>"#,
+                "Prompt"
+            ),
+            _ => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>"#,
+                "Script Dialog"
+            )
+        };
+
+        let mut body_html = format!(
+            r#"<div style="font-size:12.5px;line-height:1.5;margin-bottom:8px;word-break:break-word;">
+              {}
+            </div>"#,
+            html_escape_text(&req.message)
+        );
+
+        if req.dialog_type == COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT {
+            body_html.push_str(&format!(
+                r#"<input type="text" class="prompt-input" id="promptInput" value="{}" onkeydown="if(event.key === 'Enter') post('dialog:prompt:accept:' + document.getElementById('promptInput').value)" />"#,
+                html_escape_text(&req.default_text)
+            ));
+        }
+
+        let buttons_html = match req.dialog_type {
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT => {
+                r#"<button class="btn btn-primary" onclick="post('dialog:script:accept')">OK</button>"#
+            }
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM => {
+                r#"
+                <button class="btn btn-secondary" onclick="post('dialog:script:cancel')">Cancel</button>
+                <button class="btn btn-primary" onclick="post('dialog:script:accept')">OK</button>
+                "#
+            }
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT => {
+                r#"
+                <button class="btn btn-secondary" onclick="post('dialog:script:cancel')">Cancel</button>
+                <button class="btn btn-primary" onclick="post('dialog:prompt:accept:' + document.getElementById('promptInput').value)">OK</button>
+                "#
+            }
+            _ => {
+                r#"<button class="btn btn-primary" onclick="post('dialog:script:accept')">OK</button>"#
+            }
+        };
+
+        let html = dialog_popup_html(
+            icon_svg,
+            title,
+            &domain,
+            &body_html,
+            buttons_html,
+            &colorref_to_css(self.accent_color),
+            &colorref_to_css(self.dominant_color),
+            &colorref_to_css(self.secondary_color),
+        );
+
+        self.dialog_active_script_dialog = Some(req);
+
+        if let Ok(controller) = self.ensure_dialog_popup() {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let wide = CoTaskMemPWSTR::from(html.as_str());
+                unsafe {
+                    let _ = wv.NavigateToString(*wide.as_ref().as_pcwstr());
+                }
+                self.layout_dialog_popup();
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(self.dialog_popup_hwnd, WindowsAndMessaging::SW_SHOW);
+                    let _ = WindowsAndMessaging::SetWindowPos(self.dialog_popup_hwnd, Some(HWND_TOP), 0, 0, 0, 0, WindowsAndMessaging::SWP_NOMOVE | WindowsAndMessaging::SWP_NOSIZE);
+                }
+            }
+        }
+    }
+
+    fn update_dialog_theme(&self) {
+        if let Some(controller) = &self.dialog_popup_controller {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let accent = colorref_to_css(self.accent_color);
+                let dominant = colorref_to_css(self.dominant_color);
+                let secondary = colorref_to_css(self.secondary_color);
+                let js = format!(
+                    "document.documentElement.style.setProperty('--accent', '{}'); \
+                     document.documentElement.style.setProperty('--bg', '{}'); \
+                     document.documentElement.style.setProperty('--secondary', '{}');",
+                    accent, dominant, secondary
+                );
+                execute_webview_script(&wv, &js);
+            }
+        }
+    }
+
     fn attach_web_message_handler(&self, webview: &ICoreWebView2) {
         let hwnd = self.hwnd;
         unsafe {
@@ -2409,15 +2767,18 @@ impl App {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.accent_color = color;
                 self.run_find_script(0);
+                self.update_dialog_theme();
             }
         } else if let Some(value) = message.strip_prefix("settings:dominant:") {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.dominant_color = color;
+                self.update_dialog_theme();
             }
         } else if let Some(value) = message.strip_prefix("settings:secondary:") {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.secondary_color = color;
                 self.recreate_secondary_brush();
+                self.update_dialog_theme();
             }
         } else if message == "settings:open-state-file" {
             let path = state_path();
@@ -2516,6 +2877,26 @@ impl App {
                     picked.unwrap_or_default(),
                 );
             });
+        } else if message == "dialog:permission:allow" {
+            self.close_dialog_popup(true);
+        } else if message == "dialog:permission:block" {
+            self.close_dialog_popup(false);
+        } else if message == "dialog:extension:accept" {
+            self.close_dialog_popup(true);
+        } else if message == "dialog:extension:cancel" {
+            self.close_dialog_popup(false);
+        } else if message == "dialog:script:accept" {
+            self.close_dialog_popup(true);
+        } else if message == "dialog:script:cancel" {
+            self.close_dialog_popup(false);
+        } else if let Some(value) = message.strip_prefix("dialog:prompt:accept:") {
+            if let Some(dialog) = self.dialog_active_script_dialog.as_ref() {
+                let wide = CoTaskMemPWSTR::from(value);
+                unsafe {
+                    let _ = dialog.args.SetResultText(*wide.as_ref().as_pcwstr());
+                }
+            }
+            self.close_dialog_popup(true);
         } else if let Some(value) = message.strip_prefix("history:sort:") {
             self.history_sort_mode = HistorySortMode::from_str(value);
             self.reload_history_pages();
@@ -4577,6 +4958,91 @@ impl App {
                 &mut token,
             )?;
 
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_PermissionRequested(
+                &PermissionRequestedEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut kind = COREWEBVIEW2_PERMISSION_KIND_UNKNOWN_PERMISSION;
+                        let _ = args.PermissionKind(&mut kind);
+                        let mut uri_raw = PWSTR::null();
+                        let uri = if args.Uri(&mut uri_raw).is_ok() {
+                            CoTaskMemPWSTR::from(uri_raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        match kind {
+                            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
+                            | COREWEBVIEW2_PERMISSION_KIND_CAMERA
+                            | COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION
+                            | COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS => {
+                                if let Ok(deferral) = args.GetDeferral() {
+                                    let req = ActivePermissionRequest {
+                                        args: args.clone(),
+                                        deferral,
+                                        kind,
+                                        uri,
+                                    };
+                                    with_app(hwnd, |app| {
+                                        app.show_permission_dialog(req);
+                                    });
+                                }
+                            }
+                            _ => {
+                                // For unknown permission types, deny by default
+                                let _ = args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY);
+                            }
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_ScriptDialogOpening(
+                &ScriptDialogOpeningEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut dialog_kind = COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT;
+                        let _ = args.Kind(&mut dialog_kind);
+                        let mut uri_raw = PWSTR::null();
+                        let uri = if args.Uri(&mut uri_raw).is_ok() {
+                            CoTaskMemPWSTR::from(uri_raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        let mut msg_raw = PWSTR::null();
+                        let message = if args.Message(&mut msg_raw).is_ok() {
+                            CoTaskMemPWSTR::from(msg_raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        let mut default_raw = PWSTR::null();
+                        let default_text = if args.DefaultText(&mut default_raw).is_ok() {
+                            CoTaskMemPWSTR::from(default_raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        if let Ok(deferral) = args.GetDeferral() {
+                            let req = ActiveScriptDialog {
+                                args: args.clone(),
+                                deferral,
+                                dialog_type: dialog_kind,
+                                message,
+                                default_text,
+                                uri,
+                            };
+                            with_app(hwnd, |app| {
+                                app.show_script_dialog(req);
+                            });
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
             if let Ok(webview15) = webview.cast::<ICoreWebView2_15>() {
                 let hwnd = self.hwnd;
                 let mut token = 0;
@@ -6600,7 +7066,6 @@ impl App {
     }
 
     fn complete_extension_install(&mut self, result: ExtensionCrxResult) {
-        let hwnd = self.hwnd;
         let ext_id = result.extension_id.clone();
         if let Some(error) = result.error {
             self.pending_extension_installs.remove(&ext_id);
@@ -6620,6 +7085,15 @@ impl App {
             self.refresh();
             return;
         }
+        // Store the result and show our custom confirmation dialog
+        let id_for_dialog = ext_id.clone();
+        self.dialog_active_extension = Some(result);
+        self.show_extension_install_dialog(&id_for_dialog);
+    }
+
+    fn complete_extension_install_final(&mut self, result: ExtensionCrxResult) {
+        let hwnd = self.hwnd;
+        let ext_id = result.extension_id.clone();
         self.extension_notice = Some("Installing extension into browser...".to_string());
         self.send_store_status("Installing extension in Aster...");
         self.reload_extensions_pages();
@@ -8674,6 +9148,7 @@ impl App {
             }
         }
         self.layout_extension_popup_chrome();
+        self.layout_dialog_popup();
         self.raise_native_chrome_windows();
         unsafe {
             if self.download_popup_hwnd != HWND(std::ptr::null_mut()) && self.sidebar_width < 1.0 {
@@ -9543,11 +10018,22 @@ impl App {
         unsafe {
             let width = menu.rect.right - menu.rect.left;
             let height = menu.rect.bottom - menu.rect.top;
-            let elapsed = menu.opened_at.elapsed().as_millis() as f32;
-            let progress = (elapsed / 140.0).clamp(0.0, 1.0);
-            let ease = 1.0 - (1.0 - progress) * (1.0 - progress);
-            let alpha = (190.0 + 65.0 * ease).round().clamp(0.0, 255.0) as u8;
-            let slide_y = ((1.0 - ease) * -6.0).round() as i32;
+            let (alpha, slide_y) = if let Some(closing_at) = menu.closing_at {
+                let progress = (closing_at.elapsed().as_millis() as f32 / 110.0).clamp(0.0, 1.0);
+                let ease = progress * progress;
+                (
+                    (255.0 * (1.0 - ease)).round().clamp(0.0, 255.0) as u8,
+                    (ease * -5.0).round() as i32,
+                )
+            } else {
+                let elapsed = menu.opened_at.elapsed().as_millis() as f32;
+                let progress = (elapsed / 140.0).clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - progress) * (1.0 - progress);
+                (
+                    (190.0 + 65.0 * ease).round().clamp(0.0, 255.0) as u8,
+                    ((1.0 - ease) * -6.0).round() as i32,
+                )
+            };
             let mem_dc = CreateCompatibleDC(Some(hdc));
             if mem_dc.is_invalid() {
                 self.paint_overlay_menu_contents(hdc, menu, width, height);
@@ -11787,13 +12273,7 @@ impl App {
             }
         }
         if items.is_empty() {
-            self.overlay_menu = None;
-            unsafe {
-                let _ = WindowsAndMessaging::ShowWindow(
-                    self.overlay_menu_hwnd,
-                    WindowsAndMessaging::SW_HIDE,
-                );
-            }
+            self.close_overlay_menu(false);
             return;
         }
         let rect = client_rect(self.hwnd);
@@ -11811,6 +12291,7 @@ impl App {
             target,
             items,
             opened_at: std::time::Instant::now(),
+            closing_at: None,
         });
 
         unsafe {
@@ -11839,6 +12320,40 @@ impl App {
         }
         self.raise_native_chrome_windows();
         self.refresh();
+    }
+
+    fn close_overlay_menu(&mut self, animate: bool) {
+        let Some(menu) = self.overlay_menu.as_mut() else {
+            unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(
+                    self.overlay_menu_hwnd,
+                    WindowsAndMessaging::SW_HIDE,
+                );
+            }
+            return;
+        };
+        if animate {
+            if menu.closing_at.is_none() {
+                menu.closing_at = Some(std::time::Instant::now());
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(self.overlay_menu_hwnd), None, false);
+                let _ = WindowsAndMessaging::SetTimer(
+                    Some(self.hwnd),
+                    OVERLAY_MENU_ANIM_TIMER_ID,
+                    16,
+                    None,
+                );
+            }
+        } else {
+            self.overlay_menu = None;
+            unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(
+                    self.overlay_menu_hwnd,
+                    WindowsAndMessaging::SW_HIDE,
+                );
+            }
+        }
     }
 
     fn open_history_menu(&mut self, x: i32, y: i32, back: bool) {
@@ -11905,13 +12420,13 @@ impl App {
             );
         }
         if !point_in_rect(x, y, menu.rect) {
-            self.overlay_menu = None;
+            self.close_overlay_menu(true);
             self.refresh();
             return true;
         }
         let row_index = (y - menu.rect.top - 6) / MENU_ROW_HEIGHT;
         if row_index < 0 || row_index as usize >= menu.items.len() {
-            self.overlay_menu = None;
+            self.close_overlay_menu(true);
             return true;
         }
         let id = menu.items[row_index as usize].id;
@@ -11934,12 +12449,12 @@ impl App {
                 self.open_extension_menu();
                 return true;
             }
-            self.overlay_menu = None;
+            self.close_overlay_menu(true);
             self.open_extension_popup_by_index(offset, anchor);
             self.refresh();
             return true;
         }
-        self.overlay_menu = None;
+        self.close_overlay_menu(true);
         self.run_menu_command(menu.target, id);
         true
     }
@@ -13485,6 +14000,7 @@ impl App {
 }
 
 fn main() -> AppResult<()> {
+    apply_aster_process_branding();
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     }
@@ -13543,6 +14059,12 @@ fn main() -> AppResult<()> {
     }
 
     message_loop()
+}
+
+fn apply_aster_process_branding() {
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID);
+    }
 }
 
 fn profile_path() -> String {
@@ -13934,6 +14456,399 @@ fn create_bookmark_popup(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+fn create_dialog_popup_window(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE(0x00000080 /* WS_EX_TOOLWINDOW */),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_POPUP.0),
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_DIALOG_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            dialog_popup_proc as *const () as isize,
+        ));
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_HIDE);
+        Ok(hwnd)
+    }
+}
+
+unsafe extern "system" fn dialog_popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ACTIVATE => {
+            if loword(w_param.0 as u32) == 0 {
+                if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                    with_app(parent, |app| {
+                        app.close_dialog_popup(false);
+                    });
+                }
+                return LRESULT(0);
+            }
+        }
+        WM_CLOSE => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    app.close_dialog_popup(false);
+                });
+            }
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_DIALOG_POPUP_PROC, hwnd, msg, w_param, l_param)
+}
+
+fn url_domain(url: &str) -> Option<String> {
+    let clean = url.trim();
+    let without_scheme = if let Some(stripped) = clean.strip_prefix("https://") {
+        stripped
+    } else if let Some(stripped) = clean.strip_prefix("http://") {
+        stripped
+    } else {
+        clean
+    };
+    let mut parts = without_scheme.split('/');
+    let host = parts.next()?;
+    let mut host_parts = host.split(':');
+    Some(host_parts.next()?.to_string())
+}
+
+fn get_manifest_info(path: &str) -> Option<(String, String, Vec<String>)> {
+    let manifest_path = Path::new(path).join("manifest.json");
+    let content = fs::read_to_string(manifest_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let name = json["name"].as_str().unwrap_or("Extension").to_string();
+    let description = json["description"].as_str().unwrap_or("").to_string();
+    let mut permissions = Vec::new();
+    if let Some(perms_arr) = json["permissions"].as_array() {
+        for val in perms_arr {
+            if let Some(p) = val.as_str() {
+                permissions.push(p.to_string());
+            }
+        }
+    }
+    if let Some(host_arr) = json["host_permissions"].as_array() {
+        for val in host_arr {
+            if let Some(p) = val.as_str() {
+                permissions.push(p.to_string());
+            }
+        }
+    }
+    Some((name, description, permissions))
+}
+
+fn translate_permissions(permissions: &[String]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut has_all_urls = false;
+    let mut hosts = Vec::new();
+
+    for p in permissions {
+        match p.as_str() {
+            "activeTab" => {} // No warning
+            "bookmarks" => warnings.push("Read and modify your bookmarks".to_string()),
+            "clipboardRead" | "clipboardWrite" => {
+                let w = "Read and modify data you copy and paste".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            "contentSettings" => warnings.push("Modify settings that control websites' access to features such as cookies, JavaScript, and plugins".to_string()),
+            "cookies" => {
+                let w = "Read and modify your browsing history and data".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            "declarativeNetRequest" | "declarativeNetRequestWithHostAccess" => {
+                warnings.push("Block content on any page".to_string());
+            }
+            "desktopCapture" => warnings.push("Capture content of your screen".to_string()),
+            "downloads" => warnings.push("Manage your downloads".to_string()),
+            "geolocation" => warnings.push("Detect your physical location".to_string()),
+            "history" => warnings.push("Read and modify your browsing history".to_string()),
+            "management" => warnings.push("Manage your apps, extensions, and themes".to_string()),
+            "nativeMessaging" => warnings.push("Communicate with cooperating native applications".to_string()),
+            "notifications" => warnings.push("Display notifications".to_string()),
+            "pageCapture" => warnings.push("Save pages as MHTML".to_string()),
+            "privacy" => warnings.push("Modify privacy-related settings".to_string()),
+            "proxy" => warnings.push("Proxy your internet traffic".to_string()),
+            "tabGroups" => warnings.push("Manage your tab groups".to_string()),
+            "tabs" => {
+                let w = "Read your browsing history".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            "topSites" => warnings.push("Read and modify your most frequently visited websites".to_string()),
+            "webNavigation" => {
+                let w = "Read and modify your browsing history".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            other => {
+                if other == "<all_urls>" || other == "*://*/*" || other == "http://*/*" || other == "https://*/*" {
+                    has_all_urls = true;
+                } else if other.contains("://") || other.starts_with("*.") {
+                    hosts.push(other.to_string());
+                }
+            }
+        }
+    }
+
+    if has_all_urls {
+        warnings.push("Read and modify all your data on all websites".to_string());
+    } else if !hosts.is_empty() {
+        if hosts.len() <= 3 {
+            let joined_hosts = hosts.join(", ");
+            warnings.push(format!("Read and modify your data on {}", joined_hosts));
+        } else {
+            warnings.push("Read and modify your data on several websites".to_string());
+        }
+    }
+
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+
+fn dialog_popup_html(
+    icon_svg: &str,
+    title: &str,
+    subtitle: &str,
+    body_html: &str,
+    buttons_html: &str,
+    accent: &str,
+    dominant: &str,
+    secondary: &str,
+) -> String {
+    format!(
+        r##"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aster Dialog</title>
+<style>
+:root {{
+  --accent: {accent};
+  --bg: {dominant};
+  --secondary: {secondary};
+  --text: #f5f5f5;
+  --muted: #a1a1a1;
+}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: transparent;
+  color: var(--text);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  width: 100vw;
+}}
+.dialog-container {{
+  background: rgba(22, 22, 22, 0.85);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  width: calc(100% - 24px);
+  height: calc(100% - 24px);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  animation: slide-in 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  padding: 16px;
+}}
+@keyframes slide-in {{
+  from {{ transform: translateY(-10px); opacity: 0; }}
+  to {{ transform: translateY(0); opacity: 1; }}
+}}
+.header {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  width: 100%;
+}}
+.icon-box {{
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}}
+.icon-box svg {{
+  width: 20px;
+  height: 20px;
+  fill: var(--accent);
+}}
+.titles {{
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+  flex-grow: 1;
+}}
+.title {{
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}}
+.subtitle {{
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}}
+.content-body {{
+  flex-grow: 1;
+  font-size: 11.5px;
+  color: #e0e0e0;
+  overflow-y: auto;
+  margin-bottom: 12px;
+  padding-right: 4px;
+  line-height: 1.4;
+}}
+.content-body::-webkit-scrollbar {{
+  width: 4px;
+}}
+.content-body::-webkit-scrollbar-thumb {{
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}}
+.permissions-list {{
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}}
+.permission-item {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+}}
+.actions {{
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}}
+.btn {{
+  border: 0;
+  outline: 0;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}}
+.btn-primary {{
+  background: var(--accent);
+  color: #ffffff;
+}}
+.btn-primary:hover {{
+  filter: brightness(1.1);
+  transform: translateY(-1px);
+}}
+.btn-secondary {{
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}}
+.btn-secondary:hover {{
+  background: rgba(255, 255, 255, 0.1);
+  transform: translateY(-1px);
+}}
+.btn-danger {{
+  background: #ff4a4a;
+  color: #ffffff;
+}}
+.btn-danger:hover {{
+  filter: brightness(1.1);
+  transform: translateY(-1px);
+}}
+.prompt-input {{
+  width: 100%;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  margin-top: 8px;
+}}
+.prompt-input:focus {{
+  border-color: var(--accent);
+}}
+</style>
+</head>
+<body>
+<div class="dialog-container">
+  <div class="header">
+    <div class="icon-box">
+      {icon_svg}
+    </div>
+    <div class="titles">
+      <div class="title">{title}</div>
+      <div class="subtitle">{subtitle}</div>
+    </div>
+  </div>
+  <div class="content-body">
+    {body_html}
+  </div>
+  <div class="actions">
+    {buttons_html}
+  </div>
+</div>
+<script>
+const post = (msg) => window.chrome?.webview?.postMessage(msg);
+</script>
+</body>
+</html>"##,
+        accent = accent,
+        dominant = dominant,
+        secondary = secondary,
+        icon_svg = icon_svg,
+        title = html_escape_text(title),
+        subtitle = html_escape_text(subtitle),
+        body_html = body_html,
+        buttons_html = buttons_html
+    )
+}
+
 fn create_extension_popup_window(parent: HWND, btn_rect: RECT, pushed_top: i32) -> AppResult<HWND> {
     let (popup_w, popup_h) = extension_popup_size_for_content(parent, pushed_top, 420, 560);
     let (x, y) = extension_popup_position(parent, btn_rect, pushed_top, popup_w, popup_h);
@@ -14226,11 +15141,7 @@ unsafe extern "system" fn overlay_menu_proc(
                     if keep_open {
                         return;
                     }
-                    app.overlay_menu = None;
-                    let _ = WindowsAndMessaging::ShowWindow(
-                        app.overlay_menu_hwnd,
-                        WindowsAndMessaging::SW_HIDE,
-                    );
+                    app.close_overlay_menu(true);
                     app.refresh();
                 });
             }
@@ -15145,14 +16056,33 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
             }
             if w_param.0 == OVERLAY_MENU_ANIM_TIMER_ID {
                 with_app(hwnd, |app| unsafe {
-                    if app
-                        .overlay_menu
-                        .as_ref()
-                        .map(|menu| menu.opened_at.elapsed().as_millis() < 180)
-                        .unwrap_or(false)
-                    {
+                    let mut keep_animating = false;
+                    let mut finish_close = false;
+                    if let Some(menu) = app.overlay_menu.as_ref() {
+                        if let Some(closing_at) = menu.closing_at {
+                            if closing_at.elapsed().as_millis() < 130 {
+                                keep_animating = true;
+                            } else {
+                                finish_close = true;
+                            }
+                        } else if menu.opened_at.elapsed().as_millis() < 180 {
+                            keep_animating = true;
+                        }
+                    }
+                    if finish_close {
+                        app.overlay_menu = None;
+                        let _ = WindowsAndMessaging::ShowWindow(
+                            app.overlay_menu_hwnd,
+                            WindowsAndMessaging::SW_HIDE,
+                        );
+                    }
+                    if keep_animating {
                         let _ = InvalidateRect(Some(app.overlay_menu_hwnd), None, false);
-                    } else {
+                    } else if !finish_close {
+                        let _ =
+                            InvalidateRect(Some(app.overlay_menu_hwnd), None, false);
+                    }
+                    if !keep_animating {
                         let _ = WindowsAndMessaging::KillTimer(
                             Some(app.hwnd),
                             OVERLAY_MENU_ANIM_TIMER_ID,
