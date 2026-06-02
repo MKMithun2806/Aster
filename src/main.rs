@@ -4930,7 +4930,18 @@ impl App {
                 };
             }
         }
-        let target = self.extension_button_rect();
+        if self.topbar_mode != SidebarMode::Pushed && self.topbar_expand_mode != SidebarMode::Pushed
+        {
+            self.topbar_expand_mode = SidebarMode::Overlay;
+            self.set_topbar_mode(SidebarMode::Overlay);
+        }
+        let (min_btn, _, _) = self.window_button_rects();
+        let target = RECT {
+            left: min_btn.left - 46,
+            top: 16,
+            right: min_btn.left - 18,
+            bottom: 44,
+        };
         self.extension_install_flight = Some(ExtensionInstallFlightState {
             start_time: std::time::Instant::now(),
             from,
@@ -4952,7 +4963,7 @@ impl App {
         let t = raw_t * raw_t * (2.2 - 1.2 * raw_t);
         let mid = POINT {
             x: (flight.from.x + flight.to.x) / 2,
-            y: (flight.from.y.min(flight.to.y) - 120).max(12),
+            y: ((flight.from.y + flight.to.y) / 2 - 90).max(flight.to.y + 18),
         };
         let omt = 1.0 - t;
         let x = omt * omt * flight.from.x as f32
@@ -4966,7 +4977,7 @@ impl App {
         } else {
             1.0
         };
-        let size = (30.0 - 8.0 * raw_t).round() as i32;
+        let size = 32;
         Some((
             POINT {
                 x: x.round() as i32,
@@ -14444,23 +14455,14 @@ unsafe extern "system" fn extension_install_popup_proc(
             let hdc = BeginPaint(hwnd, &mut ps);
             if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
                 with_app(parent, |app| {
-                    if let Some((_center, _size, fade)) = app.extension_install_flight_frame() {
+                    if app.extension_install_flight_frame().is_some() {
                         let rect = client_rect(hwnd);
-                        let color =
-                            mix_color(app.accent_color, COLOR_PANEL_2, 0.32 + 0.38 * (1.0 - fade));
-                        fill_round_rect(hdc, rect, color, (rect.right - rect.left) / 2);
-                        draw_icon_glyph(
-                            hdc,
-                            &app.fonts.toolbar_icon,
-                            IconKind::Extensions.glyph(),
-                            RECT {
-                                left: rect.left + 4,
-                                top: rect.top + 4,
-                                right: rect.right - 4,
-                                bottom: rect.bottom - 4,
-                            },
-                            if fade > 0.35 { COLOR_TEXT } else { COLOR_MUTED },
-                        );
+                        let elapsed = app
+                            .extension_install_flight
+                            .as_ref()
+                            .map(|flight| flight.start_time.elapsed().as_millis() as u64)
+                            .unwrap_or(0);
+                        draw_download_popup_gdi(hdc, rect, elapsed);
                     }
                 });
             }
