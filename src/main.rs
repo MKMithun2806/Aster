@@ -60,13 +60,13 @@ use windows::{
                 self, CreateIconIndirect, GetCursorPos, GetTopWindow, GetWindow, CREATESTRUCTW,
                 CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA, GWLP_WNDPROC,
                 GWL_STYLE, GW_HWNDNEXT, HICON, HMENU, HWND_TOP, ICONINFO, ICON_BIG, ICON_SMALL,
-                IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_ACTIVATE,
-                WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
-                WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
-                WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE,
-                WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
-                WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                IDC_ARROW, IDC_SIZEWE, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE,
+                WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+                WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+                WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT,
+                WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPSIBLINGS,
+                WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
     },
@@ -216,12 +216,30 @@ const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
     const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
     return path.slice(0, 8).map(labelForNode).join(" ");
   };
-  const isInstallIntent = (label) => label.includes("add to chrome")
-    || label.includes("download chrome")
-    || label.includes("install chrome")
-    || label.includes("install")
-    || label.includes("get extension")
-    || label.includes("installed in aster");
+  const nonInstallPattern = /\b(installed in aster|download chrome|install chrome|switch to chrome|no thanks|share|search|reviews?|overview|privacy|support|related|website|report abuse|menu|close|back)\b/i;
+  const isInstallIntent = (label) => /\b(add to chrome|install in aster|get extension)\b/i.test(label)
+    && !nonInstallPattern.test(label);
+  const installControlFromPath = (path) => {
+    const nodes = Array.from(path || []).slice(0, 8);
+    const label = nodes.map(labelForNode).join(" ");
+    if (isInstallIntent(label)) return true;
+    const buttonLike = nodes.find((node) => node?.matches?.("button, a, [role='button'], [jsaction], [data-test-id], [aria-label]"));
+    if (!buttonLike || nonInstallPattern.test(label)) return false;
+    const id = extensionId();
+    if (!id) return false;
+    const attrs = nodes.map((node) => {
+      if (!node?.getAttribute) return "";
+      return [
+        node.getAttribute("aria-label"),
+        node.getAttribute("title"),
+        node.getAttribute("data-test-id"),
+        node.getAttribute("jsaction"),
+        node.id,
+        node.className
+      ].filter(Boolean).join(" ");
+    }).join(" ").toLowerCase();
+    return /\b(add|install|get|webstore|extension)\b/.test(attrs) && !/\b(search|share|menu|close|back|review|support)\b/.test(attrs);
+  };
   const applyInstallState = (el, installed) => {
     if (installed) {
       if ("disabled" in el) el.disabled = true;
@@ -243,7 +261,7 @@ const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
       const text = (el.textContent || "").trim().toLowerCase();
       if (text === "download chrome to install extensions and themes") {
         el.textContent = installed ? "Installed and managed in Aster." : "Install this extension with Aster.";
-      } else if (installed && text.length < 360 && text.includes("switch to chrome?") && text.includes("google recommends using chrome")) {
+      } else if (text.length < 420 && text.includes("switch to chrome?") && text.includes("google recommends using chrome")) {
         el.style.display = "none";
       }
     });
@@ -299,12 +317,13 @@ const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
     const installed = installedIds.has(extensionId());
     document.querySelectorAll("button, a, div[role='button']").forEach((el) => {
       const label = labelForNode(el);
-      if (!isInstallIntent(label)) return;
+      if (!isInstallIntent(label) && !installControlFromPath([el])) return;
       if (!el.dataset.asterInstallPatched) {
         el.dataset.asterInstallPatched = "1";
         el.addEventListener("click", (event) => {
           event.preventDefault();
           event.stopPropagation();
+          event.stopImmediatePropagation();
           install();
         }, true);
       }
@@ -349,13 +368,10 @@ const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
     if (installed) status("Installed in Aster");
     patchStoreControls();
   };
-  document.addEventListener("click", (event) => {
+  const handleInstallEvent = (event) => {
     if (!isStore() || !extensionId()) return;
-    const label = eventIntentLabel(event);
     const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
-    const buttonLike = path.some((node) => node?.matches?.("button, a, [role='button']"));
-    const knownNonInstall = /\b(search|sign in|share|reviews?|overview|privacy|support|related|website|report abuse|menu|close|back)\b/.test(label);
-    if (isInstallIntent(label) || (buttonLike && !knownNonInstall && path.length && path[0]?.id !== "__asterExtensionInstall")) {
+    if (installControlFromPath(path) && path.length && path[0]?.id !== "__asterExtensionInstall") {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
@@ -366,7 +382,8 @@ const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
       }
       install();
     }
-  }, true);
+  };
+  ["pointerdown", "mousedown", "click"].forEach((type) => document.addEventListener(type, handleInstallEvent, true));
   new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("popstate", schedule);
   window.addEventListener("hashchange", schedule);
@@ -449,6 +466,7 @@ static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
 static mut OLD_OVERLAY_MENU_PROC: WNDPROC = None;
 static mut OLD_DOWNLOAD_POPUP_PROC: WNDPROC = None;
 static mut OLD_EXTENSION_INSTALL_POPUP_PROC: WNDPROC = None;
+static mut OLD_EXTENSION_SIDE_PANEL_PROC: WNDPROC = None;
 static mut OLD_BOOKMARK_POPUP_PROC: WNDPROC = None;
 static mut OLD_EXTENSION_POPUP_PROC: WNDPROC = None;
 static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
@@ -1275,9 +1293,12 @@ struct App {
     extension_popup_hwnd: HWND,
     extension_popup_controller: Option<ICoreWebView2Controller>,
     extension_popup_anchor: Option<RECT>,
+    extension_popup_extension_id: Option<String>,
     extension_side_panel_hwnd: HWND,
     extension_side_panel_controller: Option<ICoreWebView2Controller>,
     extension_side_panel_extension_id: Option<String>,
+    extension_side_panel_width_override: Option<i32>,
+    extension_side_panel_resizing: bool,
     bookmark_toast: Option<BookmarkToastState>,
     download_removal_anim: Option<DownloadRemovalAnim>,
     download_collapse_anim: Option<DownloadCollapseAnim>,
@@ -1469,9 +1490,12 @@ impl App {
             extension_popup_hwnd: HWND(std::ptr::null_mut()),
             extension_popup_controller: None,
             extension_popup_anchor: None,
+            extension_popup_extension_id: None,
             extension_side_panel_hwnd: HWND(std::ptr::null_mut()),
             extension_side_panel_controller: None,
             extension_side_panel_extension_id: None,
+            extension_side_panel_width_override: None,
+            extension_side_panel_resizing: false,
             bookmark_toast: None,
             download_removal_anim: None,
             download_collapse_anim: None,
@@ -1998,6 +2022,7 @@ impl App {
             }
         }
         self.extension_popup_anchor = None;
+        self.extension_popup_extension_id = None;
     }
 
     fn close_extension_side_panel(&mut self) {
@@ -2013,6 +2038,7 @@ impl App {
             }
         }
         self.extension_side_panel_extension_id = None;
+        self.extension_side_panel_resizing = false;
         self.layout();
         self.refresh();
     }
@@ -2088,6 +2114,7 @@ impl App {
                 self.extension_popup_hwnd = hwnd;
                 self.extension_popup_controller = Some(controller);
                 self.extension_popup_anchor = Some(anchor);
+                self.extension_popup_extension_id = Some(ext.id.clone());
                 self.layout_extension_popup_chrome();
             }
         }
@@ -4166,6 +4193,11 @@ impl App {
                     "default_bubble_dismissed" => {
                         self.default_bubble_dismissed = parts[2] == "1";
                     }
+                    "extension_side_panel_width" => {
+                        if let Ok(width) = parts[2].parse::<i32>() {
+                            self.extension_side_panel_width_override = Some(width.clamp(300, 1200));
+                        }
+                    }
                     _ => {}
                 },
                 "keybind" if parts.len() >= 3 => {
@@ -4318,6 +4350,9 @@ impl App {
                 "0"
             }
         ));
+        if let Some(width) = self.extension_side_panel_width_override {
+            lines.push(format!("setting\textension_side_panel_width\t{}", width));
+        }
         for (action, combo) in &self.custom_keybinds {
             lines.push(format!(
                 "keybind\t{}\t{}",
@@ -4465,7 +4500,21 @@ impl App {
             let hwnd = self.hwnd;
             let mut token = 0;
             webview.add_NavigationStarting(
-                &NavigationStartingEventHandler::create(Box::new(move |_sender, _args| {
+                &NavigationStartingEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut uri = PWSTR::null();
+                        if args.Uri(&mut uri).is_ok() {
+                            let url = CoTaskMemPWSTR::from(uri).to_string();
+                            if let Some(extension_id) = extension_id_from_crx_download(&url, "") {
+                                let _ = args.SetCancel(true);
+                                with_app(hwnd, |app| {
+                                    app.start_extension_install_flight();
+                                    app.install_extension_from_store(&extension_id);
+                                });
+                                return Ok(());
+                            }
+                        }
+                    }
                     with_app(hwnd, |app| app.set_tab_loading(tab_id, true));
                     Ok(())
                 })),
@@ -4670,6 +4719,20 @@ impl App {
                     &DownloadStartingEventHandler::create(Box::new(move |_sender, args| {
                         if let Some(args) = args {
                             if let Ok(operation) = args.DownloadOperation() {
+                                let snapshot = download_snapshot(&operation);
+                                if let Some(extension_id) = extension_id_from_crx_download(
+                                    &snapshot.uri,
+                                    &snapshot.file_path,
+                                ) {
+                                    let _ = args.SetHandled(true);
+                                    let _ = args.SetCancel(true);
+                                    let _ = operation.Cancel();
+                                    with_app(hwnd, |app| {
+                                        app.start_extension_install_flight();
+                                        app.install_extension_from_store(&extension_id);
+                                    });
+                                    return Ok(());
+                                }
                                 let mut result_path = PWSTR::null();
                                 let file_path = if args.ResultFilePath(&mut result_path).is_ok() {
                                     CoTaskMemPWSTR::from(result_path).to_string()
@@ -4680,6 +4743,7 @@ impl App {
                                     let id = app.register_download(operation.clone(), file_path);
                                     app.attach_download_events(id, &operation);
                                 });
+                                let _ = args.SetHandled(true);
                             }
                         }
                         Ok(())
@@ -4922,12 +4986,13 @@ impl App {
     fn start_extension_install_flight(&mut self) {
         let mut from = POINT::default();
         unsafe {
-            if GetCursorPos(&mut from).is_err() || !ScreenToClient(self.hwnd, &mut from).as_bool() {
+            if GetCursorPos(&mut from).is_err() {
                 let rect = client_rect(self.hwnd);
                 from = POINT {
                     x: rect.right / 2,
                     y: rect.bottom / 2,
                 };
+                let _ = Gdi::ClientToScreen(self.hwnd, &mut from);
             }
         }
         if self.topbar_mode != SidebarMode::Pushed && self.topbar_expand_mode != SidebarMode::Pushed
@@ -4942,13 +5007,17 @@ impl App {
             right: min_btn.left - 18,
             bottom: 44,
         };
+        let mut target_center = POINT {
+            x: (target.left + target.right) / 2,
+            y: (target.top + target.bottom) / 2,
+        };
+        unsafe {
+            let _ = Gdi::ClientToScreen(self.hwnd, &mut target_center);
+        }
         self.extension_install_flight = Some(ExtensionInstallFlightState {
             start_time: std::time::Instant::now(),
             from,
-            to: POINT {
-                x: (target.left + target.right) / 2,
-                y: (target.top + target.bottom) / 2,
-            },
+            to: target_center,
         });
         self.position_extension_install_popup();
         self.ensure_download_timer();
@@ -4958,7 +5027,7 @@ impl App {
     fn extension_install_flight_frame(&self) -> Option<(POINT, i32, f32)> {
         let flight = self.extension_install_flight.as_ref()?;
         let elapsed = flight.start_time.elapsed().as_millis() as f32;
-        let raw_t = (elapsed / 820.0).clamp(0.0, 1.0);
+        let raw_t = (elapsed / 760.0).clamp(0.0, 1.0);
         // Ease-in curve: slow at click point, faster as it commits toward the toolbar.
         let t = raw_t * raw_t * (2.2 - 1.2 * raw_t);
         let mid = POINT {
@@ -4972,8 +5041,8 @@ impl App {
         let y = omt * omt * flight.from.y as f32
             + 2.0 * omt * t * mid.y as f32
             + t * t * flight.to.y as f32;
-        let fade = if raw_t > 0.68 {
-            ((1.0 - raw_t) / 0.32).clamp(0.0, 1.0)
+        let fade = if raw_t > 0.62 {
+            ((0.86 - raw_t) / 0.24).clamp(0.0, 1.0)
         } else {
             1.0
         };
@@ -5006,6 +5075,15 @@ impl App {
                 size,
                 WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
             );
+            if let Some((_, _, fade)) = self.extension_install_flight_frame() {
+                let alpha = (fade * 255.0).round().clamp(0.0, 255.0) as u8;
+                let _ = WindowsAndMessaging::SetLayeredWindowAttributes(
+                    self.extension_install_popup_hwnd,
+                    COLORREF(0),
+                    alpha,
+                    WindowsAndMessaging::LWA_ALPHA,
+                );
+            }
             let region = CreateRoundRectRgn(0, 0, size + 1, size + 1, size, size);
             let _ = SetWindowRgn(self.extension_install_popup_hwnd, Some(region), true);
             let _ = InvalidateRect(Some(self.extension_install_popup_hwnd), None, false);
@@ -6183,6 +6261,22 @@ impl App {
                         with_app(hwnd, |app| {
                             app.pinned_extensions
                                 .retain(|extension_id| installed_ids.contains(extension_id));
+                            if app
+                                .extension_popup_extension_id
+                                .as_ref()
+                                .map(|id| !installed_ids.contains(id))
+                                .unwrap_or(false)
+                            {
+                                app.close_extension_popup();
+                            }
+                            if app
+                                .extension_side_panel_extension_id
+                                .as_ref()
+                                .map(|id| !installed_ids.contains(id))
+                                .unwrap_or(false)
+                            {
+                                app.close_extension_side_panel();
+                            }
                             // Enrich with manifest data from stored install paths
                             for ext in extensions.iter_mut() {
                                 let known_path = app.extension_install_paths.get(&ext.id).cloned();
@@ -6406,6 +6500,12 @@ impl App {
         let id_for_notice = id.to_string();
         let hwnd = self.hwnd;
         self.extension_notice = Some("Removing extension...".to_string());
+        if self.extension_popup_extension_id.as_deref() == Some(id) {
+            self.close_extension_popup();
+        }
+        if self.extension_side_panel_extension_id.as_deref() == Some(id) {
+            self.close_extension_side_panel();
+        }
         self.reload_extensions_pages();
         self.with_extension_by_id(id, move |extension| unsafe {
             let _ = extension.Remove(&BrowserExtensionRemoveCompletedHandler::create(Box::new(
@@ -8093,16 +8193,30 @@ impl App {
         if width < 720 {
             0
         } else {
-            EXTENSION_SIDE_PANEL_WIDTH.min(width / 2).max(300)
+            let max_width = (width * 72 / 100).max(300);
+            self.extension_side_panel_width_override
+                .unwrap_or(EXTENSION_SIDE_PANEL_WIDTH)
+                .clamp(300, max_width)
         }
+    }
+
+    fn resize_extension_side_panel_from_x(&mut self, x: i32) {
+        let rect = client_rect(self.hwnd);
+        let browser_width = (rect.right - rect.left).max(1);
+        let max_width = (browser_width * 72 / 100).max(300);
+        let width = (rect.right - x).clamp(300, max_width);
+        self.extension_side_panel_width_override = Some(width);
+        self.layout();
+        self.refresh();
     }
 
     fn extension_side_panel_rect(&self) -> RECT {
         let rect = client_rect(self.hwnd);
         let width = self.extension_side_panel_width();
+        let top = self.topbar_pushed_height();
         RECT {
             left: rect.right - width,
-            top: 0,
+            top,
             right: rect.right,
             bottom: rect.bottom,
         }
@@ -8530,7 +8644,7 @@ impl App {
                 if panel_visible {
                     let panel_width = (panel_rect.right - panel_rect.left).max(1);
                     let panel_height = (panel_rect.bottom - panel_rect.top).max(1);
-                    let clip_top = if self.fullscreen {
+                    let clip_top = if self.fullscreen || self.topbar_pushed_height() > 0 {
                         0
                     } else {
                         self.topbar_height.ceil() as i32
@@ -13770,10 +13884,10 @@ fn create_download_popup(parent: HWND) -> AppResult<HWND> {
 fn create_extension_install_popup(parent: HWND) -> AppResult<HWND> {
     unsafe {
         let hwnd = WindowsAndMessaging::CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WINDOW_EX_STYLE(0x00080000 | 0x00000080 | 0x08000000), // WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
             w!("STATIC"),
             w!(""),
-            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            WS_POPUP | WS_VISIBLE,
             0,
             0,
             1,
@@ -13783,6 +13897,7 @@ fn create_extension_install_popup(parent: HWND) -> AppResult<HWND> {
             Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
             None,
         )?;
+        let _ = WindowsAndMessaging::SetWindowLongPtrW(hwnd, GWLP_USERDATA, parent.0 as isize);
         OLD_EXTENSION_INSTALL_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
             hwnd,
             GWLP_WNDPROC,
@@ -13907,9 +14022,86 @@ fn create_extension_side_panel_window(parent: HWND) -> AppResult<HWND> {
             Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
             None,
         )?;
+        OLD_EXTENSION_SIDE_PANEL_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            extension_side_panel_proc as *const () as isize,
+        ));
         let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOWNA);
         Ok(hwnd)
     }
+}
+
+unsafe extern "system" fn extension_side_panel_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_LBUTTONDOWN => {
+            if loword(l_param.0 as u32) as i32 <= 8 {
+                if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                    with_app(parent, |app| {
+                        app.extension_side_panel_resizing = true;
+                    });
+                    let _ = SetCapture(hwnd);
+                    return LRESULT(0);
+                }
+            }
+        }
+        WM_MOUSEMOVE => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                let x = loword(l_param.0 as u32) as i32;
+                let mut resizing = false;
+                with_app(parent, |app| {
+                    resizing = app.extension_side_panel_resizing;
+                });
+                if resizing {
+                    let mut pt = POINT {
+                        x,
+                        y: hiword(l_param.0 as u32) as i32,
+                    };
+                    let _ = Gdi::ClientToScreen(hwnd, &mut pt);
+                    let _ = ScreenToClient(parent, &mut pt);
+                    with_app(parent, |app| app.resize_extension_side_panel_from_x(pt.x));
+                    return LRESULT(0);
+                }
+            }
+        }
+        WM_LBUTTONUP => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if app.extension_side_panel_resizing {
+                        app.extension_side_panel_resizing = false;
+                        app.save_state();
+                    }
+                });
+                let _ = ReleaseCapture();
+                return LRESULT(0);
+            }
+        }
+        WM_SETCURSOR => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                let mut pt = POINT::default();
+                let mut show_resize = false;
+                if GetCursorPos(&mut pt).is_ok() {
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                    with_app(parent, |app| {
+                        show_resize = app.extension_side_panel_resizing || pt.x <= 8;
+                    });
+                }
+                if show_resize {
+                    if let Ok(cursor) = WindowsAndMessaging::LoadCursorW(None, IDC_SIZEWE) {
+                        WindowsAndMessaging::SetCursor(Some(cursor));
+                        return LRESULT(1);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_EXTENSION_SIDE_PANEL_PROC, hwnd, msg, w_param, l_param)
 }
 
 unsafe extern "system" fn extension_popup_proc(
@@ -14453,7 +14645,9 @@ unsafe extern "system" fn extension_install_popup_proc(
         WM_PAINT => {
             let mut ps = mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
-            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+            let parent =
+                HWND(WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut _);
+            if parent != HWND(std::ptr::null_mut()) {
                 with_app(parent, |app| {
                     if app.extension_install_flight_frame().is_some() {
                         let rect = client_rect(hwnd);
@@ -16852,6 +17046,24 @@ fn extract_chrome_extension_id(value: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn extension_id_from_crx_download(uri: &str, file_path: &str) -> Option<String> {
+    let lower_uri = uri.to_ascii_lowercase();
+    let lower_path = file_path.to_ascii_lowercase();
+    let looks_like_crx = lower_uri.contains("clients2.google.com/service/update2/crx")
+        || lower_uri.contains("chromewebstore.google.com")
+        || lower_uri.contains(".crx")
+        || lower_path.ends_with(".crx");
+    if !looks_like_crx {
+        return None;
+    }
+    extract_chrome_extension_id(&percent_decode(uri)).or_else(|| {
+        Path::new(file_path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(extract_chrome_extension_id)
+    })
 }
 
 fn crx_install_root() -> PathBuf {
@@ -19702,5 +19914,25 @@ mod tests {
             Some(id.to_string())
         );
         assert_eq!(extract_chrome_extension_id("not-an-extension"), None);
+    }
+
+    #[test]
+    fn test_extension_id_from_crx_download() {
+        let id = "abcdefghijklmnopabcdefghijklmnop";
+        let uri = format!(
+            "https://clients2.google.com/service/update2/crx?response=redirect&x=id%3D{id}%26installsource%3Dondemand%26uc"
+        );
+        assert_eq!(
+            extension_id_from_crx_download(&uri, ""),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            extension_id_from_crx_download("", &format!("C:\\Temp\\{id}.crx")),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            extension_id_from_crx_download("https://example.com/file.zip", "file.zip"),
+            None
+        );
     }
 }
