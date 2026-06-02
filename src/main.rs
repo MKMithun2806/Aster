@@ -94,6 +94,7 @@ const BACKGROUND_TIMER_ID: usize = 45;
 const LOADING_TIMER_ID: usize = 46;
 const TOPBAR_TIMER_ID: usize = 47;
 const DOWNLOAD_TIMER_ID: usize = 48;
+const OVERLAY_MENU_ANIM_TIMER_ID: usize = 49;
 const SPLIT_MAX_PANES: usize = 4;
 const SPLIT_GAP: i32 = 6;
 const STATE_FILE: &str = ".aster-state";
@@ -865,11 +866,21 @@ fn calculate_frecency(visit_count: u32, last_visit_time: u64, current_time: u64)
     visit_count * recency_weight
 }
 
+fn overlay_menu_pin_rect(row: RECT) -> RECT {
+    RECT {
+        left: row.right - 32,
+        top: row.top + 5,
+        right: row.right - 6,
+        bottom: row.bottom - 5,
+    }
+}
+
 #[derive(Clone)]
 struct OverlayMenu {
     rect: RECT,
     target: MenuTarget,
     items: Vec<OverlayMenuItem>,
+    opened_at: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -972,6 +983,8 @@ enum HoverTarget {
     DownloadOpen(usize),
     ExtensionButton(usize),
     ExtensionsButton,
+    OverlayMenuRow(usize),
+    OverlayMenuPin(usize),
     FindPrev,
     FindNext,
     FindClose,
@@ -1024,6 +1037,12 @@ struct DownloadToastState {
     start_time: std::time::Instant,
     fading: bool,
     slide_x: f32,
+}
+
+struct ExtensionInstallFlightState {
+    start_time: std::time::Instant,
+    from: POINT,
+    to: POINT,
 }
 
 struct BookmarkToastState {
@@ -1246,6 +1265,7 @@ struct App {
     downloads: Vec<DownloadItem>,
     next_download_id: usize,
     download_toast: Option<DownloadToastState>,
+    extension_install_flight: Option<ExtensionInstallFlightState>,
     download_panel: Option<DownloadPanelMode>,
     download_panel_reveal: f32,
     download_panel_reveal_target: f32,
@@ -1437,6 +1457,7 @@ impl App {
             downloads: Vec::new(),
             next_download_id: 1,
             download_toast: None,
+            extension_install_flight: None,
             download_panel: None,
             download_panel_reveal: 0.0,
             download_panel_reveal_target: 0.0,
@@ -1908,15 +1929,7 @@ impl App {
             menu_item(MENU_EXTENSION_REFRESH, "Refresh Extensions"),
         ];
         for (offset, extension) in self.extensions.iter().enumerate() {
-            let access = if extension.enabled {
-                if self.pinned_extensions.contains(&extension.id) {
-                    "Pinned"
-                } else {
-                    "Unpinned"
-                }
-            } else {
-                "Disabled"
-            };
+            let access = if extension.enabled { "" } else { "Disabled" };
             let mut item =
                 menu_item_with_subtitle(MENU_EXTENSION_ITEM_BASE + offset, &extension.name, access);
             item.icon_key = extension.id.clone();
@@ -2427,6 +2440,7 @@ impl App {
         } else if message == "extensions:open-store" {
             self.open_extension_store();
         } else if let Some(value) = message.strip_prefix("extensions:install-store:") {
+            self.start_extension_install_flight();
             self.install_extension_from_store(&percent_decode(value));
         } else if let Some(id) = message.strip_prefix("extensions:open-popup:") {
             self.open_extension_popup_by_id(&percent_decode(id));
@@ -4886,6 +4900,35 @@ impl App {
                 }
             }
         }
+        if let Some(flight) = &self.extension_install_flight {
+            if flight.start_time.elapsed().as_millis() >= 760 {
+                self.extension_install_flight = None;
+            }
+        }
+    }
+
+    fn start_extension_install_flight(&mut self) {
+        let mut from = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut from).is_err() || !ScreenToClient(self.hwnd, &mut from).as_bool() {
+                let rect = client_rect(self.hwnd);
+                from = POINT {
+                    x: rect.right / 2,
+                    y: rect.bottom / 2,
+                };
+            }
+        }
+        let target = self.extension_button_rect();
+        self.extension_install_flight = Some(ExtensionInstallFlightState {
+            start_time: std::time::Instant::now(),
+            from,
+            to: POINT {
+                x: (target.left + target.right) / 2,
+                y: (target.top + target.bottom) / 2,
+            },
+        });
+        self.ensure_download_timer();
+        self.refresh();
     }
 
     fn tick_download_panel_animation(&mut self) {
@@ -4924,6 +4967,7 @@ impl App {
             && (self.download_panel_reveal - self.download_panel_reveal_target).abs() > 0.005;
         let needs_timer = panel_animating
             || self.download_toast.is_some()
+            || self.extension_install_flight.is_some()
             || self.bookmark_toast.is_some()
             || self.download_removal_anim.is_some()
             || self.download_collapse_anim.is_some()
@@ -9065,6 +9109,7 @@ impl App {
             if sidebar_width <= 92 {
                 self.paint_download_toast(hdc, rect);
             }
+            self.paint_extension_install_flight(hdc);
 
             if self.show_default_bubble {
                 let width_f = sidebar_width as f32;
@@ -9077,6 +9122,79 @@ impl App {
             if self.settings_open {
                 self.paint_settings_menu(hdc);
             }
+        }
+    }
+
+    fn paint_extension_install_flight(&self, hdc: HDC) {
+        let Some(flight) = &self.extension_install_flight else {
+            return;
+        };
+        let elapsed = flight.start_time.elapsed().as_millis() as f32;
+        let t = (elapsed / 720.0).clamp(0.0, 1.0);
+        let ease = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+        let fade = if t > 0.72 {
+            ((1.0 - t) / 0.28).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        if fade <= 0.02 {
+            return;
+        }
+        let x = flight.from.x as f32 + (flight.to.x - flight.from.x) as f32 * ease;
+        let y = flight.from.y as f32 + (flight.to.y - flight.from.y) as f32 * ease;
+        let size = (28.0 - 6.0 * t).round() as i32;
+        let rect = RECT {
+            left: x.round() as i32 - size / 2,
+            top: y.round() as i32 - size / 2,
+            right: x.round() as i32 + size / 2,
+            bottom: y.round() as i32 + size / 2,
+        };
+        unsafe {
+            let mem_dc = CreateCompatibleDC(Some(hdc));
+            if mem_dc.is_invalid() {
+                return;
+            }
+            let bitmap = CreateCompatibleBitmap(hdc, size.max(1), size.max(1));
+            if bitmap.is_invalid() {
+                let _ = DeleteDC(mem_dc);
+                return;
+            }
+            let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+            fill_round_rect(
+                mem_dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: size,
+                    bottom: size,
+                },
+                mix_color(self.accent_color, COLOR_PANEL_2, 0.38),
+                size / 2,
+            );
+            draw_icon_glyph(
+                mem_dc,
+                &self.fonts.toolbar_icon,
+                IconKind::Extensions.glyph(),
+                RECT {
+                    left: 3,
+                    top: 3,
+                    right: size - 3,
+                    bottom: size - 3,
+                },
+                COLOR_TEXT,
+            );
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: (fade * 255.0).round().clamp(0.0, 255.0) as u8,
+                AlphaFormat: 0,
+            };
+            let _ = AlphaBlend(
+                hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend,
+            );
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(mem_dc);
         }
     }
 
@@ -9304,6 +9422,51 @@ impl App {
         unsafe {
             let width = menu.rect.right - menu.rect.left;
             let height = menu.rect.bottom - menu.rect.top;
+            let elapsed = menu.opened_at.elapsed().as_millis() as f32;
+            let progress = (elapsed / 140.0).clamp(0.0, 1.0);
+            let ease = 1.0 - (1.0 - progress) * (1.0 - progress);
+            let alpha = (190.0 + 65.0 * ease).round().clamp(0.0, 255.0) as u8;
+            let slide_y = ((1.0 - ease) * -6.0).round() as i32;
+            let mem_dc = CreateCompatibleDC(Some(hdc));
+            if mem_dc.is_invalid() {
+                self.paint_overlay_menu_contents(hdc, menu, width, height);
+                return;
+            }
+            let bitmap = CreateCompatibleBitmap(hdc, width, height);
+            if bitmap.is_invalid() {
+                let _ = DeleteDC(mem_dc);
+                self.paint_overlay_menu_contents(hdc, menu, width, height);
+                return;
+            }
+            let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+            fill_rect(
+                mem_dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                },
+                COLOR_BLACK,
+            );
+            let _ = SetViewportOrgEx(mem_dc, 0, slide_y, None);
+            self.paint_overlay_menu_contents(mem_dc, menu, width, height);
+            let _ = SetViewportOrgEx(mem_dc, 0, 0, None);
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: alpha,
+                AlphaFormat: 0,
+            };
+            let _ = AlphaBlend(hdc, 0, 0, width, height, mem_dc, 0, 0, width, height, blend);
+            let _ = SelectObject(mem_dc, old_bitmap);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(mem_dc);
+        }
+    }
+
+    fn paint_overlay_menu_contents(&self, hdc: HDC, menu: &OverlayMenu, width: i32, height: i32) {
+        unsafe {
             let local_rect = RECT {
                 left: 0,
                 top: 0,
@@ -9319,8 +9482,10 @@ impl App {
                     right: width - 6,
                     bottom: 6 + (index as i32 + 1) * MENU_ROW_HEIGHT,
                 };
-                if self.hover_target.map(|_| false).unwrap_or(false) {
-                    let _ = row;
+                if self.hover_target == Some(HoverTarget::OverlayMenuRow(index))
+                    || self.hover_target == Some(HoverTarget::OverlayMenuPin(index))
+                {
+                    fill_round_rect(hdc, row, COLOR_SURFACE_HOVER, 8);
                 }
                 let text_left = if item.icon_path.is_empty() {
                     row.left + 10
@@ -9376,7 +9541,13 @@ impl App {
                     RECT {
                         left: text_left,
                         top: row.top,
-                        right: row.right - 10,
+                        right: if menu.target == MenuTarget::Extensions
+                            && item.id >= MENU_EXTENSION_ITEM_BASE
+                        {
+                            row.right - 38
+                        } else {
+                            row.right - 10
+                        },
                         bottom: if item.sublabel.is_empty() {
                             row.bottom
                         } else {
@@ -9397,6 +9568,34 @@ impl App {
                             bottom: row.bottom,
                         },
                         COLOR_MUTED,
+                    );
+                }
+                if menu.target == MenuTarget::Extensions && item.id >= MENU_EXTENSION_ITEM_BASE {
+                    let extension_index = item.id - MENU_EXTENSION_ITEM_BASE;
+                    let Some(extension) = self.extensions.get(extension_index) else {
+                        continue;
+                    };
+                    let pinned = self.pinned_extensions.contains(&extension.id);
+                    let pin_rect = overlay_menu_pin_rect(row);
+                    if self.hover_target == Some(HoverTarget::OverlayMenuPin(index)) {
+                        fill_round_rect(
+                            hdc,
+                            pin_rect,
+                            mix_color(COLOR_SURFACE_HOVER, COLOR_TEXT, 0.08),
+                            7,
+                        );
+                    }
+                    let pin_glyph = if pinned { glyph(0xE77A) } else { glyph(0xE718) };
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.toolbar_icon,
+                        pin_glyph.as_str(),
+                        pin_rect,
+                        if pinned {
+                            self.accent_color
+                        } else {
+                            COLOR_MUTED
+                        },
                     );
                 }
             }
@@ -11490,6 +11689,7 @@ impl App {
             rect: menu_rect,
             target,
             items,
+            opened_at: std::time::Instant::now(),
         });
 
         unsafe {
@@ -11509,6 +11709,12 @@ impl App {
             );
             let _ = InvalidateRect(Some(self.overlay_menu_hwnd), None, false);
             let _ = SetFocus(Some(self.overlay_menu_hwnd));
+            let _ = WindowsAndMessaging::SetTimer(
+                Some(self.hwnd),
+                OVERLAY_MENU_ANIM_TIMER_ID,
+                16,
+                None,
+            );
         }
         self.raise_native_chrome_windows();
         self.refresh();
@@ -11588,7 +11794,6 @@ impl App {
             return true;
         }
         let id = menu.items[row_index as usize].id;
-        self.overlay_menu = None;
         if menu.target == MenuTarget::Extensions && id >= MENU_EXTENSION_ITEM_BASE {
             let anchor = RECT {
                 left: menu.rect.left + 6,
@@ -11597,10 +11802,23 @@ impl App {
                 bottom: menu.rect.top + 6 + (row_index + 1) * MENU_ROW_HEIGHT,
             };
             let offset = id - MENU_EXTENSION_ITEM_BASE;
+            let pin_rect = overlay_menu_pin_rect(anchor);
+            if point_in_rect(x, y, pin_rect) {
+                let currently_pinned = self
+                    .extensions
+                    .get(offset)
+                    .map(|extension| self.pinned_extensions.contains(&extension.id))
+                    .unwrap_or(false);
+                self.set_extension_pinned(offset, !currently_pinned);
+                self.open_extension_menu();
+                return true;
+            }
+            self.overlay_menu = None;
             self.open_extension_popup_by_index(offset, anchor);
             self.refresh();
             return true;
         }
+        self.overlay_menu = None;
         self.run_menu_command(menu.target, id);
         true
     }
@@ -11619,10 +11837,53 @@ impl App {
         let id = menu.items[row_index as usize].id;
         if menu.target == MenuTarget::Extensions && id >= MENU_EXTENSION_ITEM_BASE {
             let offset = id - MENU_EXTENSION_ITEM_BASE;
-            self.open_extension_context_menu(offset, x, y);
+            let currently_pinned = self
+                .extensions
+                .get(offset)
+                .map(|extension| self.pinned_extensions.contains(&extension.id))
+                .unwrap_or(false);
+            self.set_extension_pinned(offset, !currently_pinned);
+            self.open_extension_menu();
             return true;
         }
         true
+    }
+
+    fn handle_overlay_hover(&mut self, x: i32, y: i32) {
+        let old_target = self.hover_target;
+        self.hover_target = None;
+        let Some(menu) = self.overlay_menu.clone() else {
+            if old_target.is_some() {
+                self.refresh();
+            }
+            return;
+        };
+        if point_in_rect(x, y, menu.rect) {
+            let row_index = (y - menu.rect.top - 6) / MENU_ROW_HEIGHT;
+            if row_index >= 0 && (row_index as usize) < menu.items.len() {
+                let row = RECT {
+                    left: menu.rect.left + 6,
+                    top: menu.rect.top + 6 + row_index * MENU_ROW_HEIGHT,
+                    right: menu.rect.right - 6,
+                    bottom: menu.rect.top + 6 + (row_index + 1) * MENU_ROW_HEIGHT,
+                };
+                let item = &menu.items[row_index as usize];
+                if menu.target == MenuTarget::Extensions
+                    && item.id >= MENU_EXTENSION_ITEM_BASE
+                    && point_in_rect(x, y, overlay_menu_pin_rect(row))
+                {
+                    self.hover_target = Some(HoverTarget::OverlayMenuPin(row_index as usize));
+                } else {
+                    self.hover_target = Some(HoverTarget::OverlayMenuRow(row_index as usize));
+                }
+            }
+        }
+        if old_target != self.hover_target {
+            unsafe {
+                let _ = InvalidateRect(Some(self.overlay_menu_hwnd), None, false);
+            }
+            self.refresh();
+        }
     }
 
     fn run_menu_command(&mut self, target: MenuTarget, id: usize) {
@@ -13671,6 +13932,18 @@ unsafe extern "system" fn overlay_menu_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEMOVE => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some(menu) = &app.overlay_menu {
+                        app.handle_overlay_hover(x + menu.rect.left, y + menu.rect.top);
+                    }
+                });
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
             let x = loword(l_param.0 as u32) as i16 as i32;
             let y = hiword(l_param.0 as u32) as i16 as i32;
@@ -14598,6 +14871,24 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         if app.bookmark_popup_hwnd != HWND(std::ptr::null_mut()) {
                             let _ = InvalidateRect(Some(app.bookmark_popup_hwnd), None, false);
                         }
+                    }
+                });
+                return LRESULT(0);
+            }
+            if w_param.0 == OVERLAY_MENU_ANIM_TIMER_ID {
+                with_app(hwnd, |app| unsafe {
+                    if app
+                        .overlay_menu
+                        .as_ref()
+                        .map(|menu| menu.opened_at.elapsed().as_millis() < 180)
+                        .unwrap_or(false)
+                    {
+                        let _ = InvalidateRect(Some(app.overlay_menu_hwnd), None, false);
+                    } else {
+                        let _ = WindowsAndMessaging::KillTimer(
+                            Some(app.hwnd),
+                            OVERLAY_MENU_ANIM_TIMER_ID,
+                        );
                     }
                 });
                 return LRESULT(0);
@@ -16291,8 +16582,14 @@ fn extension_host_script(extension_id: &str, side_panel_path: &str) -> String {
       sizeQueued = false;
       const body = document.body;
       const root = document.documentElement;
-      const width = Math.max(root?.scrollWidth || 0, body?.scrollWidth || 0, root?.offsetWidth || 0, body?.offsetWidth || 0);
-      const height = Math.max(root?.scrollHeight || 0, body?.scrollHeight || 0, root?.offsetHeight || 0, body?.offsetHeight || 0);
+      const rects = Array.from(document.body ? document.body.querySelectorAll("*") : []).slice(0, 800).map((el) => el.getBoundingClientRect()).filter((rect) => rect.width || rect.height);
+      const extent = rects.reduce((next, rect) => {{
+        next.right = Math.max(next.right, rect.right);
+        next.bottom = Math.max(next.bottom, rect.bottom);
+        return next;
+      }}, {{ right: 0, bottom: 0 }});
+      const width = Math.max(root?.scrollWidth || 0, body?.scrollWidth || 0, root?.offsetWidth || 0, body?.offsetWidth || 0, Math.ceil(extent.right));
+      const height = Math.max(root?.scrollHeight || 0, body?.scrollHeight || 0, root?.offsetHeight || 0, body?.offsetHeight || 0, Math.ceil(extent.bottom));
       if (width || height) post(`extensions:popup-size:${{extensionId}}:${{Math.ceil(width)}}:${{Math.ceil(height)}}`);
     }});
   }};
@@ -16351,7 +16648,16 @@ fn extension_host_script(extension_id: &str, side_panel_path: &str) -> String {
   }}
   window.addEventListener("load", postPopupSize);
   new ResizeObserver(postPopupSize).observe(document.documentElement);
+  if (document.body) new ResizeObserver(postPopupSize).observe(document.body);
+  document.addEventListener("transitionend", postPopupSize, true);
+  document.addEventListener("animationend", postPopupSize, true);
+  Array.from(document.images || []).forEach((img) => {{
+    if (!img.complete) img.addEventListener("load", postPopupSize, {{ once: true }});
+  }});
+  if (document.fonts?.ready) document.fonts.ready.then(postPopupSize).catch(() => {{}});
+  setTimeout(postPopupSize, 60);
   setTimeout(postPopupSize, 250);
+  setTimeout(postPopupSize, 700);
 }})();
 "#,
         js_string_literal(extension_id),
