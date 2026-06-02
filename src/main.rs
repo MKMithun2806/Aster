@@ -448,6 +448,7 @@ static mut OLD_COMMAND_POPUP_PROC: WNDPROC = None;
 static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
 static mut OLD_OVERLAY_MENU_PROC: WNDPROC = None;
 static mut OLD_DOWNLOAD_POPUP_PROC: WNDPROC = None;
+static mut OLD_EXTENSION_INSTALL_POPUP_PROC: WNDPROC = None;
 static mut OLD_BOOKMARK_POPUP_PROC: WNDPROC = None;
 static mut OLD_EXTENSION_POPUP_PROC: WNDPROC = None;
 static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
@@ -1270,6 +1271,7 @@ struct App {
     download_panel_reveal: f32,
     download_panel_reveal_target: f32,
     download_popup_hwnd: HWND,
+    extension_install_popup_hwnd: HWND,
     extension_popup_hwnd: HWND,
     extension_popup_controller: Option<ICoreWebView2Controller>,
     extension_popup_anchor: Option<RECT>,
@@ -1335,6 +1337,7 @@ impl App {
         let command_hwnd = create_command_popup(hwnd)?;
         let overlay_menu_hwnd = create_overlay_menu(hwnd)?;
         let download_popup_hwnd = create_download_popup(hwnd)?;
+        let extension_install_popup_hwnd = create_extension_install_popup(hwnd)?;
         let bookmark_popup_hwnd = create_bookmark_popup(hwnd)?;
         unsafe {
             let _ = WindowsAndMessaging::SendMessageW(
@@ -1462,6 +1465,7 @@ impl App {
             download_panel_reveal: 0.0,
             download_panel_reveal_target: 0.0,
             download_popup_hwnd,
+            extension_install_popup_hwnd,
             extension_popup_hwnd: HWND(std::ptr::null_mut()),
             extension_popup_controller: None,
             extension_popup_anchor: None,
@@ -4901,8 +4905,16 @@ impl App {
             }
         }
         if let Some(flight) = &self.extension_install_flight {
-            if flight.start_time.elapsed().as_millis() >= 760 {
+            if flight.start_time.elapsed().as_millis() >= 860 {
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(
+                        self.extension_install_popup_hwnd,
+                        WindowsAndMessaging::SW_HIDE,
+                    );
+                }
                 self.extension_install_flight = None;
+            } else {
+                self.position_extension_install_popup();
             }
         }
     }
@@ -4927,8 +4939,66 @@ impl App {
                 y: (target.top + target.bottom) / 2,
             },
         });
+        self.position_extension_install_popup();
         self.ensure_download_timer();
         self.refresh();
+    }
+
+    fn extension_install_flight_frame(&self) -> Option<(POINT, i32, f32)> {
+        let flight = self.extension_install_flight.as_ref()?;
+        let elapsed = flight.start_time.elapsed().as_millis() as f32;
+        let raw_t = (elapsed / 820.0).clamp(0.0, 1.0);
+        // Ease-in curve: slow at click point, faster as it commits toward the toolbar.
+        let t = raw_t * raw_t * (2.2 - 1.2 * raw_t);
+        let mid = POINT {
+            x: (flight.from.x + flight.to.x) / 2,
+            y: (flight.from.y.min(flight.to.y) - 120).max(12),
+        };
+        let omt = 1.0 - t;
+        let x = omt * omt * flight.from.x as f32
+            + 2.0 * omt * t * mid.x as f32
+            + t * t * flight.to.x as f32;
+        let y = omt * omt * flight.from.y as f32
+            + 2.0 * omt * t * mid.y as f32
+            + t * t * flight.to.y as f32;
+        let fade = if raw_t > 0.68 {
+            ((1.0 - raw_t) / 0.32).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let size = (30.0 - 8.0 * raw_t).round() as i32;
+        Some((
+            POINT {
+                x: x.round() as i32,
+                y: y.round() as i32,
+            },
+            size.max(18),
+            fade,
+        ))
+    }
+
+    fn position_extension_install_popup(&self) {
+        let Some((center, size, _)) = self.extension_install_flight_frame() else {
+            return;
+        };
+        let top_left = POINT {
+            x: center.x - size / 2,
+            y: center.y - size / 2,
+        };
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.extension_install_popup_hwnd,
+                Some(HWND_TOP),
+                top_left.x,
+                top_left.y,
+                size,
+                size,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+            let region = CreateRoundRectRgn(0, 0, size + 1, size + 1, size, size);
+            let _ = SetWindowRgn(self.extension_install_popup_hwnd, Some(region), true);
+            let _ = InvalidateRect(Some(self.extension_install_popup_hwnd), None, false);
+        }
     }
 
     fn tick_download_panel_animation(&mut self) {
@@ -9109,7 +9179,6 @@ impl App {
             if sidebar_width <= 92 {
                 self.paint_download_toast(hdc, rect);
             }
-            self.paint_extension_install_flight(hdc);
 
             if self.show_default_bubble {
                 let width_f = sidebar_width as f32;
@@ -9122,79 +9191,6 @@ impl App {
             if self.settings_open {
                 self.paint_settings_menu(hdc);
             }
-        }
-    }
-
-    fn paint_extension_install_flight(&self, hdc: HDC) {
-        let Some(flight) = &self.extension_install_flight else {
-            return;
-        };
-        let elapsed = flight.start_time.elapsed().as_millis() as f32;
-        let t = (elapsed / 720.0).clamp(0.0, 1.0);
-        let ease = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
-        let fade = if t > 0.72 {
-            ((1.0 - t) / 0.28).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        if fade <= 0.02 {
-            return;
-        }
-        let x = flight.from.x as f32 + (flight.to.x - flight.from.x) as f32 * ease;
-        let y = flight.from.y as f32 + (flight.to.y - flight.from.y) as f32 * ease;
-        let size = (28.0 - 6.0 * t).round() as i32;
-        let rect = RECT {
-            left: x.round() as i32 - size / 2,
-            top: y.round() as i32 - size / 2,
-            right: x.round() as i32 + size / 2,
-            bottom: y.round() as i32 + size / 2,
-        };
-        unsafe {
-            let mem_dc = CreateCompatibleDC(Some(hdc));
-            if mem_dc.is_invalid() {
-                return;
-            }
-            let bitmap = CreateCompatibleBitmap(hdc, size.max(1), size.max(1));
-            if bitmap.is_invalid() {
-                let _ = DeleteDC(mem_dc);
-                return;
-            }
-            let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
-            fill_round_rect(
-                mem_dc,
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: size,
-                    bottom: size,
-                },
-                mix_color(self.accent_color, COLOR_PANEL_2, 0.38),
-                size / 2,
-            );
-            draw_icon_glyph(
-                mem_dc,
-                &self.fonts.toolbar_icon,
-                IconKind::Extensions.glyph(),
-                RECT {
-                    left: 3,
-                    top: 3,
-                    right: size - 3,
-                    bottom: size - 3,
-                },
-                COLOR_TEXT,
-            );
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: (fade * 255.0).round().clamp(0.0, 255.0) as u8,
-                AlphaFormat: 0,
-            };
-            let _ = AlphaBlend(
-                hdc, rect.left, rect.top, size, size, mem_dc, 0, 0, size, size, blend,
-            );
-            let _ = SelectObject(mem_dc, old);
-            let _ = DeleteObject(HGDIOBJ(bitmap.0));
-            let _ = DeleteDC(mem_dc);
         }
     }
 
@@ -13760,6 +13756,32 @@ fn create_download_popup(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+fn create_extension_install_popup(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_EXTENSION_INSTALL_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            extension_install_popup_proc as *const () as isize,
+        ));
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_HIDE);
+        Ok(hwnd)
+    }
+}
+
 fn create_bookmark_popup(parent: HWND) -> AppResult<HWND> {
     unsafe {
         let hwnd = WindowsAndMessaging::CreateWindowExW(
@@ -14410,6 +14432,52 @@ unsafe extern "system" fn download_popup_proc(
     }
 }
 
+unsafe extern "system" fn extension_install_popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some((_center, _size, fade)) = app.extension_install_flight_frame() {
+                        let rect = client_rect(hwnd);
+                        let color =
+                            mix_color(app.accent_color, COLOR_PANEL_2, 0.32 + 0.38 * (1.0 - fade));
+                        fill_round_rect(hdc, rect, color, (rect.right - rect.left) / 2);
+                        draw_icon_glyph(
+                            hdc,
+                            &app.fonts.toolbar_icon,
+                            IconKind::Extensions.glyph(),
+                            RECT {
+                                left: rect.left + 4,
+                                top: rect.top + 4,
+                                right: rect.right - 4,
+                                bottom: rect.bottom - 4,
+                            },
+                            if fade > 0.35 { COLOR_TEXT } else { COLOR_MUTED },
+                        );
+                    }
+                });
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => WindowsAndMessaging::CallWindowProcW(
+            OLD_EXTENSION_INSTALL_POPUP_PROC,
+            hwnd,
+            msg,
+            w_param,
+            l_param,
+        ),
+    }
+}
+
 unsafe extern "system" fn bookmark_popup_proc(
     hwnd: HWND,
     msg: u32,
@@ -14867,6 +14935,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         let _ = InvalidateRect(Some(app.hwnd), None, false);
                         if app.download_popup_hwnd != HWND(std::ptr::null_mut()) {
                             let _ = InvalidateRect(Some(app.download_popup_hwnd), None, false);
+                        }
+                        if app.extension_install_popup_hwnd != HWND(std::ptr::null_mut()) {
+                            let _ =
+                                InvalidateRect(Some(app.extension_install_popup_hwnd), None, false);
                         }
                         if app.bookmark_popup_hwnd != HWND(std::ptr::null_mut()) {
                             let _ = InvalidateRect(Some(app.bookmark_popup_hwnd), None, false);
