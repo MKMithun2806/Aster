@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, mem,
     path::{Path, PathBuf},
     process::Command,
@@ -50,6 +50,7 @@ use windows::{
         Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
         System::{Com::Urlmon::URLDownloadToCacheFileW, Com::*, LibraryLoader},
         UI::{
+            Shell::SetCurrentProcessExplicitAppUserModelID,
             Controls::{EM_SETMARGINS, EM_SETSEL, MARGINS},
             HiDpi,
             Input::KeyboardAndMouse::{
@@ -57,16 +58,18 @@ use windows::{
                 VK_F5, VK_MENU, VK_RETURN, VK_SHIFT,
             },
             WindowsAndMessaging::{
-                self, CreateIconIndirect, GetCursorPos, GetTopWindow, GetWindow, CREATESTRUCTW,
-                CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN, GWLP_USERDATA, GWLP_WNDPROC,
-                GWL_STYLE, GW_HWNDNEXT, HICON, HMENU, HWND_TOP, ICONINFO, ICON_BIG, ICON_SMALL,
-                IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_APP,
-                WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
-                WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
-                WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETICON, WM_SIZE,
-                WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
-                WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+                self, CreateIconIndirect, GetCursorPos, GetTopWindow, GetWindow,
+                CREATESTRUCTW, CW_USEDEFAULT, EC_LEFTMARGIN, EC_RIGHTMARGIN,
+                GWLP_USERDATA, GWLP_WNDPROC, GWL_STYLE, GW_HWNDNEXT, HICON, HMENU, HWND_TOP,
+                ICONINFO, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_SIZEWE, MSG,
+                WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX,
+                WINDOW_STYLE, WM_ACTIVATE,
+                WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+                WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+                WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT,
+                WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPSIBLINGS,
+                WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
             },
         },
     },
@@ -74,6 +77,7 @@ use windows::{
 
 const APP_NAME: PCWSTR = w!("Aster");
 const CLASS_NAME: PCWSTR = w!("AsterWindow");
+const APP_USER_MODEL_ID: PCWSTR = w!("Aster.Browser");
 const ADDRESS_ID: i32 = 1001;
 const COMMAND_POPUP_ID: i32 = 1002;
 const DOWNLOAD_POPUP_ID: i32 = 1003;
@@ -85,6 +89,7 @@ const TOPBAR_EXPANDED: f32 = 58.0;
 const TOPBAR_HIDDEN: f32 = 0.0;
 const HOVER_ZONE: i32 = 4;
 const TOPBAR_HEIGHT: i32 = 58;
+const EXTENSION_SIDE_PANEL_WIDTH: i32 = 360;
 const SIDEBAR_TIMER_ID: usize = 42;
 const HOVER_LEAVE_TIMER_ID: usize = 43;
 const HOVER_DETECT_TIMER_ID: usize = 44;
@@ -92,12 +97,337 @@ const BACKGROUND_TIMER_ID: usize = 45;
 const LOADING_TIMER_ID: usize = 46;
 const TOPBAR_TIMER_ID: usize = 47;
 const DOWNLOAD_TIMER_ID: usize = 48;
+const OVERLAY_MENU_ANIM_TIMER_ID: usize = 49;
 const SPLIT_MAX_PANES: usize = 4;
 const SPLIT_GAP: i32 = 6;
 const STATE_FILE: &str = ".aster-state";
 const FOCUS_EDIT_MSG: u32 = WM_APP + 1;
 const FAVICON_FETCHED_MSG: u32 = WM_APP + 2;
+const EXTENSION_PACKAGE_READY_MSG: u32 = WM_APP + 3;
+const WEBVIEW_MESSAGE_MSG: u32 = WM_APP + 4;
+const NEW_WINDOW_REQUESTED_MSG: u32 = WM_APP + 5;
+const WEBVIEW_PROCESS_FAILED_MSG: u32 = WM_APP + 6;
+const EXTENSION_FOLDER_PICKED_MSG: u32 = WM_APP + 7;
 const WM_COPYDATA: u32 = 0x004A;
+const CHROME_COMPAT_VERSION: &str = "148.0.7778.216";
+const ASTER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.216 Safari/537.36";
+const EXTENSION_STORE_ASSIST_SCRIPT: &str = r##"
+(() => {
+  if (window.__asterExtensionStoreAssistInstalled) return;
+  window.__asterExtensionStoreAssistInstalled = true;
+
+  const accent = "__ASTER_ACCENT__";
+  const chromeVersion = "__CHROME_VERSION__";
+  const chromeMajor = chromeVersion.split(".")[0];
+  const installedIds = new Set(__ASTER_INSTALLED_EXTENSION_IDS__.map((id) => String(id).toLowerCase()));
+  const post = (message) => window.chrome?.webview?.postMessage(message);
+  try {
+    Object.defineProperty(Navigator.prototype, "vendor", { get: () => "Google Inc.", configurable: true });
+    Object.defineProperty(Navigator.prototype, "userAgent", { get: () => "__ASTER_USER_AGENT__", configurable: true });
+    Object.defineProperty(Navigator.prototype, "userAgentData", {
+      get: () => ({
+        brands: [
+          { brand: "Chromium", version: chromeMajor },
+          { brand: "Google Chrome", version: chromeMajor },
+          { brand: "Not A(Brand", version: "24" }
+        ],
+        mobile: false,
+        platform: "Windows",
+        getHighEntropyValues: async () => ({
+          architecture: "x86",
+          bitness: "64",
+          brands: [
+            { brand: "Chromium", version: chromeMajor },
+            { brand: "Google Chrome", version: chromeMajor },
+            { brand: "Not A(Brand", version: "24" }
+          ],
+          fullVersionList: [
+            { brand: "Chromium", version: chromeVersion },
+            { brand: "Google Chrome", version: chromeVersion },
+            { brand: "Not A(Brand", version: "24.0.0.0" }
+          ],
+          mobile: false,
+          model: "",
+          platform: "Windows",
+          platformVersion: "15.0.0",
+          uaFullVersion: chromeVersion,
+          wow64: false
+        })
+      }),
+      configurable: true
+    });
+  } catch {}
+
+  const isStore = () => /(^|\.)chromewebstore\.google\.com$/i.test(location.hostname)
+    || /^chrome\.google\.com$/i.test(location.hostname);
+  const extensionId = () => {
+    const text = `${location.pathname}/${location.search}/${location.hash}`.toLowerCase();
+    const match = text.match(/[a-p]{32}/);
+    return match ? match[0] : "";
+  };
+  const status = (message) => {
+    const label = document.getElementById("__asterExtensionStatus");
+    if (label) label.textContent = message || "";
+  };
+  window.asterExtensionStoreStatus = status;
+  window.asterSetInstalledExtensions = (ids) => {
+    installedIds.clear();
+    (Array.isArray(ids) ? ids : []).forEach((id) => installedIds.add(String(id).toLowerCase()));
+    render();
+  };
+  window.asterMarkExtensionInstalled = (id) => {
+    if (id) installedIds.add(String(id).toLowerCase());
+    status("Installed in Aster");
+    render();
+  };
+
+  let queued = false;
+  let lastInstallAt = 0;
+  const schedule = () => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      render();
+    });
+  };
+  const install = () => {
+    const now = Date.now();
+    if (now - lastInstallAt < 800) return;
+    lastInstallAt = now;
+    const id = extensionId();
+    if (!id) {
+      status("Open an extension detail page first.");
+      return;
+    }
+    if (installedIds.has(id)) {
+      status("Installed in Aster");
+      render();
+      return;
+    }
+    status("Sending install request to Aster...");
+    post("extensions:install-store:" + encodeURIComponent(id));
+  };
+  const firstCallback = (args) => Array.from(args).find((item) => typeof item === "function");
+  const labelForNode = (node) => {
+    if (!node) return "";
+    const text = node.textContent || "";
+    const aria = node.getAttribute ? (node.getAttribute("aria-label") || node.getAttribute("title") || "") : "";
+    return `${text} ${aria}`.toLowerCase();
+  };
+  const eventIntentLabel = (event) => {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+    return path.slice(0, 8).map(labelForNode).join(" ");
+  };
+  const nonInstallPattern = /\b(installed in aster|download chrome|install chrome|switch to chrome|no thanks|share|search|reviews?|overview|privacy|support|related|website|report abuse|menu|close|back)\b/i;
+  const isInstallIntent = (label) => /\b(add to chrome|install in aster|get extension)\b/i.test(label)
+    && !nonInstallPattern.test(label);
+  const installControlFromPath = (path) => {
+    const buttonLike = Array.from(path || []).find((node) =>
+      node?.matches?.("button, a, [role='button'], [jsaction], [data-test-id], [aria-label]")
+    );
+    if (!buttonLike) return false;
+    if (buttonLike.id === "__asterExtensionInstall" || buttonLike.closest?.("#__asterExtensionInstall")) {
+      return false;
+    }
+    const label = labelForNode(buttonLike);
+    if (isInstallIntent(label)) return true;
+    if (nonInstallPattern.test(label)) return false;
+    const id = extensionId();
+    if (!id) return false;
+    const attrs = [
+      buttonLike.getAttribute?.("aria-label"),
+      buttonLike.getAttribute?.("title"),
+      buttonLike.getAttribute?.("data-test-id"),
+      buttonLike.getAttribute?.("jsaction"),
+      buttonLike.id,
+      buttonLike.className
+    ].filter(Boolean).join(" ").toLowerCase();
+    return /\b(add|install|get|webstore|extension)\b/.test(attrs) && !/\b(search|share|menu|close|back|review|support)\b/.test(attrs);
+  };
+  const applyInstallState = (el, installed) => {
+    if (installed) {
+      if ("disabled" in el) el.disabled = true;
+      el.setAttribute("aria-disabled", "true");
+      el.style.pointerEvents = "auto";
+      el.style.cursor = "default";
+      if (el.textContent) el.textContent = "Installed in Aster";
+      return;
+    }
+    if ("disabled" in el) el.disabled = false;
+    el.removeAttribute("disabled");
+    el.setAttribute("aria-disabled", "false");
+    el.style.pointerEvents = "auto";
+    el.style.cursor = "pointer";
+    if (el.textContent) el.textContent = "Install in Aster";
+  };
+  const patchChromePrompts = (installed) => {
+    document.querySelectorAll("div, section, aside").forEach((el) => {
+      const text = (el.textContent || "").trim().toLowerCase();
+      if (text === "download chrome to install extensions and themes") {
+        el.textContent = installed ? "Installed and managed in Aster." : "Install this extension with Aster.";
+      } else if (text.length < 420 && text.includes("switch to chrome?") && text.includes("google recommends using chrome")) {
+        el.style.display = "none";
+      }
+    });
+  };
+  const patchChromeInstallApi = () => {
+    try {
+      const originalChrome = window.chrome || {};
+      const chromeObject = originalChrome;
+      chromeObject.runtime = chromeObject.runtime || {};
+      chromeObject.webstore = chromeObject.webstore || {};
+      chromeObject.webstore.install = (_url, success, failure) => {
+        try {
+          install();
+          if (typeof success === "function") setTimeout(success, 0);
+        } catch (error) {
+          if (typeof failure === "function") setTimeout(() => failure(String(error)), 0);
+        }
+      };
+      chromeObject.webstorePrivate = chromeObject.webstorePrivate || {};
+      chromeObject.webstorePrivate.beginInstallWithManifest3 = (...args) => {
+        install();
+        const callback = firstCallback(args);
+        if (callback) setTimeout(() => callback({ result: "success" }), 0);
+      };
+      chromeObject.webstorePrivate.completeInstall = (...args) => {
+        install();
+        const callback = firstCallback(args);
+        if (callback) setTimeout(callback, 0);
+      };
+      chromeObject.webstorePrivate.getExtensionStatus = (...args) => {
+        const callback = firstCallback(args);
+        if (callback) setTimeout(() => callback("can_request"), 0);
+      };
+      if (!window.chrome) {
+        Object.defineProperty(window, "chrome", { value: chromeObject, configurable: true });
+      }
+      if (!window.chrome?.webstore?.install) {
+        Object.defineProperty(window, "chrome", {
+          value: {
+            ...originalChrome,
+            runtime: chromeObject.runtime,
+            webstore: chromeObject.webstore,
+            webstorePrivate: chromeObject.webstorePrivate,
+            webview: originalChrome.webview
+          },
+          configurable: true
+        });
+      }
+    } catch {}
+  };
+  const patchStoreControls = () => {
+    if (!isStore() || !extensionId()) return;
+    const installed = installedIds.has(extensionId());
+    document.querySelectorAll("button, a, div[role='button']").forEach((el) => {
+      const label = labelForNode(el);
+      if (!isInstallIntent(label) && !installControlFromPath([el])) return;
+      if (!el.dataset.asterInstallPatched) {
+        el.dataset.asterInstallPatched = "1";
+        el.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+          install();
+        }, true);
+      }
+      applyInstallState(el, installed);
+    });
+    patchChromePrompts(installed);
+  };
+  const render = () => {
+    patchChromeInstallApi();
+    let panel = document.getElementById("__asterExtensionInstall");
+    if (!isStore() || !extensionId()) {
+      if (panel) panel.remove();
+      return;
+    }
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "__asterExtensionInstall";
+      panel.innerHTML = `<button type="button">Install in Aster</button><span id="__asterExtensionStatus"></span>`;
+      const style = document.createElement("style");
+      style.textContent = `
+        #__asterExtensionInstall {
+          position: fixed; right: 22px; bottom: 22px; z-index: 2147483647;
+          display: flex; align-items: center; gap: 10px; max-width: min(460px, calc(100vw - 44px));
+          padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,.18);
+          background: rgba(14,14,14,.94); color: #f7f7f7;
+          box-shadow: 0 14px 44px rgba(0,0,0,.34);
+          font: 13px/1.3 "Segoe UI", system-ui, sans-serif;
+        }
+        #__asterExtensionInstall button {
+          border: 0; border-radius: 7px; padding: 8px 12px; cursor: pointer;
+          background: ${accent}; color: #fff; font: inherit; font-weight: 650; white-space: nowrap;
+        }
+        #__asterExtensionStatus { color: rgba(255,255,255,.72); overflow-wrap: anywhere; }
+      `;
+      document.documentElement.appendChild(style);
+      panel.querySelector("button").addEventListener("click", install);
+      document.documentElement.appendChild(panel);
+    }
+    const installed = installedIds.has(extensionId());
+    const btn = panel.querySelector("button");
+    if (btn) applyInstallState(btn, installed);
+    if (installed) status("Installed in Aster");
+    patchStoreControls();
+  };
+  const handleInstallEvent = (event) => {
+    if (!isStore() || !extensionId()) return;
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+    if (installControlFromPath(path) && path.length && path[0]?.id !== "__asterExtensionInstall") {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      if (installedIds.has(extensionId())) {
+        status("Installed in Aster");
+        render();
+        return;
+      }
+      install();
+    }
+  };
+  const isRemoveIntent = (label) => /\b(remove from chrome|remove|uninstall)\b/i.test(label)
+    && !/\b(add|install|get|share|search|reviews?|overview|privacy|support|related|website|report abuse|menu|close|back)\b/i.test(label);
+  const handleRemoveEvent = (event) => {
+    if (!isStore() || !extensionId()) return;
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+    const buttonLike = Array.from(path || []).find((node) =>
+      node?.matches?.("button, a, [role='button'], [jsaction], [data-test-id], [aria-label]")
+    );
+    if (!buttonLike) return;
+    const label = labelForNode(buttonLike);
+    if (!isRemoveIntent(label)) return;
+    if (!installedIds.has(extensionId())) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    post("extensions:uninstall-request:" + encodeURIComponent(extensionId()));
+  };
+  ["pointerdown", "mousedown", "click"].forEach((type) => {
+    document.addEventListener(type, handleInstallEvent, true);
+    document.addEventListener(type, handleRemoveEvent, true);
+  });
+  new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
+  window.addEventListener("popstate", schedule);
+  window.addEventListener("hashchange", schedule);
+  try {
+    const origChrome = window.chrome || {};
+    if (origChrome.webstorePrivate) {
+      origChrome.webstorePrivate.uninstallSelf = (...args) => {
+        const id = extensionId();
+        if (id) post("extensions:uninstall-request:" + encodeURIComponent(id));
+        const callback = firstCallback(args);
+        if (callback) setTimeout(callback, 0);
+      };
+    }
+  } catch {}
+  patchChromeInstallApi();
+  render();
+  schedule();
+})();
+"##;
 
 #[allow(non_snake_case)]
 #[repr(C)]
@@ -146,6 +476,8 @@ const MENU_TAB_SPLIT_GRID: usize = 4005;
 const MENU_EXTENSION_MANAGE: usize = 4100;
 const MENU_EXTENSION_STORE: usize = 4101;
 const MENU_EXTENSION_REFRESH: usize = 4102;
+const MENU_EXTENSION_PIN: usize = 4103;
+const MENU_EXTENSION_UNPIN: usize = 4104;
 const MENU_EXTENSION_ITEM_BASE: usize = 4110;
 const MENU_WIDTH: i32 = 270;
 const MENU_ROW_HEIGHT: i32 = 34;
@@ -158,7 +490,11 @@ static mut OLD_COMMAND_POPUP_PROC: WNDPROC = None;
 static mut OLD_RENAME_EDIT_PROC: WNDPROC = None;
 static mut OLD_OVERLAY_MENU_PROC: WNDPROC = None;
 static mut OLD_DOWNLOAD_POPUP_PROC: WNDPROC = None;
+static mut OLD_EXTENSION_INSTALL_POPUP_PROC: WNDPROC = None;
+static mut OLD_EXTENSION_SIDE_PANEL_PROC: WNDPROC = None;
 static mut OLD_BOOKMARK_POPUP_PROC: WNDPROC = None;
+static mut OLD_EXTENSION_POPUP_PROC: WNDPROC = None;
+static mut OLD_DIALOG_POPUP_PROC: WNDPROC = None;
 static mut OLD_DRAG_GHOST_PROC: WNDPROC = None;
 static mut CURRENT_DRAG_GHOST_BITMAP: Option<HBITMAP> = None;
 
@@ -393,6 +729,17 @@ struct FaviconBitmap {
 struct FaviconFetchResult {
     host: String,
     path: String,
+}
+
+struct ExtensionCrxResult {
+    extension_id: String,
+    install_path: String,
+    error: Option<String>,
+}
+
+struct WebViewProcessFailure {
+    tab_id: usize,
+    kind: i32,
 }
 
 impl Drop for FaviconBitmap {
@@ -683,6 +1030,28 @@ struct BrowserExtensionInfo {
     id: String,
     name: String,
     enabled: bool,
+    version: String,
+    description: String,
+    has_action: bool,
+    popup_path: String,
+    side_panel_path: String,
+    options_path: String,
+    permissions: Vec<String>,
+    install_path: String,
+    icon_path: String,
+}
+
+#[derive(Clone, Default)]
+struct ExtensionManifestDetails {
+    name: String,
+    version: String,
+    description: String,
+    has_action: bool,
+    popup_path: String,
+    side_panel_path: String,
+    options_path: String,
+    permissions: Vec<String>,
+    icon_path: String,
 }
 
 fn default_visit_count() -> u32 {
@@ -719,11 +1088,22 @@ fn calculate_frecency(visit_count: u32, last_visit_time: u64, current_time: u64)
     visit_count * recency_weight
 }
 
+fn overlay_menu_pin_rect(row: RECT) -> RECT {
+    RECT {
+        left: row.right - 32,
+        top: row.top + 5,
+        right: row.right - 6,
+        bottom: row.bottom - 5,
+    }
+}
+
 #[derive(Clone)]
 struct OverlayMenu {
     rect: RECT,
     target: MenuTarget,
     items: Vec<OverlayMenuItem>,
+    opened_at: std::time::Instant,
+    closing_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -731,6 +1111,8 @@ struct OverlayMenuItem {
     id: usize,
     label: String,
     sublabel: String,
+    icon_key: String,
+    icon_path: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -742,6 +1124,21 @@ enum MenuTarget {
     AddressMenu,
     Bookmarks,
     Extensions,
+    ExtensionContext(usize),
+}
+
+impl MenuTarget {
+    fn keeps_topbar_expanded(self) -> bool {
+        matches!(
+            self,
+            MenuTarget::BackHistory(_)
+                | MenuTarget::ForwardHistory(_)
+                | MenuTarget::AddressMenu
+                | MenuTarget::Bookmarks
+                | MenuTarget::Extensions
+                | MenuTarget::ExtensionContext(_)
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -797,8 +1194,6 @@ enum HoverTarget {
     Reload,
     Settings,
     HistoryPage,
-    ExtensionStore,
-    ExtensionsPage,
     SettingsPage,
     ModeRow,
     ModeAuto,
@@ -809,7 +1204,10 @@ enum HoverTarget {
     DownloadCancel(usize),
     DownloadPause(usize),
     DownloadOpen(usize),
+    ExtensionButton(usize),
     ExtensionsButton,
+    OverlayMenuRow(usize),
+    OverlayMenuPin(usize),
     FindPrev,
     FindNext,
     FindClose,
@@ -858,10 +1256,32 @@ struct DownloadSnapshot {
     state: COREWEBVIEW2_DOWNLOAD_STATE,
 }
 
+struct ActivePermissionRequest {
+    args: ICoreWebView2PermissionRequestedEventArgs,
+    deferral: ICoreWebView2Deferral,
+    kind: COREWEBVIEW2_PERMISSION_KIND,
+    uri: String,
+}
+
+struct ActiveScriptDialog {
+    args: ICoreWebView2ScriptDialogOpeningEventArgs,
+    deferral: ICoreWebView2Deferral,
+    dialog_type: COREWEBVIEW2_SCRIPT_DIALOG_KIND,
+    message: String,
+    default_text: String,
+    uri: String,
+}
+
 struct DownloadToastState {
     start_time: std::time::Instant,
     fading: bool,
     slide_x: f32,
+}
+
+struct ExtensionInstallFlightState {
+    start_time: std::time::Instant,
+    from: POINT,
+    to: POINT,
 }
 
 struct BookmarkToastState {
@@ -1003,6 +1423,11 @@ struct App {
     pending_favicon_hosts: Vec<String>,
     extensions: Vec<BrowserExtensionInfo>,
     extension_notice: Option<String>,
+    extension_install_paths: HashMap<String, String>,
+    extension_badges: HashMap<String, (String, u32)>,
+    pinned_extensions: HashSet<String>,
+    pending_extension_installs: HashSet<String>,
+    extension_icon_cache: RefCell<HashMap<String, FaviconBitmap>>,
     active_workspace: usize,
     active: usize,
     next_id: usize,
@@ -1066,6 +1491,7 @@ struct App {
     drag_ghost_hwnd: Cell<Option<HWND>>,
     saved_style: isize,
     saved_rect: RECT,
+    saved_placement: Option<WINDOWPLACEMENT>,
     command_selected_index: Option<usize>,
     command_scroll_offset: usize,
     find_open: bool,
@@ -1079,10 +1505,27 @@ struct App {
     downloads: Vec<DownloadItem>,
     next_download_id: usize,
     download_toast: Option<DownloadToastState>,
+    extension_install_flight: Option<ExtensionInstallFlightState>,
     download_panel: Option<DownloadPanelMode>,
     download_panel_reveal: f32,
     download_panel_reveal_target: f32,
     download_popup_hwnd: HWND,
+    extension_install_popup_hwnd: HWND,
+    extension_popup_hwnd: HWND,
+    extension_popup_controller: Option<ICoreWebView2Controller>,
+    extension_popup_anchor: Option<RECT>,
+    extension_popup_extension_id: Option<String>,
+    dialog_popup_hwnd: HWND,
+    dialog_popup_controller: Option<ICoreWebView2Controller>,
+    dialog_active_permission: Option<ActivePermissionRequest>,
+    dialog_active_script_dialog: Option<ActiveScriptDialog>,
+    dialog_active_extension: Option<ExtensionCrxResult>,
+    dialog_active_extension_remove: Option<String>,
+    extension_side_panel_hwnd: HWND,
+    extension_side_panel_controller: Option<ICoreWebView2Controller>,
+    extension_side_panel_extension_id: Option<String>,
+    extension_side_panel_width_override: Option<i32>,
+    extension_side_panel_resizing: bool,
     bookmark_toast: Option<BookmarkToastState>,
     download_removal_anim: Option<DownloadRemovalAnim>,
     download_collapse_anim: Option<DownloadCollapseAnim>,
@@ -1142,6 +1585,7 @@ impl App {
         let command_hwnd = create_command_popup(hwnd)?;
         let overlay_menu_hwnd = create_overlay_menu(hwnd)?;
         let download_popup_hwnd = create_download_popup(hwnd)?;
+        let extension_install_popup_hwnd = create_extension_install_popup(hwnd)?;
         let bookmark_popup_hwnd = create_bookmark_popup(hwnd)?;
         unsafe {
             let _ = WindowsAndMessaging::SendMessageW(
@@ -1178,6 +1622,11 @@ impl App {
             pending_favicon_hosts: Vec::new(),
             extensions: Vec::new(),
             extension_notice: None,
+            extension_install_paths: HashMap::new(),
+            extension_badges: HashMap::new(),
+            pinned_extensions: HashSet::new(),
+            pending_extension_installs: HashSet::new(),
+            extension_icon_cache: RefCell::new(HashMap::new()),
             active_workspace: 1,
             active: 0,
             next_id: 1,
@@ -1247,6 +1696,7 @@ impl App {
             drag_ghost_hwnd: Cell::new(None),
             saved_style: 0,
             saved_rect: RECT::default(),
+            saved_placement: None,
             command_selected_index: None,
             command_scroll_offset: 0,
             find_open: false,
@@ -1259,10 +1709,27 @@ impl App {
             downloads: Vec::new(),
             next_download_id: 1,
             download_toast: None,
+            extension_install_flight: None,
             download_panel: None,
             download_panel_reveal: 0.0,
             download_panel_reveal_target: 0.0,
             download_popup_hwnd,
+            extension_install_popup_hwnd,
+            extension_popup_hwnd: HWND(std::ptr::null_mut()),
+            extension_popup_controller: None,
+            extension_popup_anchor: None,
+            extension_popup_extension_id: None,
+            dialog_popup_hwnd: HWND(std::ptr::null_mut()),
+            dialog_popup_controller: None,
+            dialog_active_permission: None,
+            dialog_active_script_dialog: None,
+            dialog_active_extension: None,
+            dialog_active_extension_remove: None,
+            extension_side_panel_hwnd: HWND(std::ptr::null_mut()),
+            extension_side_panel_controller: None,
+            extension_side_panel_extension_id: None,
+            extension_side_panel_width_override: None,
+            extension_side_panel_resizing: false,
             bookmark_toast: None,
             download_removal_anim: None,
             download_collapse_anim: None,
@@ -1306,6 +1773,11 @@ impl App {
         }
 
         app.ensure_default_bookmark_folder();
+        if let Some(placement) = app.saved_placement {
+            unsafe {
+                let _ = WindowsAndMessaging::SetWindowPlacement(app.hwnd, &placement);
+            }
+        }
         unsafe {
             let _ = WindowsAndMessaging::SetTimer(Some(app.hwnd), HOVER_DETECT_TIMER_ID, 100, None);
         }
@@ -1723,15 +2195,367 @@ impl App {
             menu_item(MENU_EXTENSION_STORE, "Chrome Web Store"),
             menu_item(MENU_EXTENSION_REFRESH, "Refresh Extensions"),
         ];
-        for (offset, extension) in self.extensions.iter().take(12).enumerate() {
-            let state = if extension.enabled { "Enabled" } else { "Disabled" };
-            items.push(menu_item_with_subtitle(
-                MENU_EXTENSION_ITEM_BASE + offset,
-                &extension.name,
-                state,
-            ));
+        for (offset, extension) in self.extensions.iter().enumerate() {
+            let access = if extension.enabled { "" } else { "Disabled" };
+            let mut item =
+                menu_item_with_subtitle(MENU_EXTENSION_ITEM_BASE + offset, &extension.name, access);
+            item.icon_key = extension.id.clone();
+            item.icon_path = extension.icon_path.clone();
+            items.push(item);
         }
-        self.open_overlay_menu(rect.right - MENU_WIDTH, rect.bottom + 8, MenuTarget::Extensions, items);
+        self.open_overlay_menu(
+            rect.right - MENU_WIDTH,
+            rect.bottom + 8,
+            MenuTarget::Extensions,
+            items,
+        );
+    }
+
+    fn open_extension_context_menu(&mut self, extension_index: usize, x: i32, y: i32) {
+        let Some(extension) = self.extensions.get(extension_index) else {
+            return;
+        };
+        let pinned = self.pinned_extensions.contains(&extension.id);
+        self.open_overlay_menu(
+            x,
+            y,
+            MenuTarget::ExtensionContext(extension_index),
+            vec![menu_item(
+                if pinned {
+                    MENU_EXTENSION_UNPIN
+                } else {
+                    MENU_EXTENSION_PIN
+                },
+                if pinned {
+                    "Unpin from Toolbar"
+                } else {
+                    "Pin to Toolbar"
+                },
+            )],
+        );
+    }
+
+    fn set_extension_pinned(&mut self, extension_index: usize, pinned: bool) {
+        let Some(extension) = self.extensions.get(extension_index) else {
+            return;
+        };
+        if pinned {
+            self.pinned_extensions.insert(extension.id.clone());
+        } else {
+            self.pinned_extensions.remove(&extension.id);
+        }
+        self.save_state();
+        self.refresh();
+    }
+
+    fn close_extension_popup(&mut self) {
+        if let Some(controller) = self.extension_popup_controller.take() {
+            unsafe {
+                let _ = controller.Close();
+            }
+        }
+        unsafe {
+            if self.extension_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::DestroyWindow(self.extension_popup_hwnd);
+                self.extension_popup_hwnd = HWND(std::ptr::null_mut());
+            }
+        }
+        self.extension_popup_anchor = None;
+        self.extension_popup_extension_id = None;
+    }
+
+    fn close_extension_side_panel(&mut self) {
+        if let Some(controller) = self.extension_side_panel_controller.take() {
+            unsafe {
+                let _ = controller.Close();
+            }
+        }
+        unsafe {
+            if self.extension_side_panel_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::DestroyWindow(self.extension_side_panel_hwnd);
+                self.extension_side_panel_hwnd = HWND(std::ptr::null_mut());
+            }
+        }
+        self.extension_side_panel_extension_id = None;
+        self.extension_side_panel_resizing = false;
+        self.layout();
+        self.refresh();
+    }
+
+    fn click_extension_action_button(&mut self, extension_index: usize) {
+        let anchor = self
+            .extension_action_button_rects()
+            .iter()
+            .find(|(idx, _)| *idx == extension_index)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| self.extension_button_rect());
+        self.open_extension_popup_by_index(extension_index, anchor);
+    }
+
+    fn open_extension_popup_by_id(&mut self, extension_id: &str) {
+        if let Some(index) = self
+            .extensions
+            .iter()
+            .position(|ext| ext.id == extension_id)
+        {
+            self.open_extension_popup_by_index(index, self.extension_button_rect());
+        } else {
+            self.extension_notice =
+                Some("Extension is not available yet. Try Refresh.".to_string());
+            self.reload_extensions_pages();
+        }
+    }
+
+    fn open_extension_popup_by_index(&mut self, extension_index: usize, anchor: RECT) {
+        self.close_extension_popup();
+        let Some(ext) = self.extensions.get(extension_index).cloned() else {
+            return;
+        };
+        if !ext.enabled {
+            self.extension_notice = Some("Enable the extension before opening it.".to_string());
+            self.reload_extensions_pages();
+            return;
+        }
+        if ext.popup_path.is_empty() && !ext.side_panel_path.is_empty() {
+            self.open_extension_side_panel(&ext);
+            return;
+        }
+        let open_path = if !ext.popup_path.is_empty() {
+            ext.popup_path.as_str()
+        } else {
+            ext.options_path.as_str()
+        };
+        if open_path.is_empty() {
+            self.extension_notice = Some(format!(
+                "{} does not provide a popup, side panel, or options page.",
+                ext.name
+            ));
+            self.reload_extensions_pages();
+            return;
+        }
+        let url = extension_page_url(&ext.id, open_path);
+        if let Ok(hwnd) =
+            create_extension_popup_window(self.hwnd, anchor, self.topbar_pushed_height())
+        {
+            if let Ok(controller) = create_webview_controller(&self.environment, hwnd) {
+                unsafe {
+                    let _ = controller.SetBounds(client_rect(hwnd));
+                    let _ = controller.SetIsVisible(true);
+                    if let Ok(wv) = controller.CoreWebView2() {
+                        let _ = configure_webview(&wv);
+                        self.attach_web_message_handler(&wv);
+                        self.install_extension_host_script(&wv, &ext);
+                        apply_site_mode_to_webview(&wv, self.site_mode);
+                        let wide = CoTaskMemPWSTR::from(url.as_str());
+                        let _ = wv.Navigate(*wide.as_ref().as_pcwstr());
+                    }
+                }
+                self.extension_popup_hwnd = hwnd;
+                self.extension_popup_controller = Some(controller);
+                self.extension_popup_anchor = Some(anchor);
+                self.extension_popup_extension_id = Some(ext.id.clone());
+                self.layout_extension_popup_chrome();
+            }
+        }
+        self.refresh();
+    }
+
+    fn open_extension_side_panel_by_id_with_path(
+        &mut self,
+        extension_id: &str,
+        path_override: Option<String>,
+    ) {
+        if let Some(mut ext) = self
+            .extensions
+            .iter()
+            .find(|ext| ext.id == extension_id)
+            .cloned()
+        {
+            if let Some(path) = path_override {
+                ext.side_panel_path = path;
+            }
+            self.open_extension_side_panel(&ext);
+        }
+    }
+
+    fn open_extension_side_panel(&mut self, ext: &BrowserExtensionInfo) {
+        if !ext.enabled {
+            self.extension_notice = Some("Enable the extension before opening it.".to_string());
+            self.reload_extensions_pages();
+            return;
+        }
+        let panel_path = ext
+            .side_panel_path
+            .trim()
+            .trim_start_matches('/')
+            .to_string();
+        if panel_path.is_empty() {
+            self.extension_notice = Some(format!("{} does not provide a side panel.", ext.name));
+            self.reload_extensions_pages();
+            return;
+        }
+        if self.extension_side_panel_extension_id.as_deref() == Some(ext.id.as_str()) {
+            self.close_extension_side_panel();
+            return;
+        }
+        self.close_extension_popup();
+        self.close_extension_side_panel();
+        let url = extension_page_url(&ext.id, &panel_path);
+        if let Ok(hwnd) = create_extension_side_panel_window(self.hwnd) {
+            if let Ok(controller) = create_webview_controller(&self.environment, hwnd) {
+                unsafe {
+                    let _ = controller.SetBounds(client_rect(hwnd));
+                    let _ = controller.SetIsVisible(true);
+                    if let Ok(wv) = controller.CoreWebView2() {
+                        let _ = configure_webview(&wv);
+                        self.attach_web_message_handler(&wv);
+                        self.install_extension_host_script(&wv, ext);
+                        apply_site_mode_to_webview(&wv, self.site_mode);
+                        let wide = CoTaskMemPWSTR::from(url.as_str());
+                        let _ = wv.Navigate(*wide.as_ref().as_pcwstr());
+                    }
+                }
+                self.extension_side_panel_hwnd = hwnd;
+                self.extension_side_panel_controller = Some(controller);
+                self.extension_side_panel_extension_id = Some(ext.id.clone());
+                self.layout();
+                self.refresh();
+            } else {
+                unsafe {
+                    let _ = WindowsAndMessaging::DestroyWindow(hwnd);
+                }
+            }
+        }
+    }
+
+    fn handle_webview_process_failure(&mut self, failure: WebViewProcessFailure) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == failure.tab_id) else {
+            return;
+        };
+        match COREWEBVIEW2_PROCESS_FAILED_KIND(failure.kind) {
+            COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => unsafe {
+                let _ = tab.webview.Reload();
+                tab.is_loading = true;
+            },
+            COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
+            | COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED => unsafe {
+                let _ = tab.webview.Reload();
+                tab.is_loading = true;
+            },
+            COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => {
+                tab.title = "WebView runtime restarted".to_string();
+                tab.is_loading = false;
+            }
+            _ => {}
+        }
+        self.refresh();
+    }
+
+    fn handle_extension_folder_picked(&mut self, folder: String) {
+        if folder.trim().is_empty() {
+            self.extension_notice = Some("No extension folder selected.".to_string());
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        }
+        self.extension_notice = Some("Path set. Click Load to install.".to_string());
+        self.reload_extensions_pages();
+        let js = format!(
+            "document.getElementById('extensionPath').value = {};",
+            js_string_literal(&folder)
+        );
+        for tab in self.tabs.iter().filter(|tab| tab.url == "aster:extensions") {
+            execute_webview_script(&tab.webview, &js);
+        }
+        self.refresh();
+    }
+
+    fn resize_extension_popup_to_content(&mut self, width: i32, height: i32) {
+        if self.extension_popup_hwnd == HWND(std::ptr::null_mut()) {
+            return;
+        }
+        let anchor = self
+            .extension_popup_anchor
+            .unwrap_or_else(|| self.extension_button_rect());
+        let pushed_top = self.topbar_pushed_height();
+        let size = extension_popup_size_for_content(self.hwnd, pushed_top, width, height);
+        let (x, y) = extension_popup_position(self.hwnd, anchor, pushed_top, size.0, size.1);
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.extension_popup_hwnd,
+                Some(HWND_TOP),
+                x,
+                y,
+                size.0,
+                size.1,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+            if let Some(controller) = &self.extension_popup_controller {
+                let _ = controller.SetBounds(client_rect(self.extension_popup_hwnd));
+            }
+            self.apply_extension_popup_chrome_clip(size.0, size.1);
+        }
+    }
+
+    fn layout_extension_popup_chrome(&self) {
+        if self.extension_popup_hwnd == HWND(std::ptr::null_mut()) {
+            return;
+        }
+        let mut popup_rect = RECT::default();
+        unsafe {
+            if WindowsAndMessaging::GetWindowRect(self.extension_popup_hwnd, &mut popup_rect)
+                .is_err()
+            {
+                return;
+            }
+        }
+        let width = (popup_rect.right - popup_rect.left).max(1);
+        let height = (popup_rect.bottom - popup_rect.top).max(1);
+        let anchor = self
+            .extension_popup_anchor
+            .unwrap_or_else(|| self.extension_button_rect());
+        let pushed_top = self.topbar_pushed_height();
+        let (x, y) = extension_popup_position(self.hwnd, anchor, pushed_top, width, height);
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.extension_popup_hwnd,
+                Some(HWND_TOP),
+                x,
+                y,
+                width,
+                height,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_NOSIZE,
+            );
+            self.apply_extension_popup_chrome_clip(width, height);
+        }
+    }
+
+    fn apply_extension_popup_chrome_clip(&self, popup_w: i32, popup_h: i32) {
+        if self.extension_popup_hwnd == HWND(std::ptr::null_mut()) {
+            return;
+        }
+        let mut parent_rect = RECT::default();
+        let mut popup_rect = RECT::default();
+        unsafe {
+            if WindowsAndMessaging::GetWindowRect(self.hwnd, &mut parent_rect).is_err()
+                || WindowsAndMessaging::GetWindowRect(self.extension_popup_hwnd, &mut popup_rect)
+                    .is_err()
+            {
+                return;
+            }
+        }
+        let topbar_bottom = parent_rect.top + self.topbar_height.ceil() as i32;
+        let sidebar_right = parent_rect.left + self.sidebar_width();
+        let clip_top = (topbar_bottom - popup_rect.top).clamp(0, popup_h.saturating_sub(1));
+        let clip_left = (sidebar_right - popup_rect.left).clamp(0, popup_w.saturating_sub(1));
+        unsafe {
+            if clip_top > 0 || clip_left > 0 {
+                let region = CreateRectRgn(clip_left, clip_top, popup_w, popup_h);
+                let _ = SetWindowRgn(self.extension_popup_hwnd, Some(region), true);
+            } else {
+                let _ = SetWindowRgn(self.extension_popup_hwnd, None, true);
+            }
+        }
     }
 
     fn clear_site_data_and_reload(&mut self) {
@@ -1764,6 +2588,424 @@ impl App {
         }
     }
 
+    fn ensure_dialog_popup(&mut self) -> AppResult<&ICoreWebView2Controller> {
+        if self.dialog_popup_hwnd == HWND(std::ptr::null_mut()) {
+            let hwnd = create_dialog_popup_window(self.hwnd)?;
+            let controller = create_webview_controller(&self.environment, hwnd)?;
+            unsafe {
+                let _ = controller.SetBounds(RECT { left: 0, top: 0, right: 360, bottom: 240 });
+                let _ = controller.SetIsVisible(true);
+                if let Ok(wv) = controller.CoreWebView2() {
+                    let _ = configure_webview(&wv);
+                    self.attach_web_message_handler(&wv);
+                    apply_site_mode_to_webview(&wv, self.site_mode);
+                }
+            }
+            self.dialog_popup_hwnd = hwnd;
+            self.dialog_popup_controller = Some(controller);
+        }
+        Ok(self.dialog_popup_controller.as_ref().unwrap())
+    }
+
+    fn layout_dialog_popup(&self) {
+        if self.dialog_popup_hwnd == HWND(std::ptr::null_mut()) {
+            return;
+        }
+        unsafe {
+            if WindowsAndMessaging::IsIconic(self.hwnd).as_bool()
+                || !WindowsAndMessaging::IsWindowVisible(self.hwnd).as_bool()
+            {
+                let _ = WindowsAndMessaging::ShowWindow(
+                    self.dialog_popup_hwnd,
+                    WindowsAndMessaging::SW_HIDE,
+                );
+                return;
+            }
+        }
+        let bounds = self.web_content_bounds();
+        let width = 360;
+        let height = 240;
+        let mut right = bounds.right - 12;
+        let mut top = bounds.top + 12;
+        if right < bounds.left + width + 12 {
+            right = bounds.left + width + 12;
+        }
+        if top + height + 12 > bounds.bottom {
+            top = bounds.bottom - height - 12;
+        }
+        let left = right - width;
+        let mut pt = POINT { x: left, y: top };
+        unsafe {
+            let _ = Gdi::ClientToScreen(self.hwnd, &mut pt);
+        }
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.dialog_popup_hwnd,
+                Some(HWND_TOP),
+                pt.x,
+                pt.y,
+                width,
+                height,
+                WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+            if let Some(controller) = &self.dialog_popup_controller {
+                let _ = controller.SetBounds(RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                });
+            }
+        }
+    }
+
+    fn close_dialog_popup(&mut self, approved: bool) {
+        if let Some(req) = self.dialog_active_permission.take() {
+            unsafe {
+                if approved {
+                    let _ = req.args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+                } else {
+                    let _ = req.args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY);
+                }
+                let _ = req.deferral.Complete();
+            }
+        }
+
+        if let Some(dialog) = self.dialog_active_script_dialog.take() {
+            unsafe {
+                if approved {
+                    let _ = dialog.args.Accept();
+                }
+                let _ = dialog.deferral.Complete();
+            }
+        }
+
+        if let Some(ext) = self.dialog_active_extension.take() {
+            if approved {
+                self.complete_extension_install_final(ext);
+            } else {
+                self.pending_extension_installs.remove(&ext.extension_id);
+                self.extension_notice = Some("Extension installation cancelled.".to_string());
+                self.send_store_status("Extension installation cancelled.");
+                self.reload_extensions_pages();
+            }
+        }
+
+        if let Some(ext_id) = self.dialog_active_extension_remove.take() {
+            if approved {
+                self.remove_extension_final(&ext_id);
+            }
+        }
+
+        if let Some(controller) = self.dialog_popup_controller.take() {
+            unsafe {
+                let _ = controller.Close();
+            }
+        }
+        unsafe {
+            if self.dialog_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::DestroyWindow(self.dialog_popup_hwnd);
+                self.dialog_popup_hwnd = HWND(std::ptr::null_mut());
+            }
+        }
+        self.refresh();
+    }
+
+    fn show_extension_install_dialog(&mut self, ext_id: &str) {
+        let path = self.dialog_active_extension.as_ref().map(|r| r.install_path.as_str()).unwrap_or("");
+        let (name, desc, perms, icon_base64) = get_manifest_info(path).unwrap_or_else(|| {
+            ("Extension".to_string(), "No description provided.".to_string(), Vec::new(), None)
+        });
+
+        let mut body_html = format!(r#"<div style="font-weight:600;margin-bottom:8px;font-size:12.5px;">Do you want to install "{}" to Aster?</div>"#, html_escape_text(&name));
+        if !desc.is_empty() {
+            body_html.push_str(&format!(r#"<div style="margin-bottom:12px;color:var(--muted);font-style:italic;">{}</div>"#, html_escape_text(&desc)));
+        }
+        let translated = translate_permissions(&perms);
+        if !translated.is_empty() {
+            body_html.push_str(r#"<div style="font-weight:600;font-size:11px;margin-bottom:4px;">It can:</div><div class="permissions-list">"#);
+            for p in translated {
+                body_html.push_str(&format!(r#"<div class="permission-item">
+                  <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:var(--accent);flex-shrink:0;"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+                  <span>{}</span>
+                </div>"#, html_escape_text(&p)));
+            }
+            body_html.push_str("</div>");
+        }
+
+        let buttons_html = r#"
+            <button class="btn btn-secondary" onclick="post('dialog:extension:cancel')">Cancel</button>
+            <button class="btn btn-primary" onclick="post('dialog:extension:accept')">Add Extension</button>
+        "#;
+
+        let icon_html = if let Some(ref b64) = icon_base64 {
+            format!(r#"<img src="{}" />"#, b64)
+        } else {
+            r#"<svg viewBox="0 0 24 24"><path d="M20.5 11H19V7c0-1.1-.9-2-2-2h-4V3.5a2.5 2.5 0 0 0-5 0V5H4c-1.1 0-1.99.9-1.99 2v3.8H3.5a2.5 2.5 0 0 1 0 5H2v3.8c0 1.1.9 2 2 2h3.8v-1.5a2.5 2.5 0 0 1 5 0v1.5H17c1.1 0 2-.9 2-2v-4h1.5a2.5 2.5 0 0 0 0-5z"/></svg>"#.to_string()
+        };
+
+        let html = dialog_popup_html(
+            &icon_html,
+            "Install Extension",
+            &format!("ID: {}", ext_id),
+            &body_html,
+            buttons_html,
+            &colorref_to_css(self.accent_color),
+            &colorref_to_css(self.dominant_color),
+            &colorref_to_css(self.secondary_color),
+        );
+
+        if let Ok(controller) = self.ensure_dialog_popup() {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let wide = CoTaskMemPWSTR::from(html.as_str());
+                unsafe {
+                    let _ = wv.NavigateToString(*wide.as_ref().as_pcwstr());
+                }
+                self.layout_dialog_popup();
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(self.dialog_popup_hwnd, WindowsAndMessaging::SW_SHOW);
+                    let _ = WindowsAndMessaging::SetWindowPos(self.dialog_popup_hwnd, Some(HWND_TOP), 0, 0, 0, 0, WindowsAndMessaging::SWP_NOMOVE | WindowsAndMessaging::SWP_NOSIZE);
+                }
+            }
+        }
+    }
+
+    fn show_extension_remove_dialog(&mut self, ext_id: &str) {
+        let extension_info = self.extensions.iter().find(|e| e.id == ext_id).cloned();
+        let (name, _desc, install_path) = if let Some(info) = extension_info {
+            (info.name, info.description, info.install_path)
+        } else {
+            ("Extension".to_string(), "Are you sure you want to remove this extension?".to_string(), String::new())
+        };
+
+        let (_, _, _, icon_base64) = if !install_path.is_empty() {
+            get_manifest_info(&install_path).unwrap_or_else(|| {
+                ("".to_string(), "".to_string(), Vec::new(), None)
+            })
+        } else {
+            ("".to_string(), "".to_string(), Vec::new(), None)
+        };
+
+        let mut body_html = format!(
+            r#"<div style="font-weight:600;margin-bottom:8px;font-size:12.5px;">Remove "{}"?</div>"#,
+            html_escape_text(&name)
+        );
+        body_html.push_str(r#"<div style="margin-bottom:12px;color:var(--muted);font-style:italic;">It will be removed from Aster. Any data associated with this extension will also be deleted.</div>"#);
+
+        let buttons_html = r#"
+            <button class="btn btn-secondary" onclick="post('dialog:extension-remove:cancel')">Cancel</button>
+            <button class="btn btn-danger" onclick="post('dialog:extension-remove:accept')">Remove</button>
+        "#;
+
+        let icon_html = if let Some(ref b64) = icon_base64 {
+            format!(r#"<img src="{}" />"#, b64)
+        } else {
+            r#"<svg viewBox="0 0 24 24"><path d="M20.5 11H19V7c0-1.1-.9-2-2-2h-4V3.5a2.5 2.5 0 0 0-5 0V5H4c-1.1 0-1.99.9-1.99 2v3.8H3.5a2.5 2.5 0 0 1 0 5H2v3.8c0 1.1.9 2 2 2h3.8v-1.5a2.5 2.5 0 0 1 5 0v1.5H17c1.1 0 2-.9 2-2v-4h1.5a2.5 2.5 0 0 0 0-5z"/></svg>"#.to_string()
+        };
+
+        let html = dialog_popup_html(
+            &icon_html,
+            "Remove Extension",
+            &format!("ID: {}", ext_id),
+            &body_html,
+            buttons_html,
+            &colorref_to_css(self.accent_color),
+            &colorref_to_css(self.dominant_color),
+            &colorref_to_css(self.secondary_color),
+        );
+
+        self.dialog_active_extension_remove = Some(ext_id.to_string());
+
+        if let Ok(controller) = self.ensure_dialog_popup() {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let wide = CoTaskMemPWSTR::from(html.as_str());
+                unsafe {
+                    let _ = wv.NavigateToString(*wide.as_ref().as_pcwstr());
+                }
+                self.layout_dialog_popup();
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(self.dialog_popup_hwnd, WindowsAndMessaging::SW_SHOW);
+                    let _ = WindowsAndMessaging::SetWindowPos(self.dialog_popup_hwnd, Some(HWND_TOP), 0, 0, 0, 0, WindowsAndMessaging::SWP_NOMOVE | WindowsAndMessaging::SWP_NOSIZE);
+                }
+            }
+        }
+    }
+
+    fn show_permission_dialog(&mut self, req: ActivePermissionRequest) {
+        let origin = &req.uri;
+        let domain = url_domain(origin).unwrap_or(origin.clone());
+        let (icon_svg, title, permission_desc) = match req.kind {
+            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>"#,
+                "Use Microphone",
+                "wants to use your microphone."
+            ),
+            COREWEBVIEW2_PERMISSION_KIND_CAMERA => (
+                r#"<svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg>"#,
+                "Use Camera",
+                "wants to use your camera."
+            ),
+            COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 0 1 0-5 2.5 2.5 0 0 1 0 5z"/></svg>"#,
+                "Know your Location",
+                "wants to know your location."
+            ),
+            COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 22c1.1 0 2-.9 2-2h-4a2 2 0 0 0 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>"#,
+                "Show Notifications",
+                "wants to show you notifications."
+            ),
+            _ => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>"#,
+                "Site Permission",
+                "wants additional site permissions."
+            )
+        };
+
+        let body_html = format!(
+            r#"<div style="font-size:12.5px;line-height:1.5;">
+              <span style="font-weight:600;color:var(--text);">{}</span> {}
+            </div>"#,
+            html_escape_text(&domain),
+            permission_desc
+        );
+
+        let buttons_html = r#"
+            <button class="btn btn-secondary" onclick="post('dialog:permission:block')">Block</button>
+            <button class="btn btn-primary" onclick="post('dialog:permission:allow')">Allow</button>
+        "#;
+
+        let html = dialog_popup_html(
+            icon_svg,
+            title,
+            origin,
+            &body_html,
+            buttons_html,
+            &colorref_to_css(self.accent_color),
+            &colorref_to_css(self.dominant_color),
+            &colorref_to_css(self.secondary_color),
+        );
+
+        self.dialog_active_permission = Some(req);
+
+        if let Ok(controller) = self.ensure_dialog_popup() {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let wide = CoTaskMemPWSTR::from(html.as_str());
+                unsafe {
+                    let _ = wv.NavigateToString(*wide.as_ref().as_pcwstr());
+                }
+                self.layout_dialog_popup();
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(self.dialog_popup_hwnd, WindowsAndMessaging::SW_SHOW);
+                    let _ = WindowsAndMessaging::SetWindowPos(self.dialog_popup_hwnd, Some(HWND_TOP), 0, 0, 0, 0, WindowsAndMessaging::SWP_NOMOVE | WindowsAndMessaging::SWP_NOSIZE);
+                }
+            }
+        }
+    }
+
+    fn show_script_dialog(&mut self, req: ActiveScriptDialog) {
+        let origin = &req.uri;
+        let domain = url_domain(origin).unwrap_or(origin.clone());
+
+        let (icon_svg, title) = match req.dialog_type {
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>"#,
+                "Alert"
+            ),
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 16h-2v-2h2v2zm1.07-7.75l-.9.92C12.45 11.9 12 12.5 12 14h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/></svg>"#,
+                "Confirm"
+            ),
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 16h-2v-2h2v2zm1.07-7.75l-.9.92C12.45 11.9 12 12.5 12 14h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/></svg>"#,
+                "Prompt"
+            ),
+            _ => (
+                r#"<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>"#,
+                "Script Dialog"
+            )
+        };
+
+        let mut body_html = format!(
+            r#"<div style="font-size:12.5px;line-height:1.5;margin-bottom:8px;word-break:break-word;">
+              {}
+            </div>"#,
+            html_escape_text(&req.message)
+        );
+
+        if req.dialog_type == COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT {
+            body_html.push_str(&format!(
+                r#"<input type="text" class="prompt-input" id="promptInput" value="{}" onkeydown="if(event.key === 'Enter') post('dialog:prompt:accept:' + document.getElementById('promptInput').value)" />"#,
+                html_escape_text(&req.default_text)
+            ));
+        }
+
+        let buttons_html = match req.dialog_type {
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT => {
+                r#"<button class="btn btn-primary" onclick="post('dialog:script:accept')">OK</button>"#
+            }
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM => {
+                r#"
+                <button class="btn btn-secondary" onclick="post('dialog:script:cancel')">Cancel</button>
+                <button class="btn btn-primary" onclick="post('dialog:script:accept')">OK</button>
+                "#
+            }
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT => {
+                r#"
+                <button class="btn btn-secondary" onclick="post('dialog:script:cancel')">Cancel</button>
+                <button class="btn btn-primary" onclick="post('dialog:prompt:accept:' + document.getElementById('promptInput').value)">OK</button>
+                "#
+            }
+            _ => {
+                r#"<button class="btn btn-primary" onclick="post('dialog:script:accept')">OK</button>"#
+            }
+        };
+
+        let html = dialog_popup_html(
+            icon_svg,
+            title,
+            &domain,
+            &body_html,
+            buttons_html,
+            &colorref_to_css(self.accent_color),
+            &colorref_to_css(self.dominant_color),
+            &colorref_to_css(self.secondary_color),
+        );
+
+        self.dialog_active_script_dialog = Some(req);
+
+        if let Ok(controller) = self.ensure_dialog_popup() {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let wide = CoTaskMemPWSTR::from(html.as_str());
+                unsafe {
+                    let _ = wv.NavigateToString(*wide.as_ref().as_pcwstr());
+                }
+                self.layout_dialog_popup();
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(self.dialog_popup_hwnd, WindowsAndMessaging::SW_SHOW);
+                    let _ = WindowsAndMessaging::SetWindowPos(self.dialog_popup_hwnd, Some(HWND_TOP), 0, 0, 0, 0, WindowsAndMessaging::SWP_NOMOVE | WindowsAndMessaging::SWP_NOSIZE);
+                }
+            }
+        }
+    }
+
+    fn update_dialog_theme(&self) {
+        if let Some(controller) = &self.dialog_popup_controller {
+            if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+                let accent = colorref_to_css(self.accent_color);
+                let dominant = colorref_to_css(self.dominant_color);
+                let secondary = colorref_to_css(self.secondary_color);
+                let js = format!(
+                    "document.documentElement.style.setProperty('--accent', '{}'); \
+                     document.documentElement.style.setProperty('--bg', '{}'); \
+                     document.documentElement.style.setProperty('--secondary', '{}');",
+                    accent, dominant, secondary
+                );
+                execute_webview_script(&wv, &js);
+            }
+        }
+    }
+
     fn attach_web_message_handler(&self, webview: &ICoreWebView2) {
         let hwnd = self.hwnd;
         unsafe {
@@ -1774,7 +3016,7 @@ impl App {
                         let mut raw = PWSTR::null();
                         if args.TryGetWebMessageAsString(&mut raw).is_ok() {
                             let message = take_pwstr(raw);
-                            with_app(hwnd, |app| app.handle_settings_message(&message));
+                            post_boxed_string(hwnd, WEBVIEW_MESSAGE_MSG, message);
                         }
                     }
                     Ok(())
@@ -1782,6 +3024,34 @@ impl App {
                 &mut token,
             );
         }
+    }
+
+    fn install_extension_store_assist_script(&self, webview: &ICoreWebView2) {
+        let script = extension_store_assist_script(self.accent_color, &self.extensions);
+        unsafe {
+            let script = CoTaskMemPWSTR::from(script.as_str());
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                *script.as_ref().as_pcwstr(),
+                &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| {
+                    Ok(())
+                })),
+            );
+        }
+        execute_webview_script(webview, &script);
+    }
+
+    fn install_extension_host_script(&self, webview: &ICoreWebView2, ext: &BrowserExtensionInfo) {
+        let script = extension_host_script(&ext.id, &ext.side_panel_path);
+        unsafe {
+            let script = CoTaskMemPWSTR::from(script.as_str());
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                *script.as_ref().as_pcwstr(),
+                &AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| {
+                    Ok(())
+                })),
+            );
+        }
+        execute_webview_script(webview, &script);
     }
 
     fn recreate_secondary_brush(&mut self) {
@@ -1796,15 +3066,18 @@ impl App {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.accent_color = color;
                 self.run_find_script(0);
+                self.update_dialog_theme();
             }
         } else if let Some(value) = message.strip_prefix("settings:dominant:") {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.dominant_color = color;
+                self.update_dialog_theme();
             }
         } else if let Some(value) = message.strip_prefix("settings:secondary:") {
             if let Some(color) = parse_css_color_to_colorref(value) {
                 self.secondary_color = color;
                 self.recreate_secondary_brush();
+                self.update_dialog_theme();
             }
         } else if message == "settings:open-state-file" {
             let path = state_path();
@@ -1857,6 +3130,31 @@ impl App {
             self.refresh_extensions();
         } else if message == "extensions:open-store" {
             self.open_extension_store();
+        } else if let Some(value) = message.strip_prefix("extensions:install-store:") {
+            self.start_extension_install_flight();
+            self.install_extension_from_store(&percent_decode(value));
+        } else if let Some(id) = message.strip_prefix("extensions:open-popup:") {
+            self.open_extension_popup_by_id(&percent_decode(id));
+        } else if let Some(raw) = message.strip_prefix("extensions:open-side-panel:") {
+            let mut parts = raw.splitn(2, ':');
+            let id = parts.next().map(percent_decode).unwrap_or_default();
+            let path = parts
+                .next()
+                .map(percent_decode)
+                .filter(|value| !value.is_empty());
+            self.open_extension_side_panel_by_id_with_path(&id, path);
+        } else if let Some(raw) = message.strip_prefix("extensions:popup-size:") {
+            let mut parts = raw.split(':');
+            let _id = parts.next();
+            let width = parts
+                .next()
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            let height = parts
+                .next()
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            self.resize_extension_popup_to_content(width, height);
         } else if let Some(path) = message.strip_prefix("extensions:add:") {
             self.add_extension_from_path(&percent_decode(path));
         } else if let Some(raw) = message.strip_prefix("extensions:enable:") {
@@ -1865,6 +3163,45 @@ impl App {
             }
         } else if let Some(id) = message.strip_prefix("extensions:remove:") {
             self.remove_extension(&percent_decode(id));
+        } else if message == "extensions:browse-folder" {
+            self.extension_notice = Some("Choose an extension folder...".to_string());
+            self.reload_extensions_pages();
+            let hwnd_raw = self.hwnd.0 as isize;
+            std::thread::spawn(move || {
+                let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+                let picked = pick_extension_folder(hwnd);
+                post_boxed_string(
+                    hwnd,
+                    EXTENSION_FOLDER_PICKED_MSG,
+                    picked.unwrap_or_default(),
+                );
+            });
+        } else if message == "dialog:permission:allow" {
+            self.close_dialog_popup(true);
+        } else if message == "dialog:permission:block" {
+            self.close_dialog_popup(false);
+        } else if message == "dialog:extension:accept" {
+            self.close_dialog_popup(true);
+        } else if message == "dialog:extension:cancel" {
+            self.close_dialog_popup(false);
+        } else if message == "dialog:extension-remove:accept" {
+            self.close_dialog_popup(true);
+        } else if message == "dialog:extension-remove:cancel" {
+            self.close_dialog_popup(false);
+        } else if let Some(id) = message.strip_prefix("extensions:uninstall-request:") {
+            self.remove_extension(&percent_decode(id));
+        } else if message == "dialog:script:accept" {
+            self.close_dialog_popup(true);
+        } else if message == "dialog:script:cancel" {
+            self.close_dialog_popup(false);
+        } else if let Some(value) = message.strip_prefix("dialog:prompt:accept:") {
+            if let Some(dialog) = self.dialog_active_script_dialog.as_ref() {
+                let wide = CoTaskMemPWSTR::from(value);
+                unsafe {
+                    let _ = dialog.args.SetResultText(*wide.as_ref().as_pcwstr());
+                }
+            }
+            self.close_dialog_popup(true);
         } else if let Some(value) = message.strip_prefix("history:sort:") {
             self.history_sort_mode = HistorySortMode::from_str(value);
             self.reload_history_pages();
@@ -1977,6 +3314,7 @@ impl App {
         configure_webview(&webview)?;
         apply_site_mode_to_webview(&webview, self.site_mode);
         self.attach_web_message_handler(&webview);
+        self.install_extension_store_assist_script(&webview);
 
         let id = self.next_id;
         self.next_id += 1;
@@ -3348,6 +4686,7 @@ impl App {
         self.workspace_active_tabs.clear();
         self.visited_sites.clear();
         self.custom_keybinds.clear();
+        self.pinned_extensions.clear();
 
         let mut tab_records = Vec::new();
         let mut active_workspace = 1usize;
@@ -3496,6 +4835,16 @@ impl App {
                         self.workspace_active_tabs.push((workspace_id, tab_id));
                     }
                 }
+                "pinned_extension" if parts.len() >= 2 => {
+                    if !parts[1].trim().is_empty() {
+                        self.pinned_extensions.insert(parts[1].clone());
+                    }
+                }
+                "extension_install_path" if parts.len() >= 3 => {
+                    if !parts[1].trim().is_empty() && !parts[2].trim().is_empty() {
+                        self.extension_install_paths.insert(parts[1].clone(), parts[2].clone());
+                    }
+                }
                 "setting" if parts.len() >= 3 => match parts[1].as_str() {
                     "dominant_color" => {
                         if let Ok(color) = parts[2].parse::<u32>() {
@@ -3535,11 +4884,34 @@ impl App {
                     "default_bubble_dismissed" => {
                         self.default_bubble_dismissed = parts[2] == "1";
                     }
+                    "extension_side_panel_width" => {
+                        if let Ok(width) = parts[2].parse::<i32>() {
+                            self.extension_side_panel_width_override = Some(width.clamp(300, 1200));
+                        }
+                    }
                     _ => {}
                 },
                 "keybind" if parts.len() >= 3 => {
                     self.custom_keybinds
                         .push((parts[1].clone(), parts[2].clone()));
+                }
+                "window_placement" if parts.len() >= 6 => {
+                    if let (Ok(show_cmd), Ok(left), Ok(top), Ok(right), Ok(bottom)) = (
+                        parts[1].parse::<u32>(),
+                        parts[2].parse::<i32>(),
+                        parts[3].parse::<i32>(),
+                        parts[4].parse::<i32>(),
+                        parts[5].parse::<i32>(),
+                    ) {
+                        self.saved_placement = Some(WINDOWPLACEMENT {
+                            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                            flags: WINDOWPLACEMENT_FLAGS(0),
+                            showCmd: show_cmd,
+                            ptMinPosition: POINT { x: 0, y: 0 },
+                            ptMaxPosition: POINT { x: -1, y: -1 },
+                            rcNormalPosition: RECT { left, top, right, bottom },
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -3687,11 +5059,24 @@ impl App {
                 "0"
             }
         ));
+        if let Some(width) = self.extension_side_panel_width_override {
+            lines.push(format!("setting\textension_side_panel_width\t{}", width));
+        }
         for (action, combo) in &self.custom_keybinds {
             lines.push(format!(
                 "keybind\t{}\t{}",
                 escape_state(action),
                 escape_state(combo)
+            ));
+        }
+        for extension_id in &self.pinned_extensions {
+            lines.push(format!("pinned_extension\t{}", escape_state(extension_id)));
+        }
+        for (id, path) in &self.extension_install_paths {
+            lines.push(format!(
+                "extension_install_path\t{}\t{}",
+                escape_state(id),
+                escape_state(path)
             ));
         }
         for (workspace_id, active_tab_id) in &self.workspace_active_tabs {
@@ -3775,6 +5160,22 @@ impl App {
                 escape_state(&site.title)
             ));
         }
+        unsafe {
+            let mut placement = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if WindowsAndMessaging::GetWindowPlacement(self.hwnd, &mut placement).is_ok() {
+                lines.push(format!(
+                    "window_placement\t{}\t{}\t{}\t{}\t{}",
+                    placement.showCmd,
+                    placement.rcNormalPosition.left,
+                    placement.rcNormalPosition.top,
+                    placement.rcNormalPosition.right,
+                    placement.rcNormalPosition.bottom,
+                ));
+            }
+        }
         let _ = fs::write(state_path(), lines.join("\n"));
     }
 
@@ -3831,7 +5232,21 @@ impl App {
             let hwnd = self.hwnd;
             let mut token = 0;
             webview.add_NavigationStarting(
-                &NavigationStartingEventHandler::create(Box::new(move |_sender, _args| {
+                &NavigationStartingEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut uri = PWSTR::null();
+                        if args.Uri(&mut uri).is_ok() {
+                            let url = CoTaskMemPWSTR::from(uri).to_string();
+                            if let Some(extension_id) = extension_id_from_crx_download(&url, "") {
+                                let _ = args.SetCancel(true);
+                                with_app(hwnd, |app| {
+                                    app.start_extension_install_flight();
+                                    app.install_extension_from_store(&extension_id);
+                                });
+                                return Ok(());
+                            }
+                        }
+                    }
                     with_app(hwnd, |app| app.set_tab_loading(tab_id, true));
                     Ok(())
                 })),
@@ -3841,7 +5256,22 @@ impl App {
             let hwnd = self.hwnd;
             let mut token = 0;
             webview.add_NavigationCompleted(
-                &NavigationCompletedEventHandler::create(Box::new(move |_sender, _args| {
+                &NavigationCompletedEventHandler::create(Box::new(move |sender, _args| {
+                    if let Some(sender) = sender {
+                        let mut uri = PWSTR::null();
+                        if sender.Source(&mut uri).is_ok() {
+                            let url = CoTaskMemPWSTR::from(uri).to_string();
+                            if is_extension_store_url(&url) {
+                                with_app(hwnd, |app| {
+                                    let script = extension_store_assist_script(
+                                        app.accent_color,
+                                        &app.extensions,
+                                    );
+                                    execute_webview_script(&sender, &script);
+                                });
+                            }
+                        }
+                    }
                     with_app(hwnd, |app| {
                         app.set_tab_loading(tab_id, false);
                         if app.find_open {
@@ -3874,6 +5304,91 @@ impl App {
             webview.add_HistoryChanged(
                 &HistoryChangedEventHandler::create(Box::new(move |_sender, _args| {
                     with_app(hwnd, |app| app.refresh());
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_PermissionRequested(
+                &PermissionRequestedEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut kind = COREWEBVIEW2_PERMISSION_KIND_UNKNOWN_PERMISSION;
+                        let _ = args.PermissionKind(&mut kind);
+                        let mut uri_raw = PWSTR::null();
+                        let uri = if args.Uri(&mut uri_raw).is_ok() {
+                            CoTaskMemPWSTR::from(uri_raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        match kind {
+                            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
+                            | COREWEBVIEW2_PERMISSION_KIND_CAMERA
+                            | COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION
+                            | COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS => {
+                                if let Ok(deferral) = args.GetDeferral() {
+                                    let req = ActivePermissionRequest {
+                                        args: args.clone(),
+                                        deferral,
+                                        kind,
+                                        uri,
+                                    };
+                                    with_app(hwnd, |app| {
+                                        app.show_permission_dialog(req);
+                                    });
+                                }
+                            }
+                            _ => {
+                                // For unknown permission types, deny by default
+                                let _ = args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY);
+                            }
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_ScriptDialogOpening(
+                &ScriptDialogOpeningEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut dialog_kind = COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT;
+                        let _ = args.Kind(&mut dialog_kind);
+                        let mut uri_raw = PWSTR::null();
+                        let uri = if args.Uri(&mut uri_raw).is_ok() {
+                            CoTaskMemPWSTR::from(uri_raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        let mut msg_raw = PWSTR::null();
+                        let message = if args.Message(&mut msg_raw).is_ok() {
+                            CoTaskMemPWSTR::from(msg_raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        let mut default_raw = PWSTR::null();
+                        let default_text = if args.DefaultText(&mut default_raw).is_ok() {
+                            CoTaskMemPWSTR::from(default_raw).to_string()
+                        } else {
+                            String::new()
+                        };
+                        if let Ok(deferral) = args.GetDeferral() {
+                            let req = ActiveScriptDialog {
+                                args: args.clone(),
+                                deferral,
+                                dialog_type: dialog_kind,
+                                message,
+                                default_text,
+                                uri,
+                            };
+                            with_app(hwnd, |app| {
+                                app.show_script_dialog(req);
+                            });
+                        }
+                    }
                     Ok(())
                 })),
                 &mut token,
@@ -3977,10 +5492,36 @@ impl App {
                         let mut uri = PWSTR::null();
                         if args.Uri(&mut uri).is_ok() {
                             let url = CoTaskMemPWSTR::from(uri).to_string();
-                            with_app(hwnd, |app| {
-                                let _ = app.create_tab(&url);
-                            });
+                            post_boxed_string(hwnd, NEW_WINDOW_REQUESTED_MSG, url);
                             let _ = args.SetHandled(true);
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
+            let hwnd = self.hwnd;
+            let mut token = 0;
+            webview.add_ProcessFailed(
+                &ProcessFailedEventHandler::create(Box::new(move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND(0);
+                        let _ = args.ProcessFailedKind(&mut kind);
+                        let result = WebViewProcessFailure {
+                            tab_id,
+                            kind: kind.0,
+                        };
+                        let ptr = Box::into_raw(Box::new(result));
+                        let posted = WindowsAndMessaging::PostMessageW(
+                            Some(hwnd),
+                            WEBVIEW_PROCESS_FAILED_MSG,
+                            WPARAM(ptr as usize),
+                            LPARAM(0),
+                        )
+                        .is_ok();
+                        if !posted {
+                            drop(Box::from_raw(ptr));
                         }
                     }
                     Ok(())
@@ -3994,8 +5535,21 @@ impl App {
                 webview4.add_DownloadStarting(
                     &DownloadStartingEventHandler::create(Box::new(move |_sender, args| {
                         if let Some(args) = args {
-                            let _ = args.SetHandled(true);
                             if let Ok(operation) = args.DownloadOperation() {
+                                let snapshot = download_snapshot(&operation);
+                                if let Some(extension_id) = extension_id_from_crx_download(
+                                    &snapshot.uri,
+                                    &snapshot.file_path,
+                                ) {
+                                    let _ = args.SetHandled(true);
+                                    let _ = args.SetCancel(true);
+                                    let _ = operation.Cancel();
+                                    with_app(hwnd, |app| {
+                                        app.start_extension_install_flight();
+                                        app.install_extension_from_store(&extension_id);
+                                    });
+                                    return Ok(());
+                                }
                                 let mut result_path = PWSTR::null();
                                 let file_path = if args.ResultFilePath(&mut result_path).is_ok() {
                                     CoTaskMemPWSTR::from(result_path).to_string()
@@ -4006,6 +5560,7 @@ impl App {
                                     let id = app.register_download(operation.clone(), file_path);
                                     app.attach_download_events(id, &operation);
                                 });
+                                let _ = args.SetHandled(true);
                             }
                         }
                         Ok(())
@@ -4230,6 +5785,126 @@ impl App {
                 }
             }
         }
+        if let Some(flight) = &self.extension_install_flight {
+            if flight.start_time.elapsed().as_millis() >= 860 {
+                unsafe {
+                    let _ = WindowsAndMessaging::ShowWindow(
+                        self.extension_install_popup_hwnd,
+                        WindowsAndMessaging::SW_HIDE,
+                    );
+                }
+                self.extension_install_flight = None;
+            } else {
+                self.position_extension_install_popup();
+            }
+        }
+    }
+
+    fn start_extension_install_flight(&mut self) {
+        let mut from = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut from).is_err() {
+                let rect = client_rect(self.hwnd);
+                from = POINT {
+                    x: rect.right / 2,
+                    y: rect.bottom / 2,
+                };
+                let _ = Gdi::ClientToScreen(self.hwnd, &mut from);
+            }
+        }
+        if self.topbar_mode != SidebarMode::Pushed && self.topbar_expand_mode != SidebarMode::Pushed
+        {
+            self.topbar_expand_mode = SidebarMode::Overlay;
+            self.set_topbar_mode(SidebarMode::Overlay);
+        }
+        let (min_btn, _, _) = self.window_button_rects();
+        let target = RECT {
+            left: min_btn.left - 46,
+            top: 16,
+            right: min_btn.left - 18,
+            bottom: 44,
+        };
+        let mut target_center = POINT {
+            x: (target.left + target.right) / 2,
+            y: (target.top + target.bottom) / 2,
+        };
+        unsafe {
+            let _ = Gdi::ClientToScreen(self.hwnd, &mut target_center);
+        }
+        self.extension_install_flight = Some(ExtensionInstallFlightState {
+            start_time: std::time::Instant::now(),
+            from,
+            to: target_center,
+        });
+        self.position_extension_install_popup();
+        self.ensure_download_timer();
+        self.refresh();
+    }
+
+    fn extension_install_flight_frame(&self) -> Option<(POINT, i32, f32)> {
+        let flight = self.extension_install_flight.as_ref()?;
+        let elapsed = flight.start_time.elapsed().as_millis() as f32;
+        let raw_t = (elapsed / 760.0).clamp(0.0, 1.0);
+        // Ease-in curve: slow at click point, faster as it commits toward the toolbar.
+        let t = raw_t * raw_t * (2.2 - 1.2 * raw_t);
+        let mid = POINT {
+            x: (flight.from.x + flight.to.x) / 2,
+            y: ((flight.from.y + flight.to.y) / 2 - 90).max(flight.to.y + 18),
+        };
+        let omt = 1.0 - t;
+        let x = omt * omt * flight.from.x as f32
+            + 2.0 * omt * t * mid.x as f32
+            + t * t * flight.to.x as f32;
+        let y = omt * omt * flight.from.y as f32
+            + 2.0 * omt * t * mid.y as f32
+            + t * t * flight.to.y as f32;
+        let fade = if raw_t > 0.62 {
+            ((0.86 - raw_t) / 0.24).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let size = 32;
+        Some((
+            POINT {
+                x: x.round() as i32,
+                y: y.round() as i32,
+            },
+            size.max(18),
+            fade,
+        ))
+    }
+
+    fn position_extension_install_popup(&self) {
+        let Some((center, size, _)) = self.extension_install_flight_frame() else {
+            return;
+        };
+        let top_left = POINT {
+            x: center.x - size / 2,
+            y: center.y - size / 2,
+        };
+        unsafe {
+            let _ = WindowsAndMessaging::SetWindowPos(
+                self.extension_install_popup_hwnd,
+                Some(HWND_TOP),
+                top_left.x,
+                top_left.y,
+                size,
+                size,
+                WindowsAndMessaging::SWP_NOACTIVATE | WindowsAndMessaging::SWP_SHOWWINDOW,
+            );
+            if let Some((_, _, fade)) = self.extension_install_flight_frame() {
+                let alpha = (fade * 255.0).round().clamp(0.0, 255.0) as u8;
+                let _ = WindowsAndMessaging::SetLayeredWindowAttributes(
+                    self.extension_install_popup_hwnd,
+                    COLORREF(0),
+                    alpha,
+                    WindowsAndMessaging::LWA_ALPHA,
+                );
+            }
+            let region = CreateRoundRectRgn(0, 0, size + 1, size + 1, size, size);
+            let _ = SetWindowRgn(self.extension_install_popup_hwnd, Some(region), true);
+            let _ = InvalidateRect(Some(self.extension_install_popup_hwnd), None, false);
+        }
     }
 
     fn tick_download_panel_animation(&mut self) {
@@ -4268,6 +5943,7 @@ impl App {
             && (self.download_panel_reveal - self.download_panel_reveal_target).abs() > 0.005;
         let needs_timer = panel_animating
             || self.download_toast.is_some()
+            || self.extension_install_flight.is_some()
             || self.bookmark_toast.is_some()
             || self.download_removal_anim.is_some()
             || self.download_collapse_anim.is_some()
@@ -5366,7 +7042,11 @@ impl App {
         let tab = self.tabs.get(self.active).or_else(|| self.tabs.first())?;
         unsafe {
             let webview13 = tab.webview.cast::<ICoreWebView2_13>().ok()?;
-            webview13.Profile().ok()?.cast::<ICoreWebView2Profile7>().ok()
+            webview13
+                .Profile()
+                .ok()?
+                .cast::<ICoreWebView2Profile7>()
+                .ok()
         }
     }
 
@@ -5376,36 +7056,144 @@ impl App {
         };
         let hwnd = self.hwnd;
         unsafe {
-            let _ = profile.GetBrowserExtensions(
-                &ProfileGetBrowserExtensionsCompletedHandler::create(Box::new(
-                    move |error_code, list| {
+            let _ =
+                profile.GetBrowserExtensions(&ProfileGetBrowserExtensionsCompletedHandler::create(
+                    Box::new(move |error_code, list| {
                         let mut extensions = Vec::new();
                         if error_code.is_ok() {
                             if let Some(list) = list {
                                 let mut count = 0u32;
                                 let _ = list.Count(&mut count);
                                 for index in 0..count {
-                                    if let Ok(extension) = list.GetValueAtIndex(index) {
-                                        extensions.push(extension_info(&extension));
+                                    if let Ok(ext) = list.GetValueAtIndex(index) {
+                                        extensions.push(extension_info(&ext, None));
                                     }
                                 }
                             }
                         }
+                        // Deduplicate by ID
+                        let mut seen = HashSet::new();
+                        extensions.retain(|ext| seen.insert(ext.id.clone()));
+                        let installed_ids = extensions
+                            .iter()
+                            .map(|extension| extension.id.clone())
+                            .collect::<HashSet<_>>();
                         with_app(hwnd, |app| {
-                            app.extensions = extensions;
-                            if app.extension_notice.as_deref()
-                                == Some("Refreshing extensions...")
+                            app.pinned_extensions
+                                .retain(|extension_id| installed_ids.contains(extension_id));
+                            if app
+                                .extension_popup_extension_id
+                                .as_ref()
+                                .map(|id| !installed_ids.contains(id))
+                                .unwrap_or(false)
                             {
+                                app.close_extension_popup();
+                            }
+                            if app
+                                .extension_side_panel_extension_id
+                                .as_ref()
+                                .map(|id| !installed_ids.contains(id))
+                                .unwrap_or(false)
+                            {
+                                app.close_extension_side_panel();
+                            }
+                            // Enrich with manifest data from stored install paths
+                            for ext in extensions.iter_mut() {
+                                let known_path = app.extension_install_paths.get(&ext.id).cloned();
+                                let path = resolve_extension_install_path(
+                                    &ext.id,
+                                    &ext.name,
+                                    known_path.as_deref(),
+                                )
+                                .unwrap_or_else(|| ext.install_path.clone());
+                                if Path::new(&path).join("manifest.json").exists() {
+                                    let details = read_extension_manifest(&path);
+                                    if !details.name.is_empty() {
+                                        ext.name = details.name;
+                                    }
+                                    if !details.version.is_empty() {
+                                        ext.version = details.version;
+                                    }
+                                    if !details.description.is_empty() {
+                                        ext.description = details.description;
+                                    }
+                                    ext.has_action = details.has_action;
+                                    if !details.popup_path.is_empty() {
+                                        ext.popup_path = details.popup_path;
+                                    }
+                                    if !details.side_panel_path.is_empty() {
+                                        ext.side_panel_path = details.side_panel_path;
+                                    }
+                                    if !details.options_path.is_empty() {
+                                        ext.options_path = details.options_path;
+                                    }
+                                    if !details.permissions.is_empty() {
+                                        ext.permissions = details.permissions;
+                                    }
+                                    if !details.icon_path.is_empty() {
+                                        ext.icon_path = details.icon_path;
+                                    }
+                                    ext.install_path = path;
+                                }
+                            }
+                            app.extensions = extensions;
+                            if app.extension_notice.as_deref() == Some("Refreshing extensions...") {
                                 app.extension_notice =
                                     Some("Extension list refreshed.".to_string());
                             }
+                            app.sync_store_installed_extensions();
                             app.reload_extensions_pages();
+                            app.save_state();
                             app.refresh();
                         });
                         Ok(())
-                    },
-                )),
-            );
+                    }),
+                ));
+        }
+    }
+
+    fn sync_store_installed_extensions(&self) {
+        let ids = installed_extension_ids_json(&self.extensions);
+        let script = format!(
+            "window.asterSetInstalledExtensions && window.asterSetInstalledExtensions({ids});"
+        );
+        for tab in self.tabs.iter() {
+            if is_extension_store_url(&tab.url) {
+                execute_webview_script(&tab.webview, &script);
+            }
+        }
+    }
+
+    fn notify_store_tabs(&mut self, extension_id: &str) {
+        let script = format!(
+            r#"(() => {{
+            if (window.asterMarkExtensionInstalled) window.asterMarkExtensionInstalled({});
+            const panel = document.getElementById("__asterExtensionInstall");
+            if (panel) {{
+                const btn = panel.querySelector("button");
+                if (btn) {{ btn.disabled = true; btn.textContent = "Installed"; }}
+            }}
+            const s = window.asterExtensionStoreStatus;
+            if (typeof s === "function") s("Installed in Aster");
+        }})()"#,
+            js_string_literal(extension_id)
+        );
+        for tab in self.tabs.iter() {
+            if is_extension_store_url(&tab.url) {
+                execute_webview_script(&tab.webview, &script);
+            }
+        }
+    }
+
+    fn send_store_status(&self, message: &str) {
+        let script = format!(
+            "window.asterExtensionStoreStatus && window.asterExtensionStoreStatus({});",
+            js_string_literal(message)
+        );
+        for tab in self.tabs.iter() {
+            if is_extension_store_url(&tab.url) {
+                execute_webview_script(&tab.webview, &script);
+            }
         }
     }
 
@@ -5418,14 +7206,13 @@ impl App {
         }
         let folder = PathBuf::from(path);
         if !folder.join("manifest.json").exists() {
-            self.extension_notice =
-                Some("That folder does not contain manifest.json.".to_string());
+            self.extension_notice = Some("That folder does not contain manifest.json.".to_string());
             self.reload_extensions_pages();
             return;
         }
         let Some(profile) = self.active_extension_profile() else {
             self.extension_notice =
-                Some("Extensions are not available in this WebView2 runtime.".to_string());
+                Some("Extensions are not available in this browser runtime.".to_string());
             self.reload_extensions_pages();
             return;
         };
@@ -5433,6 +7220,7 @@ impl App {
         self.reload_extensions_pages();
         let hwnd = self.hwnd;
         let path = folder.to_string_lossy().into_owned();
+        let path_for_callback = path.clone();
         unsafe {
             let wide = CoTaskMemPWSTR::from(path.as_str());
             let _ = profile.AddBrowserExtension(
@@ -5443,8 +7231,12 @@ impl App {
                             app.extension_notice = if error_code.is_ok() {
                                 let name = extension
                                     .as_ref()
-                                    .map(extension_info)
-                                    .map(|info| info.name)
+                                    .map(|ext| extension_info(ext, Some(&path_for_callback)))
+                                    .map(|info| {
+                                        app.extension_install_paths
+                                            .insert(info.id.clone(), path_for_callback.clone());
+                                        info.name
+                                    })
                                     .unwrap_or_else(|| "Extension".to_string());
                                 Some(format!("{name} loaded."))
                             } else {
@@ -5469,16 +7261,16 @@ impl App {
         let wanted = id.to_string();
         let action = RefCell::new(Some(action));
         unsafe {
-            let _ = profile.GetBrowserExtensions(
-                &ProfileGetBrowserExtensionsCompletedHandler::create(Box::new(
-                    move |error_code, list| {
+            let _ =
+                profile.GetBrowserExtensions(&ProfileGetBrowserExtensionsCompletedHandler::create(
+                    Box::new(move |error_code, list| {
                         if error_code.is_ok() {
                             if let Some(list) = list {
                                 let mut count = 0u32;
                                 let _ = list.Count(&mut count);
                                 for index in 0..count {
                                     if let Ok(extension) = list.GetValueAtIndex(index) {
-                                        if extension_info(&extension).id == wanted {
+                                        if extension_info(&extension, None).id == wanted {
                                             if let Some(action) = action.borrow_mut().take() {
                                                 action(extension);
                                             }
@@ -5489,9 +7281,8 @@ impl App {
                             }
                         }
                         Ok(())
-                    },
-                )),
-            );
+                    }),
+                ));
         }
     }
 
@@ -5527,15 +7318,26 @@ impl App {
     }
 
     fn remove_extension(&mut self, id: &str) {
+        self.show_extension_remove_dialog(id);
+    }
+
+    fn remove_extension_final(&mut self, id: &str) {
         let id_for_notice = id.to_string();
         let hwnd = self.hwnd;
         self.extension_notice = Some("Removing extension...".to_string());
+        if self.extension_popup_extension_id.as_deref() == Some(id) {
+            self.close_extension_popup();
+        }
+        if self.extension_side_panel_extension_id.as_deref() == Some(id) {
+            self.close_extension_side_panel();
+        }
         self.reload_extensions_pages();
         self.with_extension_by_id(id, move |extension| unsafe {
             let _ = extension.Remove(&BrowserExtensionRemoveCompletedHandler::create(Box::new(
                 move |error_code| {
                     with_app(hwnd, |app| {
                         app.extension_notice = if error_code.is_ok() {
+                            app.extension_install_paths.remove(&id_for_notice);
                             Some("Extension removed.".to_string())
                         } else {
                             Some(format!("Could not remove extension {id_for_notice}."))
@@ -5546,6 +7348,161 @@ impl App {
                 },
             )));
         });
+    }
+
+    fn install_extension_from_store(&mut self, extension_id: &str) {
+        let Some(id) = extract_chrome_extension_id(extension_id) else {
+            self.extension_notice =
+                Some("Paste a valid Chrome Web Store link or extension id.".to_string());
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        };
+        if self.extensions.iter().any(|e| e.id == id)
+            || self.pending_extension_installs.contains(&id)
+        {
+            self.extension_notice =
+                Some("Extension is already installed or being installed.".to_string());
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        }
+        self.pending_extension_installs.insert(id.clone());
+        self.extension_notice = Some(format!("Downloading extension from Chrome Web Store..."));
+        self.send_store_status("Downloading extension package...");
+        self.reload_extensions_pages();
+        self.refresh();
+        let hwnd_raw = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            let url = format!(
+                "https://clients2.google.com/service/update2/crx?response=redirect&prodversion={CHROME_COMPAT_VERSION}&acceptformat=crx2,crx3&x=id%3D{id}%26installsource%3Dondemand%26uc"
+            );
+            let crx_path = download_url_to_cache(&url).unwrap_or_default();
+            let result = if crx_path.is_empty() {
+                ExtensionCrxResult {
+                    extension_id: id.clone(),
+                    install_path: String::new(),
+                    error: Some(
+                        "Failed to download extension. Check your internet connection.".to_string(),
+                    ),
+                }
+            } else {
+                match extract_crx(&crx_path, &id) {
+                    Ok(install_path) => ExtensionCrxResult {
+                        extension_id: id.clone(),
+                        install_path,
+                        error: None,
+                    },
+                    Err(e) => ExtensionCrxResult {
+                        extension_id: id.clone(),
+                        install_path: String::new(),
+                        error: Some(e),
+                    },
+                }
+            };
+            let ptr = Box::into_raw(Box::new(result));
+            let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+            let posted = unsafe {
+                WindowsAndMessaging::PostMessageW(
+                    Some(hwnd),
+                    EXTENSION_PACKAGE_READY_MSG,
+                    WPARAM(ptr as usize),
+                    LPARAM(0),
+                )
+                .is_ok()
+            };
+            if !posted {
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+            unsafe {
+                CoUninitialize();
+            }
+        });
+    }
+
+    fn complete_extension_install(&mut self, result: ExtensionCrxResult) {
+        let ext_id = result.extension_id.clone();
+        if let Some(error) = result.error {
+            self.pending_extension_installs.remove(&ext_id);
+            self.extension_notice = Some(error);
+            if let Some(message) = self.extension_notice.as_deref() {
+                self.send_store_status(message);
+            }
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        }
+        if result.install_path.is_empty() {
+            self.pending_extension_installs.remove(&ext_id);
+            self.extension_notice = Some("Failed to install extension: empty path.".to_string());
+            self.send_store_status("Failed to install extension.");
+            self.reload_extensions_pages();
+            self.refresh();
+            return;
+        }
+        // Store the result and show our custom confirmation dialog
+        let id_for_dialog = ext_id.clone();
+        self.dialog_active_extension = Some(result);
+        self.show_extension_install_dialog(&id_for_dialog);
+    }
+
+    fn complete_extension_install_final(&mut self, result: ExtensionCrxResult) {
+        let hwnd = self.hwnd;
+        let ext_id = result.extension_id.clone();
+        self.extension_notice = Some("Installing extension into browser...".to_string());
+        self.send_store_status("Installing extension in Aster...");
+        self.reload_extensions_pages();
+        if let Some(profile) = self.active_extension_profile() {
+            let path = result.install_path;
+            let path_for_callback = path.clone();
+            unsafe {
+                let wide = CoTaskMemPWSTR::from(path.as_str());
+                let _ = profile.AddBrowserExtension(
+                    *wide.as_ref().as_pcwstr(),
+                    &ProfileAddBrowserExtensionCompletedHandler::create(Box::new(
+                        move |error_code, extension| {
+                            with_app(hwnd, |app| {
+                                app.pending_extension_installs.remove(&ext_id);
+                                let ext_name = extension
+                                    .as_ref()
+                                    .map(|ext| extension_info(ext, Some(&path_for_callback)).name)
+                                    .unwrap_or_default();
+                                app.extension_notice = if error_code.is_ok() {
+                                    if let Some(ref ext) = extension {
+                                        let info = extension_info(ext, Some(&path_for_callback));
+                                        app.extension_install_paths
+                                            .insert(info.id.clone(), path_for_callback.clone());
+                                    }
+                                    Some(format!("{ext_name} installed from Chrome Web Store."))
+                                } else {
+                                    Some(format!("{ext_name} could not be loaded."))
+                                };
+                                if let Some(message) = app.extension_notice.as_deref() {
+                                    app.send_store_status(message);
+                                }
+                                if error_code.is_ok() {
+                                    app.notify_store_tabs(&ext_id);
+                                }
+                                app.refresh_extensions();
+                            });
+                            Ok(())
+                        },
+                    )),
+                );
+            }
+        } else {
+            self.pending_extension_installs.remove(&ext_id);
+            self.extension_notice =
+                Some("Extensions are not available in this browser runtime.".to_string());
+            self.send_store_status("Extensions are not available in this browser runtime.");
+            self.reload_extensions_pages();
+            self.refresh();
+        }
     }
 
     fn bookmarks_export_html(&self) -> String {
@@ -6576,6 +8533,57 @@ impl App {
         }
     }
 
+    fn extension_action_button_rects(&self) -> Vec<(usize, RECT)> {
+        let overflow = self.extension_button_rect();
+        let y = self.topbar_y();
+        let mut rects = Vec::new();
+        let mut right = overflow.left - 4;
+        for (i, ext) in self.extensions.iter().enumerate() {
+            if ext.enabled
+                && self.pinned_extensions.contains(&ext.id)
+                && (ext.has_action
+                    || !ext.popup_path.is_empty()
+                    || !ext.side_panel_path.is_empty()
+                    || !ext.options_path.is_empty())
+            {
+                let left = right - 28;
+                rects.push((
+                    i,
+                    RECT {
+                        left,
+                        top: y + 16,
+                        right,
+                        bottom: y + 44,
+                    },
+                ));
+                right = left - 4;
+            }
+        }
+        rects.reverse();
+        rects
+    }
+
+    fn get_or_cache_extension_icon(
+        &self,
+        id: &str,
+        icon_path: &str,
+    ) -> Option<(HBITMAP, i32, i32)> {
+        if icon_path.is_empty() {
+            return None;
+        }
+        let mut cache = self.extension_icon_cache.borrow_mut();
+        if let Some(cached) = cache.get(id) {
+            return Some((cached.handle, cached.width, cached.height));
+        }
+        if let Some(favicon) = decode_favicon_file(icon_path) {
+            cache.insert(id.to_string(), favicon);
+            let cached = cache.get(id)?;
+            Some((cached.handle, cached.width, cached.height))
+        } else {
+            None
+        }
+    }
+
     fn settings_rect(&self) -> RECT {
         let rect = client_rect(self.hwnd);
         RECT {
@@ -6600,7 +8608,7 @@ impl App {
         let bottom = settings.top - 8;
         RECT {
             left: 12,
-            top: bottom - 236,
+            top: bottom - 148,
             right: 196,
             bottom,
         }
@@ -6627,27 +8635,7 @@ impl App {
     }
 
     fn history_page_row_rect(&self) -> RECT {
-        let row = self.extensions_page_row_rect();
-        RECT {
-            left: row.left,
-            top: row.bottom + 8,
-            right: row.right,
-            bottom: row.bottom + 44,
-        }
-    }
-
-    fn extension_store_row_rect(&self) -> RECT {
         let row = self.mode_row_rect();
-        RECT {
-            left: row.left,
-            top: row.bottom + 8,
-            right: row.right,
-            bottom: row.bottom + 44,
-        }
-    }
-
-    fn extensions_page_row_rect(&self) -> RECT {
-        let row = self.extension_store_row_rect();
         RECT {
             left: row.left,
             top: row.bottom + 8,
@@ -6972,6 +8960,8 @@ impl App {
         let rect = client_rect(self.hwnd);
         let sidebar_width = self.sidebar_width();
         let pushed_left = sidebar_width;
+        let panel_width = self.extension_side_panel_width();
+        let right = rect.right - panel_width;
         if self.fullscreen {
             RECT {
                 left: 0,
@@ -6987,19 +8977,19 @@ impl App {
                             SidebarMode::Overlay => RECT {
                                 left: 0,
                                 top: self.topbar_pushed_height(),
-                                right: rect.right,
+                                right,
                                 bottom: rect.bottom,
                             },
                             SidebarMode::Pushed => RECT {
                                 left: pushed_left,
                                 top: self.topbar_pushed_height(),
-                                right: rect.right,
+                                right,
                                 bottom: rect.bottom,
                             },
                             _ => RECT {
                                 left: HOVER_ZONE,
                                 top: self.topbar_pushed_height(),
-                                right: rect.right,
+                                right,
                                 bottom: rect.bottom,
                             },
                         }
@@ -7007,7 +8997,7 @@ impl App {
                         RECT {
                             left: 0,
                             top: self.topbar_pushed_height(),
-                            right: rect.right,
+                            right,
                             bottom: rect.bottom,
                         }
                     }
@@ -7015,16 +9005,54 @@ impl App {
                 SidebarMode::Overlay => RECT {
                     left: 0,
                     top: self.topbar_pushed_height(),
-                    right: rect.right,
+                    right,
                     bottom: rect.bottom,
                 },
                 SidebarMode::Pushed => RECT {
                     left: pushed_left,
                     top: self.topbar_pushed_height(),
-                    right: rect.right,
+                    right,
                     bottom: rect.bottom,
                 },
             }
+        }
+    }
+
+    fn extension_side_panel_width(&self) -> i32 {
+        if self.fullscreen || self.extension_side_panel_hwnd == HWND(std::ptr::null_mut()) {
+            return 0;
+        }
+        let rect = client_rect(self.hwnd);
+        let width = (rect.right - rect.left).max(0);
+        if width < 720 {
+            0
+        } else {
+            let max_width = (width * 72 / 100).max(300);
+            self.extension_side_panel_width_override
+                .unwrap_or(EXTENSION_SIDE_PANEL_WIDTH)
+                .clamp(300, max_width)
+        }
+    }
+
+    fn resize_extension_side_panel_from_x(&mut self, x: i32) {
+        let rect = client_rect(self.hwnd);
+        let browser_width = (rect.right - rect.left).max(1);
+        let max_width = (browser_width * 72 / 100).max(300);
+        let width = (rect.right - x).clamp(300, max_width);
+        self.extension_side_panel_width_override = Some(width);
+        self.layout();
+        self.refresh();
+    }
+
+    fn extension_side_panel_rect(&self) -> RECT {
+        let rect = client_rect(self.hwnd);
+        let width = self.extension_side_panel_width();
+        let top = self.topbar_pushed_height();
+        RECT {
+            left: rect.right - width,
+            top,
+            right: rect.right,
+            bottom: rect.bottom,
         }
     }
 
@@ -7433,6 +9461,55 @@ impl App {
                 let _ = tab.controller.SetIsVisible(is_visible);
             }
         }
+        if self.extension_side_panel_hwnd != HWND(std::ptr::null_mut()) {
+            let panel_rect = self.extension_side_panel_rect();
+            let panel_visible =
+                panel_rect.right > panel_rect.left && panel_rect.bottom > panel_rect.top;
+            unsafe {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.extension_side_panel_hwnd,
+                    Some(HWND_TOP),
+                    panel_rect.left,
+                    panel_rect.top,
+                    panel_rect.right - panel_rect.left,
+                    panel_rect.bottom - panel_rect.top,
+                    WindowsAndMessaging::SWP_NOACTIVATE,
+                );
+                if panel_visible {
+                    let panel_width = (panel_rect.right - panel_rect.left).max(1);
+                    let panel_height = (panel_rect.bottom - panel_rect.top).max(1);
+                    let clip_top = if self.fullscreen || self.topbar_pushed_height() > 0 {
+                        0
+                    } else {
+                        self.topbar_height.ceil() as i32
+                    }
+                    .clamp(0, panel_height.saturating_sub(1));
+                    if clip_top > 0 {
+                        let region = CreateRectRgn(0, clip_top, panel_width, panel_height);
+                        let _ = SetWindowRgn(self.extension_side_panel_hwnd, Some(region), true);
+                    } else {
+                        let _ = SetWindowRgn(self.extension_side_panel_hwnd, None, true);
+                    }
+                } else {
+                    let _ = SetWindowRgn(self.extension_side_panel_hwnd, None, true);
+                }
+                if let Some(controller) = &self.extension_side_panel_controller {
+                    let _ = controller.SetBounds(client_rect(self.extension_side_panel_hwnd));
+                    let _ = controller.SetIsVisible(panel_visible);
+                }
+                let _ = WindowsAndMessaging::ShowWindow(
+                    self.extension_side_panel_hwnd,
+                    if panel_visible {
+                        WindowsAndMessaging::SW_SHOWNA
+                    } else {
+                        WindowsAndMessaging::SW_HIDE
+                    },
+                );
+            }
+        }
+        self.layout_extension_popup_chrome();
+        self.layout_dialog_popup();
+        self.raise_native_chrome_windows();
         unsafe {
             if self.download_popup_hwnd != HWND(std::ptr::null_mut()) && self.sidebar_width < 1.0 {
                 if let Some(toast) = &self.download_toast {
@@ -7459,6 +9536,78 @@ impl App {
             self.last_bounds_rect.set(bounds);
         }
         self.position_rename_edit();
+    }
+
+    fn raise_native_chrome_windows(&self) {
+        unsafe {
+            let flags = WindowsAndMessaging::SWP_NOMOVE
+                | WindowsAndMessaging::SWP_NOSIZE
+                | WindowsAndMessaging::SWP_NOACTIVATE;
+            if self.overlay_menu.is_some() {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.overlay_menu_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+            if self.command_open && !self.fullscreen {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.command_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.address_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+            if self.find_open && !self.fullscreen {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.find_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+            if self.download_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.download_popup_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+            if self.bookmark_popup_hwnd != HWND(std::ptr::null_mut()) {
+                let _ = WindowsAndMessaging::SetWindowPos(
+                    self.bookmark_popup_hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    flags,
+                );
+            }
+        }
     }
 
     fn paint(&self, hdc: HDC) {
@@ -7575,6 +9724,69 @@ impl App {
                 self.hover_target == Some(HoverTarget::Reload),
                 &self.fonts.toolbar_icon,
             );
+            for (idx, rect) in self.extension_action_button_rects() {
+                let hovered = self.hover_target == Some(HoverTarget::ExtensionButton(idx));
+                if let Some(ext) = self.extensions.get(idx) {
+                    let icon_handle = self.get_or_cache_extension_icon(&ext.id, &ext.icon_path);
+                    if let Some((icon_hbmp, icon_w, icon_h)) = icon_handle {
+                        if hovered {
+                            fill_round_rect(hdc, rect, COLOR_SURFACE_HOVER, 8);
+                        }
+                        let icon_rect = RECT {
+                            left: rect.left + 3,
+                            top: rect.top + 3,
+                            right: rect.right - 3,
+                            bottom: rect.bottom - 3,
+                        };
+                        let src_hdc = CreateCompatibleDC(Some(hdc));
+                        if !src_hdc.is_invalid() {
+                            let old = SelectObject(src_hdc, HGDIOBJ(icon_hbmp.0));
+                            let _ = StretchBlt(
+                                hdc,
+                                icon_rect.left,
+                                icon_rect.top,
+                                icon_rect.right - icon_rect.left,
+                                icon_rect.bottom - icon_rect.top,
+                                Some(src_hdc),
+                                0,
+                                0,
+                                icon_w,
+                                icon_h,
+                                SRCCOPY,
+                            );
+                            let _ = SelectObject(src_hdc, old);
+                            let _ = DeleteDC(src_hdc);
+                        }
+                    } else {
+                        draw_toolbar_icon_button(
+                            hdc,
+                            rect,
+                            IconKind::Extensions,
+                            hovered,
+                            &self.fonts.toolbar_icon,
+                        );
+                    }
+                } else {
+                    draw_toolbar_icon_button(
+                        hdc,
+                        rect,
+                        IconKind::Extensions,
+                        hovered,
+                        &self.fonts.toolbar_icon,
+                    );
+                }
+                if let Some((badge_text, bg_color)) = self.extension_badges.get(
+                    &self
+                        .extensions
+                        .get(idx)
+                        .map(|e| e.id.clone())
+                        .unwrap_or_default(),
+                ) {
+                    if !badge_text.is_empty() {
+                        draw_extension_badge(hdc, rect, badge_text, *bg_color);
+                    }
+                }
+            }
             draw_toolbar_icon_button(
                 hdc,
                 self.extension_button_rect(),
@@ -8170,6 +10382,62 @@ impl App {
         unsafe {
             let width = menu.rect.right - menu.rect.left;
             let height = menu.rect.bottom - menu.rect.top;
+            let (alpha, slide_y) = if let Some(closing_at) = menu.closing_at {
+                let progress = (closing_at.elapsed().as_millis() as f32 / 110.0).clamp(0.0, 1.0);
+                let ease = progress * progress;
+                (
+                    (255.0 * (1.0 - ease)).round().clamp(0.0, 255.0) as u8,
+                    (ease * -5.0).round() as i32,
+                )
+            } else {
+                let elapsed = menu.opened_at.elapsed().as_millis() as f32;
+                let progress = (elapsed / 140.0).clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - progress) * (1.0 - progress);
+                (
+                    (190.0 + 65.0 * ease).round().clamp(0.0, 255.0) as u8,
+                    ((1.0 - ease) * -6.0).round() as i32,
+                )
+            };
+            let mem_dc = CreateCompatibleDC(Some(hdc));
+            if mem_dc.is_invalid() {
+                self.paint_overlay_menu_contents(hdc, menu, width, height);
+                return;
+            }
+            let bitmap = CreateCompatibleBitmap(hdc, width, height);
+            if bitmap.is_invalid() {
+                let _ = DeleteDC(mem_dc);
+                self.paint_overlay_menu_contents(hdc, menu, width, height);
+                return;
+            }
+            let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
+            fill_rect(
+                mem_dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                },
+                COLOR_BLACK,
+            );
+            let _ = SetViewportOrgEx(mem_dc, 0, slide_y, None);
+            self.paint_overlay_menu_contents(mem_dc, menu, width, height);
+            let _ = SetViewportOrgEx(mem_dc, 0, 0, None);
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: alpha,
+                AlphaFormat: 0,
+            };
+            let _ = AlphaBlend(hdc, 0, 0, width, height, mem_dc, 0, 0, width, height, blend);
+            let _ = SelectObject(mem_dc, old_bitmap);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(mem_dc);
+        }
+    }
+
+    fn paint_overlay_menu_contents(&self, hdc: HDC, menu: &OverlayMenu, width: i32, height: i32) {
+        unsafe {
             let local_rect = RECT {
                 left: 0,
                 top: 0,
@@ -8185,17 +10453,72 @@ impl App {
                     right: width - 6,
                     bottom: 6 + (index as i32 + 1) * MENU_ROW_HEIGHT,
                 };
-                if self.hover_target.map(|_| false).unwrap_or(false) {
-                    let _ = row;
+                if self.hover_target == Some(HoverTarget::OverlayMenuRow(index))
+                    || self.hover_target == Some(HoverTarget::OverlayMenuPin(index))
+                {
+                    fill_round_rect(hdc, row, COLOR_SURFACE_HOVER, 8);
                 }
+                let text_left = if item.icon_path.is_empty() {
+                    row.left + 10
+                } else {
+                    if let Some((icon_hbmp, icon_w, icon_h)) =
+                        self.get_or_cache_extension_icon(&item.icon_key, &item.icon_path)
+                    {
+                        let icon_rect = RECT {
+                            left: row.left + 10,
+                            top: row.top + 6,
+                            right: row.left + 32,
+                            bottom: row.top + 28,
+                        };
+                        let src_hdc = CreateCompatibleDC(Some(hdc));
+                        if !src_hdc.is_invalid() {
+                            let old = SelectObject(src_hdc, HGDIOBJ(icon_hbmp.0));
+                            let _ = StretchBlt(
+                                hdc,
+                                icon_rect.left,
+                                icon_rect.top,
+                                icon_rect.right - icon_rect.left,
+                                icon_rect.bottom - icon_rect.top,
+                                Some(src_hdc),
+                                0,
+                                0,
+                                icon_w,
+                                icon_h,
+                                SRCCOPY,
+                            );
+                            let _ = SelectObject(src_hdc, old);
+                            let _ = DeleteDC(src_hdc);
+                        }
+                    } else {
+                        draw_icon_glyph(
+                            hdc,
+                            &self.fonts.toolbar_icon,
+                            IconKind::Extensions.glyph(),
+                            RECT {
+                                left: row.left + 10,
+                                top: row.top + 7,
+                                right: row.left + 30,
+                                bottom: row.top + 27,
+                            },
+                            COLOR_MUTED,
+                        );
+                    }
+                    row.left + 40
+                };
                 draw_text(
                     hdc,
                     &self.fonts.small,
                     &item.label,
                     RECT {
-                        left: row.left + 10,
+                        left: text_left,
                         top: row.top,
-                        right: row.right - 10,
+                        right: if menu.target == MenuTarget::Extensions
+                            && item.id >= MENU_EXTENSION_ITEM_BASE
+                        {
+                            row.right - 38
+                        } else {
+                            row.right - 10
+                        },
                         bottom: if item.sublabel.is_empty() {
                             row.bottom
                         } else {
@@ -8210,12 +10533,40 @@ impl App {
                         &self.fonts.small,
                         &item.sublabel,
                         RECT {
-                            left: row.left + 10,
+                            left: text_left,
                             top: row.top + 15,
                             right: row.right - 10,
                             bottom: row.bottom,
                         },
                         COLOR_MUTED,
+                    );
+                }
+                if menu.target == MenuTarget::Extensions && item.id >= MENU_EXTENSION_ITEM_BASE {
+                    let extension_index = item.id - MENU_EXTENSION_ITEM_BASE;
+                    let Some(extension) = self.extensions.get(extension_index) else {
+                        continue;
+                    };
+                    let pinned = self.pinned_extensions.contains(&extension.id);
+                    let pin_rect = overlay_menu_pin_rect(row);
+                    if self.hover_target == Some(HoverTarget::OverlayMenuPin(index)) {
+                        fill_round_rect(
+                            hdc,
+                            pin_rect,
+                            mix_color(COLOR_SURFACE_HOVER, COLOR_TEXT, 0.08),
+                            7,
+                        );
+                    }
+                    let pin_glyph = if pinned { glyph(0xE77A) } else { glyph(0xE718) };
+                    draw_icon_glyph(
+                        hdc,
+                        &self.fonts.toolbar_icon,
+                        pin_glyph.as_str(),
+                        pin_rect,
+                        if pinned {
+                            self.accent_color
+                        } else {
+                            COLOR_MUTED
+                        },
                     );
                 }
             }
@@ -8270,64 +10621,6 @@ impl App {
                     top: row.top,
                     right: row.right - 6,
                     bottom: row.bottom,
-                },
-                COLOR_MUTED,
-            );
-
-            let store_row = self.extension_store_row_rect();
-            if self.hover_target == Some(HoverTarget::ExtensionStore) {
-                fill_round_rect(hdc, store_row, COLOR_SURFACE_HOVER, 9);
-            }
-            draw_text(
-                hdc,
-                &self.fonts.small,
-                "Extension Store",
-                RECT {
-                    left: store_row.left + 12,
-                    top: store_row.top,
-                    right: store_row.right - 30,
-                    bottom: store_row.bottom,
-                },
-                COLOR_TEXT,
-            );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.icon,
-                glyph(0xE719).as_str(),
-                RECT {
-                    left: store_row.right - 28,
-                    top: store_row.top,
-                    right: store_row.right - 6,
-                    bottom: store_row.bottom,
-                },
-                COLOR_MUTED,
-            );
-
-            let extensions_row = self.extensions_page_row_rect();
-            if self.hover_target == Some(HoverTarget::ExtensionsPage) {
-                fill_round_rect(hdc, extensions_row, COLOR_SURFACE_HOVER, 9);
-            }
-            draw_text(
-                hdc,
-                &self.fonts.small,
-                "Extensions",
-                RECT {
-                    left: extensions_row.left + 12,
-                    top: extensions_row.top,
-                    right: extensions_row.right - 30,
-                    bottom: extensions_row.bottom,
-                },
-                COLOR_TEXT,
-            );
-            draw_icon_glyph(
-                hdc,
-                &self.fonts.icon,
-                glyph(0xECAA).as_str(),
-                RECT {
-                    left: extensions_row.right - 28,
-                    top: extensions_row.top,
-                    right: extensions_row.right - 6,
-                    bottom: extensions_row.bottom,
                 },
                 COLOR_MUTED,
             );
@@ -9867,6 +12160,7 @@ impl App {
         }
 
         if self.show_default_bubble && self.sidebar_width() >= sidebar_expanded() as i32 - 8 {
+        if self.show_default_bubble && !self.settings_open && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
                 if point_in_rect(x, y, close_rect) {
                     self.show_default_bubble = false;
@@ -9945,18 +12239,6 @@ impl App {
         }
 
         if self.settings_open {
-            if point_in_rect(x, y, self.extension_store_row_rect()) {
-                self.settings_open = false;
-                self.mode_menu_open = false;
-                self.open_extension_store();
-                return;
-            }
-            if point_in_rect(x, y, self.extensions_page_row_rect()) {
-                self.settings_open = false;
-                self.mode_menu_open = false;
-                self.open_extensions_page();
-                return;
-            }
             if point_in_rect(x, y, self.history_page_row_rect()) {
                 self.settings_open = false;
                 self.mode_menu_open = false;
@@ -10053,6 +12335,15 @@ impl App {
         }
         if point_in_rect(x, y, reload) {
             self.reload();
+            return;
+        }
+
+        if let Some((idx, _)) = self
+            .extension_action_button_rects()
+            .iter()
+            .find(|(_, rect)| point_in_rect(x, y, *rect))
+        {
+            self.click_extension_action_button(*idx);
             return;
         }
 
@@ -10170,6 +12461,15 @@ impl App {
         }
         if point_in_rect(x, y, forward) {
             self.open_history_menu(x, y, false);
+            return;
+        }
+
+        if let Some((idx, _)) = self
+            .extension_action_button_rects()
+            .iter()
+            .find(|(_, rect)| point_in_rect(x, y, *rect))
+        {
+            self.open_extension_context_menu(*idx, x, y);
             return;
         }
 
@@ -10332,14 +12632,17 @@ impl App {
         target: MenuTarget,
         items: Vec<OverlayMenuItem>,
     ) {
-        if items.is_empty() {
-            self.overlay_menu = None;
-            unsafe {
-                let _ = WindowsAndMessaging::ShowWindow(
-                    self.overlay_menu_hwnd,
-                    WindowsAndMessaging::SW_HIDE,
-                );
+        self.close_extension_popup();
+        if target.keeps_topbar_expanded() && !self.fullscreen {
+            if self.topbar_mode != SidebarMode::Pushed
+                && self.topbar_expand_mode != SidebarMode::Pushed
+            {
+                self.topbar_expand_mode = SidebarMode::Overlay;
+                self.set_topbar_mode(SidebarMode::Overlay);
             }
+        }
+        if items.is_empty() {
+            self.close_overlay_menu(false);
             return;
         }
         let rect = client_rect(self.hwnd);
@@ -10356,6 +12659,8 @@ impl App {
             rect: menu_rect,
             target,
             items,
+            opened_at: std::time::Instant::now(),
+            closing_at: None,
         });
 
         unsafe {
@@ -10375,8 +12680,49 @@ impl App {
             );
             let _ = InvalidateRect(Some(self.overlay_menu_hwnd), None, false);
             let _ = SetFocus(Some(self.overlay_menu_hwnd));
+            let _ = WindowsAndMessaging::SetTimer(
+                Some(self.hwnd),
+                OVERLAY_MENU_ANIM_TIMER_ID,
+                16,
+                None,
+            );
         }
+        self.raise_native_chrome_windows();
         self.refresh();
+    }
+
+    fn close_overlay_menu(&mut self, animate: bool) {
+        let Some(menu) = self.overlay_menu.as_mut() else {
+            unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(
+                    self.overlay_menu_hwnd,
+                    WindowsAndMessaging::SW_HIDE,
+                );
+            }
+            return;
+        };
+        if animate {
+            if menu.closing_at.is_none() {
+                menu.closing_at = Some(std::time::Instant::now());
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(self.overlay_menu_hwnd), None, false);
+                let _ = WindowsAndMessaging::SetTimer(
+                    Some(self.hwnd),
+                    OVERLAY_MENU_ANIM_TIMER_ID,
+                    16,
+                    None,
+                );
+            }
+        } else {
+            self.overlay_menu = None;
+            unsafe {
+                let _ = WindowsAndMessaging::ShowWindow(
+                    self.overlay_menu_hwnd,
+                    WindowsAndMessaging::SW_HIDE,
+                );
+            }
+        }
     }
 
     fn open_history_menu(&mut self, x: i32, y: i32, back: bool) {
@@ -10443,19 +12789,106 @@ impl App {
             );
         }
         if !point_in_rect(x, y, menu.rect) {
-            self.overlay_menu = None;
+            self.close_overlay_menu(true);
             self.refresh();
             return true;
         }
         let row_index = (y - menu.rect.top - 6) / MENU_ROW_HEIGHT;
         if row_index < 0 || row_index as usize >= menu.items.len() {
-            self.overlay_menu = None;
+            self.close_overlay_menu(true);
             return true;
         }
         let id = menu.items[row_index as usize].id;
-        self.overlay_menu = None;
+        if menu.target == MenuTarget::Extensions && id >= MENU_EXTENSION_ITEM_BASE {
+            let anchor = RECT {
+                left: menu.rect.left + 6,
+                top: menu.rect.top + 6 + row_index * MENU_ROW_HEIGHT,
+                right: menu.rect.right - 6,
+                bottom: menu.rect.top + 6 + (row_index + 1) * MENU_ROW_HEIGHT,
+            };
+            let offset = id - MENU_EXTENSION_ITEM_BASE;
+            let pin_rect = overlay_menu_pin_rect(anchor);
+            if point_in_rect(x, y, pin_rect) {
+                let currently_pinned = self
+                    .extensions
+                    .get(offset)
+                    .map(|extension| self.pinned_extensions.contains(&extension.id))
+                    .unwrap_or(false);
+                self.set_extension_pinned(offset, !currently_pinned);
+                self.open_extension_menu();
+                return true;
+            }
+            self.close_overlay_menu(true);
+            self.open_extension_popup_by_index(offset, anchor);
+            self.refresh();
+            return true;
+        }
+        self.close_overlay_menu(true);
         self.run_menu_command(menu.target, id);
         true
+    }
+
+    fn handle_overlay_right_click(&mut self, x: i32, y: i32) -> bool {
+        let Some(menu) = self.overlay_menu.clone() else {
+            return false;
+        };
+        if !point_in_rect(x, y, menu.rect) {
+            return false;
+        }
+        let row_index = (y - menu.rect.top - 6) / MENU_ROW_HEIGHT;
+        if row_index < 0 || row_index as usize >= menu.items.len() {
+            return true;
+        }
+        let id = menu.items[row_index as usize].id;
+        if menu.target == MenuTarget::Extensions && id >= MENU_EXTENSION_ITEM_BASE {
+            let offset = id - MENU_EXTENSION_ITEM_BASE;
+            let currently_pinned = self
+                .extensions
+                .get(offset)
+                .map(|extension| self.pinned_extensions.contains(&extension.id))
+                .unwrap_or(false);
+            self.set_extension_pinned(offset, !currently_pinned);
+            self.open_extension_menu();
+            return true;
+        }
+        true
+    }
+
+    fn handle_overlay_hover(&mut self, x: i32, y: i32) {
+        let old_target = self.hover_target;
+        self.hover_target = None;
+        let Some(menu) = self.overlay_menu.clone() else {
+            if old_target.is_some() {
+                self.refresh();
+            }
+            return;
+        };
+        if point_in_rect(x, y, menu.rect) {
+            let row_index = (y - menu.rect.top - 6) / MENU_ROW_HEIGHT;
+            if row_index >= 0 && (row_index as usize) < menu.items.len() {
+                let row = RECT {
+                    left: menu.rect.left + 6,
+                    top: menu.rect.top + 6 + row_index * MENU_ROW_HEIGHT,
+                    right: menu.rect.right - 6,
+                    bottom: menu.rect.top + 6 + (row_index + 1) * MENU_ROW_HEIGHT,
+                };
+                let item = &menu.items[row_index as usize];
+                if menu.target == MenuTarget::Extensions
+                    && item.id >= MENU_EXTENSION_ITEM_BASE
+                    && point_in_rect(x, y, overlay_menu_pin_rect(row))
+                {
+                    self.hover_target = Some(HoverTarget::OverlayMenuPin(row_index as usize));
+                } else {
+                    self.hover_target = Some(HoverTarget::OverlayMenuRow(row_index as usize));
+                }
+            }
+        }
+        if old_target != self.hover_target {
+            unsafe {
+                let _ = InvalidateRect(Some(self.overlay_menu_hwnd), None, false);
+            }
+            self.refresh();
+        }
     }
 
     fn run_menu_command(&mut self, target: MenuTarget, id: usize) {
@@ -10475,6 +12908,9 @@ impl App {
                 }
             }
             MenuTarget::Extensions => self.run_extension_menu_command(id),
+            MenuTarget::ExtensionContext(index) => {
+                self.run_extension_context_menu_command(index, id)
+            }
         }
         self.refresh();
     }
@@ -10487,9 +12923,18 @@ impl App {
                 self.extension_notice = Some("Refreshing extensions...".to_string());
                 self.refresh_extensions();
             }
-            id if (MENU_EXTENSION_ITEM_BASE..MENU_EXTENSION_ITEM_BASE + 12).contains(&id) => {
-                self.open_extensions_page();
+            id if id >= MENU_EXTENSION_ITEM_BASE => {
+                let offset = id - MENU_EXTENSION_ITEM_BASE;
+                self.open_extension_popup_by_index(offset, self.extension_button_rect());
             }
+            _ => {}
+        }
+    }
+
+    fn run_extension_context_menu_command(&mut self, extension_index: usize, id: usize) {
+        match id {
+            MENU_EXTENSION_PIN => self.set_extension_pinned(extension_index, true),
+            MENU_EXTENSION_UNPIN => self.set_extension_pinned(extension_index, false),
             _ => {}
         }
     }
@@ -10792,7 +13237,7 @@ impl App {
         self.drop_target = Some(DropTarget::None);
         self.split_drop_target = None;
 
-        if self.show_default_bubble && self.sidebar_width() >= sidebar_expanded() as i32 - 8 {
+        if self.show_default_bubble && !self.settings_open && self.sidebar_width() >= 240 {
             if let Some(close_rect) = self.default_bubble_close_rect() {
                 if point_in_rect(x, y, close_rect) {
                     self.hover_target = Some(HoverTarget::DefaultBubbleClose);
@@ -10894,6 +13339,12 @@ impl App {
                     self.hover_target = Some(HoverTarget::Forward);
                 } else if point_in_rect(x, y, reload) {
                     self.hover_target = Some(HoverTarget::Reload);
+                } else if let Some((idx, _)) = self
+                    .extension_action_button_rects()
+                    .iter()
+                    .find(|(_, rect)| point_in_rect(x, y, *rect))
+                {
+                    self.hover_target = Some(HoverTarget::ExtensionButton(*idx));
                 } else if point_in_rect(x, y, self.extension_button_rect()) {
                     self.hover_target = Some(HoverTarget::ExtensionsButton);
                 } else if point_in_rect(x, y, self.address_menu_rect()) {
@@ -10923,16 +13374,6 @@ impl App {
                         Some(id) => Some(HoverTarget::DownloadIndicator(id)),
                         None => Some(HoverTarget::DownloadOverflow),
                     };
-                } else if self.settings_open
-                    && point_in_rect(x, y, self.extension_store_row_rect())
-                {
-                    self.hover_target = Some(HoverTarget::ExtensionStore);
-                    self.mode_menu_open = false;
-                } else if self.settings_open
-                    && point_in_rect(x, y, self.extensions_page_row_rect())
-                {
-                    self.hover_target = Some(HoverTarget::ExtensionsPage);
-                    self.mode_menu_open = false;
                 } else if self.settings_open && point_in_rect(x, y, self.history_page_row_rect()) {
                     self.hover_target = Some(HoverTarget::HistoryPage);
                     self.mode_menu_open = false;
@@ -10990,6 +13431,7 @@ impl App {
         }
 
         if self.show_default_bubble && self.sidebar_width() >= sidebar_expanded() as i32 - 8 {
+        if self.show_default_bubble && !self.settings_open && self.sidebar_width() >= 240 {
             if let Some(bubble_rect) = self.default_bubble_rect() {
                 if point_in_rect(x, y, bubble_rect) {
                     self.hover_tab = None;
@@ -11597,6 +14039,16 @@ impl App {
     }
 
     fn set_sidebar_mode(&mut self, mode: SidebarMode) {
+        let target = match mode {
+            SidebarMode::Hidden => SIDEBAR_HIDDEN,
+            SidebarMode::Overlay | SidebarMode::Pushed => SIDEBAR_EXPANDED,
+        };
+        if (self.sidebar_target - target).abs() < 0.5
+            && self.sidebar_expand_mode == mode
+            && (self.animating_sidebar || self.sidebar_mode == mode)
+        {
+            return;
+        }
         if mode != SidebarMode::Hidden {
             if let Some(toast) = &mut self.download_toast {
                 toast.fading = true;
@@ -11616,10 +14068,17 @@ impl App {
     }
 
     fn set_topbar_mode(&mut self, mode: SidebarMode) {
-        self.topbar_target = match mode {
+        let target = match mode {
             SidebarMode::Hidden => TOPBAR_HIDDEN,
             SidebarMode::Overlay | SidebarMode::Pushed => TOPBAR_EXPANDED,
         };
+        if (self.topbar_target - target).abs() < 0.5
+            && self.topbar_expand_mode == mode
+            && (self.animating_topbar || self.topbar_mode == mode)
+        {
+            return;
+        }
+        self.topbar_target = target;
         self.animating_topbar = true;
         unsafe {
             if mode != SidebarMode::Hidden && self.sidebar_mode != SidebarMode::Hidden {
@@ -11671,10 +14130,6 @@ impl App {
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
-        self.layout();
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
-        }
     }
 
     fn tick_topbar_animation(&mut self) {
@@ -11721,6 +14176,7 @@ impl App {
 
     fn clear_webview_clipping(&self) {
         self.last_clip_width.set(0.0);
+        self.last_clip_top.set(0.0);
         for tab in &self.tabs {
             unsafe {
                 let _ = SetWindowRgn(tab.child_hwnd, None, false);
@@ -11917,6 +14373,7 @@ impl App {
 }
 
 fn main() -> AppResult<()> {
+    apply_aster_process_branding();
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     }
@@ -11971,11 +14428,19 @@ fn main() -> AppResult<()> {
             app.request_missing_favicons();
             app.refresh_extensions();
         });
-        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOW);
+        if !WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() {
+            let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOW);
+        }
         let _ = Gdi::UpdateWindow(hwnd);
     }
 
     message_loop()
+}
+
+fn apply_aster_process_branding() {
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID);
+    }
 }
 
 fn profile_path() -> String {
@@ -11997,6 +14462,8 @@ fn create_environment() -> AppResult<ICoreWebView2Environment> {
             let path = profile_path();
             let user_data = CoTaskMemPWSTR::from(path.as_str());
             let options = CoreWebView2EnvironmentOptions::default();
+            options
+                .set_additional_browser_arguments(format!("--user-agent=\"{}\"", ASTER_USER_AGENT));
             options.set_are_browser_extensions_enabled(true);
             CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),
@@ -12044,6 +14511,9 @@ fn configure_webview(webview: &ICoreWebView2) -> AppResult<()> {
         settings.SetAreDefaultScriptDialogsEnabled(true)?;
         settings.SetAreDevToolsEnabled(true)?;
         settings.SetIsStatusBarEnabled(false)?;
+        let settings2: ICoreWebView2Settings2 = settings.cast()?;
+        let user_agent = CoTaskMemPWSTR::from(ASTER_USER_AGENT);
+        settings2.SetUserAgent(*user_agent.as_ref().as_pcwstr())?;
         let settings3: ICoreWebView2Settings3 = settings.cast()?;
         settings3.SetAreBrowserAcceleratorKeysEnabled(true)?;
     }
@@ -12309,6 +14779,33 @@ fn create_download_popup(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+fn create_extension_install_popup(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE(0x00080000 | 0x00000080 | 0x08000000), // WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            w!("STATIC"),
+            w!(""),
+            WS_POPUP | WS_VISIBLE,
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        let _ = WindowsAndMessaging::SetWindowLongPtrW(hwnd, GWLP_USERDATA, parent.0 as isize);
+        OLD_EXTENSION_INSTALL_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            extension_install_popup_proc as *const () as isize,
+        ));
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_HIDE);
+        Ok(hwnd)
+    }
+}
+
 fn create_bookmark_popup(parent: HWND) -> AppResult<HWND> {
     unsafe {
         let hwnd = WindowsAndMessaging::CreateWindowExW(
@@ -12335,6 +14832,641 @@ fn create_bookmark_popup(parent: HWND) -> AppResult<HWND> {
     }
 }
 
+fn create_dialog_popup_window(parent: HWND) -> AppResult<HWND> {
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE(0x00000080 /* WS_EX_TOOLWINDOW */),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_POPUP.0),
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_DIALOG_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            dialog_popup_proc as *const () as isize,
+        ));
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_HIDE);
+        Ok(hwnd)
+    }
+}
+
+unsafe extern "system" fn dialog_popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CLOSE => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    app.close_dialog_popup(false);
+                });
+            }
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_DIALOG_POPUP_PROC, hwnd, msg, w_param, l_param)
+}
+
+fn url_domain(url: &str) -> Option<String> {
+    let clean = url.trim();
+    let without_scheme = if let Some(stripped) = clean.strip_prefix("https://") {
+        stripped
+    } else if let Some(stripped) = clean.strip_prefix("http://") {
+        stripped
+    } else {
+        clean
+    };
+    let mut parts = without_scheme.split('/');
+    let host = parts.next()?;
+    let mut host_parts = host.split(':');
+    Some(host_parts.next()?.to_string())
+}
+
+fn get_mime_type(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "image/png"
+    }
+}
+
+fn get_extension_icon_as_base64(extension_path: &str, icon_rel_path: &str) -> Option<String> {
+    let clean_rel = icon_rel_path.trim_start_matches('/');
+    let full_path = Path::new(extension_path).join(clean_rel);
+    if let Ok(data) = fs::read(&full_path) {
+        let mime = get_mime_type(clean_rel);
+        let b64 = general_purpose::STANDARD.encode(&data);
+        Some(format!("data:{};base64,{}", mime, b64))
+    } else {
+        None
+    }
+}
+
+fn get_manifest_info(path: &str) -> Option<(String, String, Vec<String>, Option<String>)> {
+    let manifest_path = Path::new(path).join("manifest.json");
+    let content = fs::read_to_string(manifest_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let default_locale = json.get("default_locale").and_then(|v| v.as_str()).unwrap_or("en");
+    let name_raw = json["name"].as_str().unwrap_or("Extension").to_string();
+    let description_raw = json["description"].as_str().unwrap_or("").to_string();
+    let name = resolve_manifest_text(Path::new(path), &name_raw, default_locale);
+    let description = resolve_manifest_text(Path::new(path), &description_raw, default_locale);
+    let mut permissions = Vec::new();
+    if let Some(perms_arr) = json["permissions"].as_array() {
+        for val in perms_arr {
+            if let Some(p) = val.as_str() {
+                permissions.push(p.to_string());
+            }
+        }
+    }
+    if let Some(host_arr) = json["host_permissions"].as_array() {
+        for val in host_arr {
+            if let Some(p) = val.as_str() {
+                permissions.push(p.to_string());
+            }
+        }
+    }
+    let icon_path = pick_best_icon(
+        json.get("icons"),
+        json.get("action")
+            .or_else(|| json.get("browser_action"))
+            .and_then(|a| a.get("default_icon")),
+        path,
+    );
+    let icon_base64 = if !icon_path.is_empty() {
+        get_extension_icon_as_base64(path, &icon_path)
+    } else {
+        None
+    };
+    Some((name, description, permissions, icon_base64))
+}
+
+fn translate_permissions(permissions: &[String]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut has_all_urls = false;
+    let mut hosts = Vec::new();
+
+    for p in permissions {
+        match p.as_str() {
+            "activeTab" => {} // No warning
+            "bookmarks" => warnings.push("Read and modify your bookmarks".to_string()),
+            "clipboardRead" | "clipboardWrite" => {
+                let w = "Read and modify data you copy and paste".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            "contentSettings" => warnings.push("Modify settings that control websites' access to features such as cookies, JavaScript, and plugins".to_string()),
+            "cookies" => {
+                let w = "Read and modify your browsing history and data".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            "declarativeNetRequest" | "declarativeNetRequestWithHostAccess" => {
+                warnings.push("Block content on any page".to_string());
+            }
+            "desktopCapture" => warnings.push("Capture content of your screen".to_string()),
+            "downloads" => warnings.push("Manage your downloads".to_string()),
+            "geolocation" => warnings.push("Detect your physical location".to_string()),
+            "history" => warnings.push("Read and modify your browsing history".to_string()),
+            "management" => warnings.push("Manage your apps, extensions, and themes".to_string()),
+            "nativeMessaging" => warnings.push("Communicate with cooperating native applications".to_string()),
+            "notifications" => warnings.push("Display notifications".to_string()),
+            "pageCapture" => warnings.push("Save pages as MHTML".to_string()),
+            "privacy" => warnings.push("Modify privacy-related settings".to_string()),
+            "proxy" => warnings.push("Proxy your internet traffic".to_string()),
+            "tabGroups" => warnings.push("Manage your tab groups".to_string()),
+            "tabs" => {
+                let w = "Read your browsing history".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            "topSites" => warnings.push("Read and modify your most frequently visited websites".to_string()),
+            "webNavigation" => {
+                let w = "Read and modify your browsing history".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            other => {
+                if other == "<all_urls>" || other == "*://*/*" || other == "http://*/*" || other == "https://*/*" {
+                    has_all_urls = true;
+                } else if other.contains("://") || other.starts_with("*.") {
+                    hosts.push(other.to_string());
+                }
+            }
+        }
+    }
+
+    if has_all_urls {
+        warnings.push("Read and modify all your data on all websites".to_string());
+    } else if !hosts.is_empty() {
+        if hosts.len() <= 3 {
+            let joined_hosts = hosts.join(", ");
+            warnings.push(format!("Read and modify your data on {}", joined_hosts));
+        } else {
+            warnings.push("Read and modify your data on several websites".to_string());
+        }
+    }
+
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+
+fn dialog_popup_html(
+    icon_svg: &str,
+    title: &str,
+    subtitle: &str,
+    body_html: &str,
+    buttons_html: &str,
+    accent: &str,
+    dominant: &str,
+    secondary: &str,
+) -> String {
+    format!(
+        r##"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aster Dialog</title>
+<style>
+:root {{
+  --accent: {accent};
+  --bg: {dominant};
+  --secondary: {secondary};
+  --text: #f5f5f5;
+  --muted: #a1a1a1;
+}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: transparent;
+  color: var(--text);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  width: 100vw;
+}}
+.dialog-container {{
+  background: rgba(22, 22, 22, 0.85);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  width: calc(100% - 24px);
+  height: calc(100% - 24px);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  animation: slide-in 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  padding: 16px;
+}}
+@keyframes slide-in {{
+  from {{ transform: translateY(-10px); opacity: 0; }}
+  to {{ transform: translateY(0); opacity: 1; }}
+}}
+.header {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  width: 100%;
+}}
+.icon-box {{
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}}
+.icon-box svg {{
+  width: 20px;
+  height: 20px;
+  fill: var(--accent);
+}}
+.icon-box img {{
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  border-radius: 4px;
+}}
+.titles {{
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+  flex-grow: 1;
+}}
+.title {{
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}}
+.subtitle {{
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}}
+.content-body {{
+  flex-grow: 1;
+  font-size: 11.5px;
+  color: #e0e0e0;
+  overflow-y: auto;
+  margin-bottom: 12px;
+  padding-right: 4px;
+  line-height: 1.4;
+}}
+.content-body::-webkit-scrollbar {{
+  width: 4px;
+}}
+.content-body::-webkit-scrollbar-thumb {{
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}}
+.permissions-list {{
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}}
+.permission-item {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+}}
+.actions {{
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}}
+.btn {{
+  border: 0;
+  outline: 0;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}}
+.btn-primary {{
+  background: var(--accent);
+  color: #ffffff;
+}}
+.btn-primary:hover {{
+  filter: brightness(1.1);
+  transform: translateY(-1px);
+}}
+.btn-secondary {{
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}}
+.btn-secondary:hover {{
+  background: rgba(255, 255, 255, 0.1);
+  transform: translateY(-1px);
+}}
+.btn-danger {{
+  background: #ff4a4a;
+  color: #ffffff;
+}}
+.btn-danger:hover {{
+  filter: brightness(1.1);
+  transform: translateY(-1px);
+}}
+.prompt-input {{
+  width: 100%;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  margin-top: 8px;
+}}
+.prompt-input:focus {{
+  border-color: var(--accent);
+}}
+</style>
+</head>
+<body>
+<div class="dialog-container">
+  <div class="header">
+    <div class="icon-box">
+      {icon_svg}
+    </div>
+    <div class="titles">
+      <div class="title">{title}</div>
+      <div class="subtitle">{subtitle}</div>
+    </div>
+  </div>
+  <div class="content-body">
+    {body_html}
+  </div>
+  <div class="actions">
+    {buttons_html}
+  </div>
+</div>
+<script>
+const post = (msg) => window.chrome?.webview?.postMessage(msg);
+</script>
+</body>
+</html>"##,
+        accent = accent,
+        dominant = dominant,
+        secondary = secondary,
+        icon_svg = icon_svg,
+        title = html_escape_text(title),
+        subtitle = html_escape_text(subtitle),
+        body_html = body_html,
+        buttons_html = buttons_html
+    )
+}
+
+fn create_extension_popup_window(parent: HWND, btn_rect: RECT, pushed_top: i32) -> AppResult<HWND> {
+    let (popup_w, popup_h) = extension_popup_size_for_content(parent, pushed_top, 420, 560);
+    let (x, y) = extension_popup_position(parent, btn_rect, pushed_top, popup_w, popup_h);
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE(0x00000080 /* WS_EX_TOOLWINDOW */),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_POPUP.0),
+            x,
+            y,
+            popup_w,
+            popup_h,
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_EXTENSION_POPUP_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            extension_popup_proc as *const () as isize,
+        ));
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOWNA);
+        Ok(hwnd)
+    }
+}
+
+fn extension_popup_size_for_content(
+    parent: HWND,
+    pushed_top: i32,
+    content_w: i32,
+    content_h: i32,
+) -> (i32, i32) {
+    let client = client_rect(parent);
+    let max_w = (client.right - client.left - 16).max(240);
+    let max_h = (client.bottom - client.top - pushed_top - 16).max(180);
+    let width = content_w.clamp(240, max_w);
+    let height = content_h.clamp(180, max_h);
+    (width, height)
+}
+
+fn extension_popup_position(
+    parent: HWND,
+    _btn_rect: RECT,
+    pushed_top: i32,
+    popup_w: i32,
+    popup_h: i32,
+) -> (i32, i32) {
+    unsafe {
+        let client = client_rect(parent);
+        let mut client_top_left = POINT {
+            x: client.left,
+            y: client.top,
+        };
+        let mut client_bottom_right = POINT {
+            x: client.right,
+            y: client.bottom,
+        };
+        let _ = Gdi::ClientToScreen(parent, &mut client_top_left);
+        let _ = Gdi::ClientToScreen(parent, &mut client_bottom_right);
+        let min_x = client_top_left.x + 8;
+        let max_x = (client_bottom_right.x - popup_w - 8).max(min_x);
+        let min_y = client_top_left.y + pushed_top + 8;
+        let max_y = (client_bottom_right.y - popup_h - 8).max(min_y);
+        let x = max_x;
+        let y = min_y.clamp(min_y, max_y);
+        (x, y)
+    }
+}
+
+fn create_extension_side_panel_window(parent: HWND) -> AppResult<HWND> {
+    let rect = client_rect(parent);
+    unsafe {
+        let hwnd = WindowsAndMessaging::CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0),
+            rect.right - EXTENSION_SIDE_PANEL_WIDTH,
+            0,
+            EXTENSION_SIDE_PANEL_WIDTH,
+            rect.bottom.max(1),
+            Some(parent),
+            None,
+            Some(HINSTANCE(LibraryLoader::GetModuleHandleW(None)?.0)),
+            None,
+        )?;
+        OLD_EXTENSION_SIDE_PANEL_PROC = mem::transmute(WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            extension_side_panel_proc as *const () as isize,
+        ));
+        let _ = WindowsAndMessaging::ShowWindow(hwnd, WindowsAndMessaging::SW_SHOWNA);
+        Ok(hwnd)
+    }
+}
+
+unsafe extern "system" fn extension_side_panel_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_LBUTTONDOWN => {
+            if loword(l_param.0 as u32) as i32 <= 8 {
+                if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                    with_app(parent, |app| {
+                        app.extension_side_panel_resizing = true;
+                    });
+                    let _ = SetCapture(hwnd);
+                    return LRESULT(0);
+                }
+            }
+        }
+        WM_MOUSEMOVE => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                let x = loword(l_param.0 as u32) as i32;
+                let mut resizing = false;
+                with_app(parent, |app| {
+                    resizing = app.extension_side_panel_resizing;
+                });
+                if resizing {
+                    let mut pt = POINT {
+                        x,
+                        y: hiword(l_param.0 as u32) as i32,
+                    };
+                    let _ = Gdi::ClientToScreen(hwnd, &mut pt);
+                    let _ = ScreenToClient(parent, &mut pt);
+                    with_app(parent, |app| app.resize_extension_side_panel_from_x(pt.x));
+                    return LRESULT(0);
+                }
+            }
+        }
+        WM_LBUTTONUP => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if app.extension_side_panel_resizing {
+                        app.extension_side_panel_resizing = false;
+                        app.save_state();
+                    }
+                });
+                let _ = ReleaseCapture();
+                return LRESULT(0);
+            }
+        }
+        WM_SETCURSOR => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                let mut pt = POINT::default();
+                let mut show_resize = false;
+                if GetCursorPos(&mut pt).is_ok() {
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                    with_app(parent, |app| {
+                        show_resize = app.extension_side_panel_resizing || pt.x <= 8;
+                    });
+                }
+                if show_resize {
+                    if let Ok(cursor) = WindowsAndMessaging::LoadCursorW(None, IDC_SIZEWE) {
+                        WindowsAndMessaging::SetCursor(Some(cursor));
+                        return LRESULT(1);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_EXTENSION_SIDE_PANEL_PROC, hwnd, msg, w_param, l_param)
+}
+
+unsafe extern "system" fn extension_popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ACTIVATE => {
+            if loword(w_param.0 as u32) == 0 {
+                if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                    with_app(parent, |app| {
+                        app.close_extension_popup();
+                        app.refresh();
+                    });
+                }
+                return LRESULT(0);
+            }
+        }
+        WM_CLOSE => {
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    app.close_extension_popup();
+                    app.refresh();
+                });
+            }
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    WindowsAndMessaging::CallWindowProcW(OLD_EXTENSION_POPUP_PROC, hwnd, msg, w_param, l_param)
+}
+
 unsafe extern "system" fn overlay_menu_proc(
     hwnd: HWND,
     msg: u32,
@@ -12356,6 +15488,18 @@ unsafe extern "system" fn overlay_menu_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEMOVE => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some(menu) = &app.overlay_menu {
+                        app.handle_overlay_hover(x + menu.rect.left, y + menu.rect.top);
+                    }
+                });
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
             let x = loword(l_param.0 as u32) as i16 as i32;
             let y = hiword(l_param.0 as u32) as i16 as i32;
@@ -12370,14 +15514,50 @@ unsafe extern "system" fn overlay_menu_proc(
             }
             LRESULT(0)
         }
+        WM_RBUTTONDOWN => {
+            let x = loword(l_param.0 as u32) as i16 as i32;
+            let y = hiword(l_param.0 as u32) as i16 as i32;
+            if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
+                with_app(parent, |app| {
+                    if let Some(menu) = &app.overlay_menu {
+                        let parent_x = x + menu.rect.left;
+                        let parent_y = y + menu.rect.top;
+                        let _ = app.handle_overlay_right_click(parent_x, parent_y);
+                    }
+                });
+            }
+            LRESULT(0)
+        }
         WindowsAndMessaging::WM_KILLFOCUS => {
             if let Ok(parent) = WindowsAndMessaging::GetParent(hwnd) {
                 with_app(parent, |app| {
-                    app.overlay_menu = None;
-                    let _ = WindowsAndMessaging::ShowWindow(
-                        app.overlay_menu_hwnd,
-                        WindowsAndMessaging::SW_HIDE,
-                    );
+                    let keep_open = app
+                        .overlay_menu
+                        .as_ref()
+                        .map(|menu| {
+                            if !menu.target.keeps_topbar_expanded() {
+                                return false;
+                            }
+                            let mut pt = POINT::default();
+                            if GetCursorPos(&mut pt).is_err()
+                                || !ScreenToClient(parent, &mut pt).as_bool()
+                            {
+                                return false;
+                            }
+                            let topbar_rect = RECT {
+                                left: 0,
+                                top: app.topbar_y(),
+                                right: client_rect(parent).right,
+                                bottom: app.topbar_y() + TOPBAR_HEIGHT,
+                            };
+                            point_in_rect(pt.x, pt.y, menu.rect)
+                                || point_in_rect(pt.x, pt.y, topbar_rect)
+                        })
+                        .unwrap_or(false);
+                    if keep_open {
+                        return;
+                    }
+                    app.close_overlay_menu(true);
                     app.refresh();
                 });
             }
@@ -12782,6 +15962,45 @@ unsafe extern "system" fn download_popup_proc(
     }
 }
 
+unsafe extern "system" fn extension_install_popup_proc(
+    hwnd: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let parent =
+                HWND(WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut _);
+            if parent != HWND(std::ptr::null_mut()) {
+                with_app(parent, |app| {
+                    if app.extension_install_flight_frame().is_some() {
+                        let rect = client_rect(hwnd);
+                        let elapsed = app
+                            .extension_install_flight
+                            .as_ref()
+                            .map(|flight| flight.start_time.elapsed().as_millis() as u64)
+                            .unwrap_or(0);
+                        draw_download_popup_gdi(hdc, rect, elapsed);
+                    }
+                });
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => WindowsAndMessaging::CallWindowProcW(
+            OLD_EXTENSION_INSTALL_POPUP_PROC,
+            hwnd,
+            msg,
+            w_param,
+            l_param,
+        ),
+    }
+}
+
 unsafe extern "system" fn bookmark_popup_proc(
     hwnd: HWND,
     msg: u32,
@@ -12827,6 +16046,59 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                 unsafe {
                     let result = *Box::from_raw(ptr);
                     with_app(hwnd, |app| app.complete_favicon_fetch(result));
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == EXTENSION_PACKAGE_READY_MSG => {
+            let ptr = w_param.0 as *mut ExtensionCrxResult;
+            if !ptr.is_null() {
+                unsafe {
+                    let result = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.complete_extension_install(result));
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == WEBVIEW_MESSAGE_MSG => {
+            let ptr = w_param.0 as *mut String;
+            if !ptr.is_null() {
+                unsafe {
+                    let message = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.handle_settings_message(&message));
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == NEW_WINDOW_REQUESTED_MSG => {
+            let ptr = w_param.0 as *mut String;
+            if !ptr.is_null() {
+                unsafe {
+                    let url = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| {
+                        let _ = app.create_tab(&url);
+                        app.refresh();
+                    });
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == WEBVIEW_PROCESS_FAILED_MSG => {
+            let ptr = w_param.0 as *mut WebViewProcessFailure;
+            if !ptr.is_null() {
+                unsafe {
+                    let failure = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.handle_webview_process_failure(failure));
+                }
+            }
+            LRESULT(0)
+        }
+        msg if msg == EXTENSION_FOLDER_PICKED_MSG => {
+            let ptr = w_param.0 as *mut String;
+            if !ptr.is_null() {
+                unsafe {
+                    let folder = *Box::from_raw(ptr);
+                    with_app(hwnd, |app| app.handle_extension_folder_picked(folder));
                 }
             }
             LRESULT(0)
@@ -12946,11 +16218,16 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                     let split_layout = app.split_layout_button_rect();
                     let split_unsplit = app.split_unsplit_button_rect();
 
+                    let has_ext_buttons = app
+                        .extension_action_button_rects()
+                        .iter()
+                        .any(|(_, r)| point_in_rect(pt.x, pt.y, *r));
                     if point_in_rect(pt.x, pt.y, logo)
                         || point_in_rect(pt.x, pt.y, new_tab)
                         || point_in_rect(pt.x, pt.y, back)
                         || point_in_rect(pt.x, pt.y, forward)
                         || point_in_rect(pt.x, pt.y, reload)
+                        || has_ext_buttons
                         || point_in_rect(pt.x, pt.y, extensions)
                         || point_in_rect(pt.x, pt.y, address)
                         || split_layout
@@ -13182,9 +16459,50 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
                         if app.download_popup_hwnd != HWND(std::ptr::null_mut()) {
                             let _ = InvalidateRect(Some(app.download_popup_hwnd), None, false);
                         }
+                        if app.extension_install_popup_hwnd != HWND(std::ptr::null_mut()) {
+                            let _ =
+                                InvalidateRect(Some(app.extension_install_popup_hwnd), None, false);
+                        }
                         if app.bookmark_popup_hwnd != HWND(std::ptr::null_mut()) {
                             let _ = InvalidateRect(Some(app.bookmark_popup_hwnd), None, false);
                         }
+                    }
+                });
+                return LRESULT(0);
+            }
+            if w_param.0 == OVERLAY_MENU_ANIM_TIMER_ID {
+                with_app(hwnd, |app| unsafe {
+                    let mut keep_animating = false;
+                    let mut finish_close = false;
+                    if let Some(menu) = app.overlay_menu.as_ref() {
+                        if let Some(closing_at) = menu.closing_at {
+                            if closing_at.elapsed().as_millis() < 130 {
+                                keep_animating = true;
+                            } else {
+                                finish_close = true;
+                            }
+                        } else if menu.opened_at.elapsed().as_millis() < 180 {
+                            keep_animating = true;
+                        }
+                    }
+                    if finish_close {
+                        app.overlay_menu = None;
+                        let _ = WindowsAndMessaging::ShowWindow(
+                            app.overlay_menu_hwnd,
+                            WindowsAndMessaging::SW_HIDE,
+                        );
+                    }
+                    if keep_animating {
+                        let _ = InvalidateRect(Some(app.overlay_menu_hwnd), None, false);
+                    } else if !finish_close {
+                        let _ =
+                            InvalidateRect(Some(app.overlay_menu_hwnd), None, false);
+                    }
+                    if !keep_animating {
+                        let _ = WindowsAndMessaging::KillTimer(
+                            Some(app.hwnd),
+                            OVERLAY_MENU_ANIM_TIMER_ID,
+                        );
                     }
                 });
                 return LRESULT(0);
@@ -13382,6 +16700,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: L
         },
         WM_CLOSE => {
             unsafe {
+                with_app(hwnd, |app| app.save_state());
                 let _ = WindowsAndMessaging::DestroyWindow(hwnd);
             }
             LRESULT(0)
@@ -13630,6 +16949,43 @@ fn draw_toolbar_icon_button(
             },
             if hovered { COLOR_TEXT } else { COLOR_MUTED },
         );
+    }
+}
+
+fn draw_extension_badge(hdc: HDC, rect: RECT, text: &str, bg: u32) {
+    unsafe {
+        if text.is_empty() {
+            return;
+        }
+        let bg = if bg == 0 { 0xFF0000 } else { bg };
+        let small_font = create_font(9, 700);
+        if let Ok(font) = small_font {
+            let badge_w = (rect.right - rect.left).min(20).max(12);
+            let badge_h = 10;
+            let badge_x = rect.right - badge_w;
+            let badge_y = rect.top;
+            let mut badge_rect = RECT {
+                left: badge_x,
+                top: badge_y,
+                right: badge_x + badge_w,
+                bottom: badge_y + badge_h,
+            };
+            fill_round_rect(hdc, badge_rect, bg, 5);
+            let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let _ = SetTextColor(hdc, COLORREF(0xFFFFFF));
+            let display = if text.len() > 3 { &text[..3] } else { text };
+            let mut wide = to_wide(display);
+            let text_len = wide.len().saturating_sub(1);
+            let _ = DrawTextW(
+                hdc,
+                &mut wide[..text_len],
+                &mut badge_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            let _ = SelectObject(hdc, old_font);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
     }
 }
 
@@ -14778,7 +18134,389 @@ fn download_url_to_cache(url: &str) -> Option<String> {
     }
 }
 
-fn render_glyph_favicon<C: ColorValue>(
+fn pick_extension_folder(parent: HWND) -> Option<String> {
+    use std::ffi::c_void;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHBrowseForFolderW(lpbi: *const BrowseInfoW) -> *mut c_void;
+        fn SHGetPathFromIDListW(pidl: *const c_void, pszPath: *mut u16) -> i32;
+    }
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct BrowseInfoW {
+        hwndOwner: HWND,
+        pidlRoot: *const c_void,
+        pszDisplayName: *mut u16,
+        lpszTitle: *const u16,
+        ulFlags: u32,
+        lpfn: Option<unsafe extern "system" fn(HWND, u32, isize, isize) -> isize>,
+        lParam: isize,
+        iImage: i32,
+    }
+    let mut display_buf = [0u16; 260];
+    let title = to_wide("Select the extension folder");
+    let bi = BrowseInfoW {
+        hwndOwner: parent,
+        pidlRoot: ptr::null(),
+        pszDisplayName: display_buf.as_mut_ptr(),
+        lpszTitle: title.as_ptr(),
+        ulFlags: 0x00000001,
+        lpfn: None,
+        lParam: 0,
+        iImage: 0,
+    };
+    unsafe {
+        let pidl = SHBrowseForFolderW(&bi);
+        if pidl.is_null() {
+            return None;
+        }
+        let mut path_buf = [0u16; 260];
+        if SHGetPathFromIDListW(pidl, path_buf.as_mut_ptr()) != 0 {
+            let len = path_buf
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(path_buf.len());
+            let path = String::from_utf16_lossy(&path_buf[..len]);
+            CoTaskMemFree(Some(pidl as *const _));
+            if !path.is_empty() {
+                return Some(path);
+            }
+        } else {
+            CoTaskMemFree(Some(pidl as *const _));
+        }
+        None
+    }
+}
+
+fn extension_store_assist_script(accent_color: u32, extensions: &[BrowserExtensionInfo]) -> String {
+    EXTENSION_STORE_ASSIST_SCRIPT
+        .replace("__ASTER_ACCENT__", &colorref_to_css(accent_color))
+        .replace("__CHROME_VERSION__", CHROME_COMPAT_VERSION)
+        .replace("__ASTER_USER_AGENT__", ASTER_USER_AGENT)
+        .replace(
+            "__ASTER_INSTALLED_EXTENSION_IDS__",
+            &installed_extension_ids_json(extensions),
+        )
+}
+
+fn extension_host_script(extension_id: &str, side_panel_path: &str) -> String {
+    format!(
+        r#"
+(() => {{
+  if (window.__asterExtensionHostInstalled) return;
+  window.__asterExtensionHostInstalled = true;
+  const extensionId = {};
+  const defaultSidePanelPath = {};
+  const post = (message) => window.chrome?.webview?.postMessage?.(message);
+  let sidePanelPath = defaultSidePanelPath;
+  let sizeQueued = false;
+  const postPopupSize = () => {{
+    if (sizeQueued) return;
+    sizeQueued = true;
+    requestAnimationFrame(() => {{
+      sizeQueued = false;
+      const body = document.body;
+      const root = document.documentElement;
+      const rects = Array.from(document.body ? document.body.querySelectorAll("*") : []).slice(0, 800).map((el) => el.getBoundingClientRect()).filter((rect) => rect.width || rect.height);
+      const extent = rects.reduce((next, rect) => {{
+        next.right = Math.max(next.right, rect.right);
+        next.bottom = Math.max(next.bottom, rect.bottom);
+        return next;
+      }}, {{ right: 0, bottom: 0 }});
+      const width = Math.max(root?.scrollWidth || 0, body?.scrollWidth || 0, root?.offsetWidth || 0, body?.offsetWidth || 0, Math.ceil(extent.right));
+      const height = Math.max(root?.scrollHeight || 0, body?.scrollHeight || 0, root?.offsetHeight || 0, body?.offsetHeight || 0, Math.ceil(extent.bottom));
+      if (width || height) post(`extensions:popup-size:${{extensionId}}:${{Math.ceil(width)}}:${{Math.ceil(height)}}`);
+    }});
+  }};
+  const openPanel = (path) => {{
+    if (typeof path === "string" && path.trim()) sidePanelPath = path.trim();
+    if (sidePanelPath) {{
+      post(`extensions:open-side-panel:${{encodeURIComponent(extensionId)}}:${{encodeURIComponent(sidePanelPath)}}`);
+    }} else {{
+      post(`extensions:open-side-panel:${{encodeURIComponent(extensionId)}}`);
+    }}
+  }};
+  const installSidePanelBridge = () => {{
+    const chromeObject = window.chrome || {{}};
+    const original = chromeObject.sidePanel || {{}};
+    const behavior = {{ openPanelOnActionClick: false }};
+    const sidePanel = Object.assign(Object.create(Object.getPrototypeOf(original) || Object.prototype), original);
+    sidePanel.open = (options, callback) => {{
+      openPanel(options && typeof options.path === "string" ? options.path : sidePanelPath);
+      if (typeof callback === "function") setTimeout(callback, 0);
+      return Promise.resolve();
+    }};
+    sidePanel.close = (options, callback) => {{
+      if (typeof callback === "function") setTimeout(callback, 0);
+      return Promise.resolve();
+    }};
+    sidePanel.setOptions = (options, callback) => {{
+      if (options && typeof options.path === "string" && options.path.trim()) sidePanelPath = options.path.trim();
+      if (typeof callback === "function") setTimeout(callback, 0);
+      return Promise.resolve();
+    }};
+    sidePanel.getOptions = (options, callback) => {{
+      const value = {{ enabled: true, path: sidePanelPath || defaultSidePanelPath || "" }};
+      if (typeof callback === "function") setTimeout(() => callback(value), 0);
+      return Promise.resolve(value);
+    }};
+    sidePanel.setPanelBehavior = (next, callback) => {{
+      Object.assign(behavior, next || {{}});
+      if (typeof callback === "function") setTimeout(callback, 0);
+      return Promise.resolve();
+    }};
+    sidePanel.getPanelBehavior = (callback) => {{
+      const value = Object.assign({{}}, behavior);
+      if (typeof callback === "function") setTimeout(() => callback(value), 0);
+      return Promise.resolve(value);
+    }};
+    try {{
+      chromeObject.sidePanel = sidePanel;
+      if (!window.chrome) Object.defineProperty(window, "chrome", {{ value: chromeObject, configurable: true }});
+    }} catch {{}}
+  }};
+  installSidePanelBridge();
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", postPopupSize, {{ once: true }});
+  }} else {{
+    postPopupSize();
+  }}
+  window.addEventListener("load", postPopupSize);
+  new ResizeObserver(postPopupSize).observe(document.documentElement);
+  if (document.body) new ResizeObserver(postPopupSize).observe(document.body);
+  document.addEventListener("transitionend", postPopupSize, true);
+  document.addEventListener("animationend", postPopupSize, true);
+  Array.from(document.images || []).forEach((img) => {{
+    if (!img.complete) img.addEventListener("load", postPopupSize, {{ once: true }});
+  }});
+  if (document.fonts?.ready) document.fonts.ready.then(postPopupSize).catch(() => {{}});
+  setTimeout(postPopupSize, 60);
+  setTimeout(postPopupSize, 250);
+  setTimeout(postPopupSize, 700);
+}})();
+"#,
+        js_string_literal(extension_id),
+        js_string_literal(side_panel_path)
+    )
+}
+
+fn installed_extension_ids_json(extensions: &[BrowserExtensionInfo]) -> String {
+    let ids = extensions
+        .iter()
+        .map(|ext| js_string_literal(&ext.id))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", ids)
+}
+
+fn is_extension_store_url(url: &str) -> bool {
+    url.contains("chromewebstore.google.com") || url.contains("chrome.google.com/webstore")
+}
+
+fn execute_webview_script(webview: &ICoreWebView2, script: &str) {
+    unsafe {
+        let js = CoTaskMemPWSTR::from(script);
+        let _ = webview.ExecuteScript(
+            *js.as_ref().as_pcwstr(),
+            &ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(()))),
+        );
+    }
+}
+
+fn post_boxed_string(hwnd: HWND, message_id: u32, value: String) {
+    let ptr = Box::into_raw(Box::new(value));
+    let posted = unsafe {
+        WindowsAndMessaging::PostMessageW(Some(hwnd), message_id, WPARAM(ptr as usize), LPARAM(0))
+            .is_ok()
+    };
+    if !posted {
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+}
+
+fn extension_page_url(extension_id: &str, path: &str) -> String {
+    let clean_path = path.trim().trim_start_matches('/');
+    format!("chrome-extension://{extension_id}/{clean_path}")
+}
+
+fn manifest_exists(path: &Path) -> bool {
+    path.join("manifest.json").exists()
+}
+
+fn normalize_extension_label(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn resolve_extension_install_path(
+    id: &str,
+    name: &str,
+    known_path: Option<&str>,
+) -> Option<String> {
+    if let Some(path) = known_path {
+        let candidate = PathBuf::from(path);
+        if manifest_exists(&candidate) {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    let direct = crx_install_dir(id);
+    if manifest_exists(&direct) {
+        return Some(direct.to_string_lossy().to_string());
+    }
+
+    let root = crx_install_root();
+    let wanted_name = normalize_extension_label(name);
+    let entries = fs::read_dir(root).ok()?;
+    let mut only_manifest_dir: Option<PathBuf> = None;
+    let mut manifest_dir_count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !manifest_exists(&path) {
+            continue;
+        }
+        let folder_matches = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|folder| folder.eq_ignore_ascii_case(id))
+            .unwrap_or(false);
+        if folder_matches {
+            return Some(path.to_string_lossy().to_string());
+        }
+        manifest_dir_count += 1;
+        only_manifest_dir = Some(path.clone());
+        if !wanted_name.is_empty() {
+            let manifest_name = read_extension_manifest_name(&path);
+            if normalize_extension_label(&manifest_name) == wanted_name {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    if manifest_dir_count == 1 {
+        only_manifest_dir.map(|path| path.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_chrome_extension_id(value: &str) -> Option<String> {
+    let lower = value.trim().to_ascii_lowercase();
+    for token in lower.split(|ch: char| !ch.is_ascii_lowercase()) {
+        if token.len() == 32 && token.chars().all(|ch| ('a'..='p').contains(&ch)) {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn extension_id_from_crx_download(uri: &str, file_path: &str) -> Option<String> {
+    let lower_uri = uri.to_ascii_lowercase();
+    let lower_path = file_path.to_ascii_lowercase();
+    let looks_like_crx = lower_uri.contains("clients2.google.com/service/update2/crx")
+        || lower_uri.contains("chromewebstore.google.com")
+        || lower_uri.contains(".crx")
+        || lower_path.ends_with(".crx");
+    if !looks_like_crx {
+        return None;
+    }
+    extract_chrome_extension_id(&percent_decode(uri)).or_else(|| {
+        Path::new(file_path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(extract_chrome_extension_id)
+    })
+}
+
+fn crx_install_root() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let mut p = PathBuf::from(appdata);
+        p.push("Aster");
+        p.push(".aster-profile");
+        p.push("Extensions");
+        p
+    } else {
+        let mut p = PathBuf::from(".aster-profile");
+        p.push("Extensions");
+        p
+    }
+}
+
+fn crx_install_dir(extension_id: &str) -> PathBuf {
+    let mut path = crx_install_root();
+    path.push(extension_id);
+    path
+}
+
+fn extract_crx(crx_path: &str, extension_id: &str) -> std::result::Result<String, String> {
+    let data = fs::read(crx_path).map_err(|e| format!("Failed to read CRX: {e}"))?;
+    if data.len() < 4 || &data[0..4] != b"Cr24" {
+        return Err("Invalid CRX file: missing Cr24 magic.".to_string());
+    }
+    let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let zip_start = match version {
+        2 => {
+            if data.len() < 16 {
+                return Err("CRX2 file too short.".to_string());
+            }
+            let key_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+            let sig_len = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+            16 + key_len + sig_len
+        }
+        3 => {
+            if data.len() < 12 {
+                return Err("CRX3 file too short.".to_string());
+            }
+            let header_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+            12 + header_len
+        }
+        _ => return Err(format!("Unsupported CRX version: {version}")),
+    };
+    if zip_start >= data.len() {
+        return Err("CRX has no ZIP data.".to_string());
+    }
+    let zip_data = &data[zip_start..];
+    let install_dir = crx_install_dir(extension_id);
+    if install_dir.exists() {
+        fs::remove_dir_all(&install_dir)
+            .map_err(|e| format!("Failed to replace old extension files: {e}"))?;
+    }
+    fs::create_dir_all(&install_dir).map_err(|e| format!("Failed to create extension dir: {e}"))?;
+    let reader = std::io::Cursor::new(zip_data.to_vec());
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("Failed to read CRX ZIP content: {e}"))?;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("ZIP entry {i}: {e}"))?;
+        let Some(enclosed) = file.enclosed_name().map(|path| path.to_owned()) else {
+            continue;
+        };
+        let out_path = install_dir.join(enclosed);
+        if file.is_dir() {
+            let _ = fs::create_dir_all(&out_path);
+        } else {
+            if let Some(parent) = out_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let mut outfile = fs::File::create(&out_path)
+                .map_err(|e| format!("Failed to create {:?}: {e}", out_path))?;
+            std::io::copy(&mut file, &mut outfile)
+                .map_err(|e| format!("Failed to extract {:?}: {e}", out_path))?;
+        }
+    }
+    if !install_dir.join("manifest.json").exists() {
+        return Err("Extension package did not contain manifest.json.".to_string());
+    }
+    Ok(install_dir.to_string_lossy().to_string())
+}
+
+fn render_glyph_favicon(
     size: i32,
     codepoint: u32,
     icon_font: &HFONT,
@@ -15697,6 +19435,8 @@ fn menu_item(id: usize, label: &str) -> OverlayMenuItem {
         id,
         label: label.to_string(),
         sublabel: String::new(),
+        icon_key: String::new(),
+        icon_path: String::new(),
     }
 }
 
@@ -15705,6 +19445,8 @@ fn menu_item_with_subtitle(id: usize, label: &str, sublabel: &str) -> OverlayMen
         id,
         label: label.to_string(),
         sublabel: sublabel.to_string(),
+        icon_key: String::new(),
+        icon_path: String::new(),
     }
 }
 
@@ -16000,15 +19742,60 @@ fn history_entries_json(entries: &[VisitedSite]) -> String {
     format!("[{}]", items)
 }
 
+fn extension_icon_data_url(path: &str) -> String {
+    if path.trim().is_empty() {
+        return String::new();
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let mime = match Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        _ => "image/png",
+    };
+    format!(
+        "data:{mime};base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    )
+}
+
 fn extensions_entries_json(entries: &[BrowserExtensionInfo]) -> String {
     let items = entries
         .iter()
         .map(|entry| {
+            let icon = extension_icon_data_url(&entry.icon_path);
             format!(
-                "{{\"id\":{},\"name\":{},\"enabled\":{}}}",
+                "{{\"id\":{},\"name\":{},\"enabled\":{},\"version\":{},\"description\":{},\"hasAction\":{},\"canOpen\":{},\"permissions\":{},\"icon\":{}}}",
                 js_string_literal(&entry.id),
                 js_string_literal(&entry.name),
-                if entry.enabled { "true" } else { "false" }
+                if entry.enabled { "true" } else { "false" },
+                js_string_literal(&entry.version),
+                js_string_literal(&entry.description),
+                if entry.has_action { "true" } else { "false" },
+                if entry.enabled
+                    && (!entry.popup_path.is_empty()
+                        || !entry.side_panel_path.is_empty()
+                        || !entry.options_path.is_empty())
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+                js_string_literal(&entry.permissions.join(", ")),
+                js_string_literal(&icon),
             )
         })
         .collect::<Vec<_>>()
@@ -16055,9 +19842,16 @@ h1 { font-size: 28px; line-height: 1.1; margin: 0 0 7px; font-weight: 650; }
 .group { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); margin: 16px 0; }
 .row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 15px 17px; border-top: 1px solid var(--line); }
 .row:first-child { border-top: 0; }
+.ext-main { min-width: 0; display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 12px; align-items: center; padding: 0; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.ext-main:hover .title, .ext-main:focus-visible .title { color: var(--accent); }
+.ext-main:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent), transparent 40%); outline-offset: 4px; border-radius: 6px; }
+.ext-icon { width: 32px; height: 32px; object-fit: contain; border-radius: 7px; background: var(--soft); }
+.ext-icon-fallback { display: grid; place-items: center; color: var(--accent); font-weight: 700; }
 .title { font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.subtitle { color: var(--muted); font-size: 12px; margin-top: 1px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.desc { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .hint { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
-.load { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 8px; width: min(560px, 100%); }
+.load { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; gap: 8px; width: min(620px, 100%); }
 input { color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; min-width: 0; }
 .action-btn { min-width: 110px; color: var(--text); background: #080808; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; cursor: pointer; }
 .action-btn:hover { background: color-mix(in srgb, var(--accent), transparent 88%); border-color: color-mix(in srgb, var(--accent), var(--line) 55%); }
@@ -16065,15 +19859,19 @@ input { color: var(--text); background: #080808; border: 1px solid var(--line); 
 .toggle input { width: 18px; height: 18px; accent-color: var(--accent); }
 .notice { border: 1px solid color-mix(in srgb, var(--accent), var(--line) 58%); background: color-mix(in srgb, var(--accent), transparent 90%); border-radius: 8px; padding: 11px 13px; margin: 0 0 14px; }
 .empty { color: var(--muted); padding: 18px; }
+.perms { color: var(--muted); font-size: 11px; margin-top: 4px; overflow-wrap: anywhere; }
+.perms span { display: inline-block; background: var(--soft); border-radius: 4px; padding: 1px 6px; margin: 1px 2px; }
+.action-btn:disabled { opacity: .45; cursor: default; }
 @media (max-width: 760px) { .header, .row { grid-template-columns: minmax(0, 1fr); flex-direction: column; align-items: stretch; } .load { grid-template-columns: minmax(0, 1fr); } .actions { justify-content: stretch; } .action-btn { flex: 1; } }
 </style>
 </head>
 <body>
 <div class="page"><div class="wrap">
-<div class="header"><div><h1>Extensions</h1><p class="lead">Load unpacked Chrome extensions and manage what is active in Aster.</p></div><div class="actions"><button class="action-btn" id="openStore">Chrome Web Store</button><button class="action-btn" id="refresh">Refresh</button></div></div>
+<div class="header"><div><h1>Extensions</h1><p class="lead">Install Chrome extensions and manage what is active in Aster.</p></div><div class="actions"><button class="action-btn" id="openStore">Chrome Web Store</button><button class="action-btn" id="refresh">Refresh</button></div></div>
 __NOTICE__
 <div class="group">
-<div class="row"><div><div class="title">Load unpacked extension</div><div class="hint">Enter the folder that contains manifest.json. Extensions are stored by the WebView2 profile.</div></div><div class="load"><input id="extensionPath" placeholder="C:\path\to\extension"><button class="action-btn" id="loadUnpacked">Load</button></div></div>
+<div class="row"><div><div class="title">Install from Chrome Web Store</div><div class="hint">Paste a Chrome Web Store link or extension id. Aster downloads and loads the extension locally.</div></div><div class="load"><input id="storeExtension" placeholder="Chrome Web Store URL or extension id"><button class="action-btn" id="installStore">Install</button></div></div>
+<div class="row"><div><div class="title">Load unpacked extension</div><div class="hint">Enter the folder containing manifest.json, or use Browse to pick one.</div></div><div class="load"><input id="extensionPath" placeholder="C:\path\to\extension"><button class="action-btn" id="browseExtension">Browse...</button><button class="action-btn" id="loadUnpacked">Load</button></div></div>
 </div>
 <div class="group" id="extensionRows"></div>
 </div></div>
@@ -16090,16 +19888,31 @@ function render() {
   extensions.forEach((extension) => {
     const row = document.createElement("div");
     row.className = "row";
-    row.innerHTML = `<div><div class="title"></div><div class="hint"></div></div><div class="actions"><label class="toggle"><input type="checkbox"${extension.enabled ? " checked" : ""}>Enabled</label><button class="action-btn">Remove</button></div>`;
-    row.querySelector(".title").textContent = extension.name;
-    row.querySelector(".hint").textContent = extension.id;
+    const icon = extension.icon
+      ? `<img class="ext-icon" src="${escapeAttr(extension.icon)}" alt="">`
+      : `<div class="ext-icon ext-icon-fallback" aria-hidden="true">${escapeHtml((extension.name || "?").slice(0, 1).toUpperCase())}</div>`;
+    let info = `<div class="title">${escapeHtml(extension.name)}</div>`;
+    if (extension.version) info += `<div class="subtitle">v${escapeHtml(extension.version)} &middot; ${escapeHtml(extension.id)}</div>`;
+    else info += `<div class="subtitle">${escapeHtml(extension.id)}</div>`;
+    if (extension.description) info += `<div class="desc">${escapeHtml(extension.description)}</div>`;
+    if (extension.permissions) info += `<div class="perms">` + extension.permissions.split(", ").filter(p => p).map(p => `<span>${escapeHtml(p)}</span>`).join("") + `</div>`;
+    row.innerHTML = `<button class="ext-main" type="button" title="Open ${escapeAttr(extension.name)}">${icon}<span>${info}</span></button><div class="actions"><label class="toggle"><input type="checkbox"${extension.enabled ? " checked" : ""}>Enabled</label><button class="action-btn" data-action="open"${extension.canOpen ? "" : " disabled"}>Open</button><button class="action-btn" data-action="remove">Remove</button></div>`;
+    row.querySelector(".ext-main").onclick = () => post("extensions:open-popup:" + encodeURIComponent(extension.id));
     row.querySelector("input").onchange = (event) => post("extensions:enable:" + encodeURIComponent(extension.id) + ":" + (event.target.checked ? "1" : "0"));
-    row.querySelector("button").onclick = () => post("extensions:remove:" + encodeURIComponent(extension.id));
+    row.querySelector("[data-action='open']").onclick = () => post("extensions:open-popup:" + encodeURIComponent(extension.id));
+    row.querySelector("[data-action='remove']").onclick = () => post("extensions:remove:" + encodeURIComponent(extension.id));
     rows.appendChild(row);
   });
 }
+function escapeHtml(s) { return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function escapeAttr(s) { return escapeHtml(s).replace(/"/g,"&quot;"); }
 document.getElementById("openStore").onclick = () => post("extensions:open-store");
 document.getElementById("refresh").onclick = () => post("extensions:refresh");
+document.getElementById("installStore").onclick = () => {
+  const value = document.getElementById("storeExtension").value.trim();
+  if (value) post("extensions:install-store:" + encodeURIComponent(value));
+};
+document.getElementById("browseExtension").onclick = () => post("extensions:browse-folder");
 document.getElementById("loadUnpacked").onclick = () => {
   const path = document.getElementById("extensionPath").value.trim();
   if (path) post("extensions:add:" + encodeURIComponent(path));
@@ -16336,6 +20149,63 @@ fn colorref_to_css(color: u32) -> String {
     )
 }
 
+fn manifest_message(dir: &Path, key: &str, default_locale: &str) -> Option<String> {
+    let locale = if default_locale.trim().is_empty() {
+        "en"
+    } else {
+        default_locale.trim()
+    };
+    let candidates = [locale, "en", "en_US"];
+    for candidate in candidates {
+        let path = dir.join("_locales").join(candidate).join("messages.json");
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        if let Some(message) = json
+            .get(key)
+            .and_then(|entry| entry.get("message"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(message.to_string());
+        }
+    }
+    None
+}
+
+fn resolve_manifest_text(dir: &Path, raw: &str, default_locale: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(key) = trimmed
+        .strip_prefix("__MSG_")
+        .and_then(|value| value.strip_suffix("__"))
+    {
+        manifest_message(dir, key, default_locale).unwrap_or_else(|| trimmed.to_string())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn read_extension_manifest_name(dir: &Path) -> String {
+    let manifest_path = dir.join("manifest.json");
+    let Ok(content) = fs::read_to_string(&manifest_path) else {
+        return String::new();
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&content) else {
+        return String::new();
+    };
+    let default_locale = json
+        .get("default_locale")
+        .and_then(|value| value.as_str())
+        .unwrap_or("en");
+    json.get("name")
+        .and_then(|value| value.as_str())
+        .map(|raw| resolve_manifest_text(dir, raw, default_locale))
+        .unwrap_or_default()
+}
+
 fn parse_css_color_to_colorref(value: &str) -> Option<u32> {
     let hex = value.trim().trim_start_matches('#');
     if hex.len() != 6 {
@@ -16362,7 +20232,7 @@ unsafe fn take_pwstr(value: PWSTR) -> String {
     out
 }
 
-fn extension_info(extension: &ICoreWebView2BrowserExtension) -> BrowserExtensionInfo {
+fn extension_info(extension: &ICoreWebView2BrowserExtension, known_path: Option<&str>) -> BrowserExtensionInfo {
     unsafe {
         let mut id = PWSTR::null();
         let mut name = PWSTR::null();
@@ -16378,16 +20248,175 @@ fn extension_info(extension: &ICoreWebView2BrowserExtension) -> BrowserExtension
             String::new()
         };
         let _ = extension.IsEnabled(&mut enabled);
+        let install_path = resolve_extension_install_path(&id, &name, known_path)
+            .unwrap_or_else(|| crx_install_dir(&id).to_string_lossy().to_string());
+        let details = if Path::new(&install_path).join("manifest.json").exists() {
+            read_extension_manifest(&install_path)
+        } else {
+            ExtensionManifestDetails::default()
+        };
         BrowserExtensionInfo {
             id,
-            name: if name.trim().is_empty() {
+            name: if !details.name.trim().is_empty()
+                && (name.trim().is_empty() || name.trim().starts_with("__MSG_"))
+            {
+                details.name
+            } else if name.trim().is_empty() {
                 "Unnamed extension".to_string()
             } else {
                 name
             },
             enabled: enabled.as_bool(),
+            version: details.version,
+            description: details.description,
+            has_action: details.has_action,
+            popup_path: details.popup_path,
+            side_panel_path: details.side_panel_path,
+            options_path: details.options_path,
+            permissions: details.permissions,
+            install_path,
+            icon_path: details.icon_path,
         }
     }
+}
+
+fn read_extension_manifest(dir: &str) -> ExtensionManifestDetails {
+    let manifest_path = Path::new(dir).join("manifest.json");
+    let content = match fs::read_to_string(&manifest_path) {
+        Ok(content) => content,
+        Err(_) => return ExtensionManifestDetails::default(),
+    };
+    let json: Value = match serde_json::from_str(&content) {
+        Ok(json) => json,
+        Err(_) => return ExtensionManifestDetails::default(),
+    };
+    let dir_path = Path::new(dir);
+    let default_locale = json
+        .get("default_locale")
+        .and_then(|v| v.as_str())
+        .unwrap_or("en");
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|raw| resolve_manifest_text(dir_path, raw, default_locale))
+        .unwrap_or_default();
+    let version = json
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let description = json
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|raw| resolve_manifest_text(dir_path, raw, default_locale))
+        .unwrap_or_default();
+    let permissions: Vec<String> = json
+        .get("permissions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_action = json.get("action").is_some() || json.get("browser_action").is_some();
+    let popup_path = json
+        .get("action")
+        .or_else(|| json.get("browser_action"))
+        .and_then(|a| a.get("default_popup"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    let side_panel_path = json
+        .get("side_panel")
+        .and_then(|panel| panel.get("default_path"))
+        .and_then(|path| path.as_str())
+        .unwrap_or("")
+        .to_string();
+    let options_path = json
+        .get("options_ui")
+        .and_then(|ui| ui.get("page"))
+        .or_else(|| json.get("options_page"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    let icon_path = pick_best_icon(
+        json.get("icons"),
+        json.get("action")
+            .or_else(|| json.get("browser_action"))
+            .and_then(|a| a.get("default_icon")),
+        dir,
+    );
+    ExtensionManifestDetails {
+        name,
+        version,
+        description,
+        has_action,
+        popup_path,
+        side_panel_path,
+        options_path,
+        permissions,
+        icon_path,
+    }
+}
+
+fn pick_best_icon(icons: Option<&Value>, default_icon: Option<&Value>, dir: &str) -> String {
+    let preferred_sizes = [32i32, 48, 64, 96, 128, 16];
+    let dir_path = Path::new(dir);
+    if let Some(icons_obj) = icons.and_then(|v| v.as_object()) {
+        if let Some(path) = preferred_sizes.iter().find_map(|&s| {
+            icons_obj
+                .get(&s.to_string())
+                .or_else(|| {
+                    icons_obj
+                        .keys()
+                        .filter_map(|k| k.parse::<i32>().ok())
+                        .min_by_key(|k| (k - s).abs())
+                        .and_then(|k| icons_obj.get(&k.to_string()))
+                })
+                .and_then(|v| v.as_str())
+                .filter(|p| dir_path.join(p).exists())
+        }) {
+            return dir_path.join(path).to_string_lossy().to_string();
+        }
+        if let Some(path) = icons_obj
+            .values()
+            .filter_map(|v| v.as_str())
+            .find(|p| dir_path.join(p).exists())
+        {
+            return dir_path.join(path).to_string_lossy().to_string();
+        }
+    }
+    if let Some(icon_val) = default_icon {
+        if let Some(path) = icon_val.as_str() {
+            let candidate = dir_path.join(path);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        } else if let Some(obj) = icon_val.as_object() {
+            if let Some(path) = preferred_sizes.iter().find_map(|&s| {
+                obj.get(&s.to_string())
+                    .or_else(|| {
+                        obj.keys()
+                            .filter_map(|k| k.parse::<i32>().ok())
+                            .min_by_key(|k| (k - s).abs())
+                            .and_then(|k| obj.get(&k.to_string()))
+                    })
+                    .and_then(|v| v.as_str())
+                    .filter(|p| dir_path.join(p).exists())
+            }) {
+                return dir_path.join(path).to_string_lossy().to_string();
+            }
+            if let Some(path) = obj
+                .values()
+                .filter_map(|v| v.as_str())
+                .find(|p| dir_path.join(p).exists())
+            {
+                return dir_path.join(path).to_string_lossy().to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 fn client_rect(hwnd: HWND) -> RECT {
@@ -16497,9 +20526,7 @@ fn normalize_address(raw: &str) -> String {
     if value.eq_ignore_ascii_case(":history") || value.eq_ignore_ascii_case("aster:history") {
         return "aster:history".to_string();
     }
-    if value.eq_ignore_ascii_case(":extensions")
-        || value.eq_ignore_ascii_case("aster:extensions")
-    {
+    if value.eq_ignore_ascii_case(":extensions") || value.eq_ignore_ascii_case("aster:extensions") {
         return "aster:extensions".to_string();
     }
     if value.contains("://") || value.starts_with("about:") {
@@ -17243,6 +21270,39 @@ mod tests {
         assert_eq!(
             favicon_candidate_urls("https://example.com/docs/page", None),
             vec!["https://example.com/favicon.ico".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_chrome_extension_id() {
+        let id = "abcdefghijklmnopabcdefghijklmnop";
+        assert_eq!(extract_chrome_extension_id(id), Some(id.to_string()));
+        assert_eq!(
+            extract_chrome_extension_id(&format!(
+                "https://chromewebstore.google.com/detail/example/{id}"
+            )),
+            Some(id.to_string())
+        );
+        assert_eq!(extract_chrome_extension_id("not-an-extension"), None);
+    }
+
+    #[test]
+    fn test_extension_id_from_crx_download() {
+        let id = "abcdefghijklmnopabcdefghijklmnop";
+        let uri = format!(
+            "https://clients2.google.com/service/update2/crx?response=redirect&x=id%3D{id}%26installsource%3Dondemand%26uc"
+        );
+        assert_eq!(
+            extension_id_from_crx_download(&uri, ""),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            extension_id_from_crx_download("", &format!("C:\\Temp\\{id}.crx")),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            extension_id_from_crx_download("https://example.com/file.zip", "file.zip"),
+            None
         );
     }
 }
