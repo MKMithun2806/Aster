@@ -1,0 +1,52 @@
+name: Build and Update Aster Release
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    types: [closed]
+    branches: [ main ]
+
+jobs:
+  build:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Aster (Release)
+        run: cargo build --release --verbose
+
+      - name: Copy built executable to releases/
+        run: |
+          Copy-Item -Path "target/release/Aster.exe" -Destination "releases/Aster.exe" -Force
+
+      - name: Commit and push updated Aster.exe
+        if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+        run: |
+          git config user.name "MKMithun2806"
+          git config user.email "mmithunkrish@gmail.com"
+          
+          git add releases/Aster.exe
+          
+          # Check if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to Aster.exe"
+            exit 0
+          fi
+          
+          git commit -m "chore: update Aster.exe with latest build [skip ci]"
+          git push
+        shell: pwsh
