@@ -26,12 +26,17 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Aster (Release)
-        run: cargo build --release --verbose
+      - name: Build Aster directly to releases folder
+        run: cargo build --release --target-dir releases --verbose
 
-      - name: Copy built executable to releases/
+      - name: Copy built executable to releases/Aster.exe
         run: |
-          Copy-Item -Path "target/release/Aster.exe" -Destination "releases/Aster.exe" -Force
+          Copy-Item -Path "releases/x86_64-pc-windows-msvc/release/Aster.exe" -Destination "releases/Aster.exe" -Force
+
+      - name: Clean up nested build folders
+        run: |
+          Remove-Item -Path "releases/x86_64-pc-windows-msvc" -Recurse -Force -ErrorAction SilentlyContinue
+        shell: pwsh
 
       - name: Commit and push updated Aster.exe
         if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
