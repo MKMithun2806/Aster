@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Aster Todo List",
+  "version": "1.0",
+  "description": "Local todo list for Aster Browser",
+  "permissions": ["storage"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Todos"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "icons": {
+    "128": "icon.png"
+  }
+}
