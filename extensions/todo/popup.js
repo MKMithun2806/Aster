@@ -11,17 +11,17 @@ function render() {
   `).join('');
 }
 
-function toggle(i) {
+window.toggle = function(i) {
   todos[i].done = !todos[i].done;
   save();
   render();
-}
+};
 
-function del(i) {
+window.del = function(i) {
   todos.splice(i, 1);
   save();
   render();
-}
+};
 
 document.getElementById('input').addEventListener('keypress', e => {
   if (e.key === 'Enter' && e.target.value.trim()) {
