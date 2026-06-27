@@ -2,39 +2,53 @@ let todos = [];
 
 function render() {
   const list = document.getElementById('list');
-  list.innerHTML = todos.map((todo, i) => `
-    <li>
-      <input type="checkbox" \( {todo.done ? 'checked' : ''} onchange="toggle( \){i})">
+  list.innerHTML = '';
+
+  todos.forEach((todo, i) => {
+    const li = document.createElement('li');
+
+    li.innerHTML = `
+      <input type="checkbox" ${todo.done ? 'checked' : ''}>
       <span class="\( {todo.done ? 'done' : ''}"> \){todo.text}</span>
-      <button onclick="del(${i})" style="margin-left:auto">×</button>
-    </li>
-  `).join('');
+      <button>×</button>
+    `;
+
+    // Dynamic event listeners
+    li.querySelector('input').addEventListener('change', () => toggleTodo(i));
+    li.querySelector('button').addEventListener('click', () => deleteTodo(i));
+
+    list.appendChild(li);
+  });
 }
 
-window.toggle = function(i) {
+function toggleTodo(i) {
   todos[i].done = !todos[i].done;
-  localStorage.setItem('aster_todos', JSON.stringify(todos));
-  render();
-};
+  saveTodos();
+}
 
-window.del = function(i) {
+function deleteTodo(i) {
   todos.splice(i, 1);
-  localStorage.setItem('aster_todos', JSON.stringify(todos));
-  render();
-};
+  saveTodos();
+}
+
+function saveTodos() {
+  chrome.storage.local.set({ todos: todos });
+}
 
 document.getElementById('input').addEventListener('keypress', e => {
   if (e.key === 'Enter') {
     const text = e.target.value.trim();
     if (text) {
       todos.push({ text, done: false });
-      localStorage.setItem('aster_todos', JSON.stringify(todos));
+      saveTodos();
       render();
       e.target.value = '';
     }
   }
 });
 
-// Load shared data
-todos = JSON.parse(localStorage.getItem('aster_todos') || '[]');
-render();
+// Load todos
+chrome.storage.local.get('todos', (data) => {
+  todos = data.todos || [];
+  render();
+});
