@@ -4,32 +4,56 @@
   <meta charset="utf-8">
   <style>
     body { 
-      margin:0; padding:16px; 
+      margin: 0; 
+      padding: 16px; 
       font-family: Segoe UI, system-ui, sans-serif; 
-      background:#1a1a1a; color:#eee; 
-      height:100vh; box-sizing:border-box;
+      background: #1a1a1a; 
+      color: #eee; 
+      height: 100vh; 
+      box-sizing: border-box;
     }
-    h2 { margin:0 0 16px 0; }
+    h2 { margin: 0 0 16px 0; color: #fff; }
     input { 
-      width:100%; padding:12px; 
-      background:#2a2a2a; border:none; 
-      border-radius:8px; color:white; 
-      margin-bottom:16px; font-size:15px;
+      width: 100%; 
+      padding: 12px; 
+      background: #2a2a2a; 
+      border: none; 
+      border-radius: 8px; 
+      color: white; 
+      font-size: 15px;
+      margin-bottom: 16px;
     }
-    ul { list-style:none; padding:0; margin:0; }
+    ul { 
+      list-style: none; 
+      padding: 0; 
+      margin: 0; 
+    }
     li { 
-      padding:12px; 
-      display:flex; align-items:center; gap:12px; 
-      background:#252525; margin-bottom:8px; 
-      border-radius:8px;
+      padding: 12px; 
+      display: flex; 
+      align-items: center; 
+      gap: 12px; 
+      background: #252525; 
+      margin-bottom: 8px; 
+      border-radius: 8px;
     }
-    .done { text-decoration:line-through; opacity:0.65; }
-    button { background:none; border:none; color:#ff6666; font-size:20px; cursor:pointer; }
+    .done { 
+      text-decoration: line-through; 
+      opacity: 0.65; 
+    }
+    button { 
+      background: none; 
+      border: none; 
+      color: #ff6666; 
+      font-size: 20px; 
+      cursor: pointer; 
+      margin-left: auto;
+    }
   </style>
 </head>
 <body>
-  <h2>My Todos</h2>
-  <input type="text" id="input" placeholder="Add new task...">
+  <h2>Aster Todos</h2>
+  <input type="text" id="input" placeholder="Add a new task...">
   <ul id="list"></ul>
 
   <script src="sidepanel.js"></script>
